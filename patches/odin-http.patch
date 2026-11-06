@@ -1,0 +1,167 @@
+--- a/vendor/odin-http/http.odin
++++ b/vendor/odin-http/http.odin
+@@ -177,7 +177,7 @@
+ 	// field-values or a single Content-Length header field having an
+ 	// invalid value, then the message framing is invalid and the
+ 	// recipient MUST treat it as an unrecoverable error.
+-	if tmp_key == "content-length" && has_cl && cl != value {
++	if tmp_key == "content-length" && has_cl {
+ 		return
+ 	}
+ 
+--- a/vendor/odin-http/request.odin
++++ b/vendor/odin-http/request.odin
+@@ -59,7 +59,7 @@
+ 	// perform request smuggling (Section 9.5) or response splitting
+ 	// (Section 9.4) and ought to be handled as an error.
+ 	if headers_has_unsafe(headers^, "transfer-encoding") && headers_has_unsafe(headers^, "content-length") {
+-		headers_delete_unsafe(headers, "content-length")
++		return false
+ 	}
+ 
+ 	return true
+--- a/vendor/odin-http/response.odin
++++ b/vendor/odin-http/response.odin
+@@ -334,7 +334,9 @@
+ 	}
+ 
+ 	buf := bytes.buffer_to_bytes(&r._buf)
+-	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
++	timeout := conn.server.opts.write_timeout
++	if timeout <= 0 { timeout = nbio.NO_TIMEOUT }
++	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent, timeout=timeout)
+ }
+ 
+ 
+--- a/vendor/odin-http/responses.odin
++++ b/vendor/odin-http/responses.odin
+@@ -148,7 +148,7 @@
+ 	// Ends the body and sends the response.
+ 	defer io.close(rw.w)
+ 
+-	if err = json.marshal_to_writer(rw.w, v, &opt); err != nil {
++	if err = json.marshal_to_writer(rw.w, v, opt); err != nil {
+ 		headers_set_close(&r.headers)
+ 		response_status(r, .Internal_Server_Error)
+ 	}
+--- a/vendor/odin-http/scanner.odin
++++ b/vendor/odin-http/scanner.odin
+@@ -7,6 +7,7 @@
+ import "core:bufio"
+ import "core:nbio"
+ import "core:net"
++import "core:time"
+ 
+ Scan_Callback :: #type proc(user_data: rawptr, token: string, err: bufio.Scanner_Error)
+ Split_Proc    :: #type proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool)
+@@ -33,6 +34,7 @@
+ 
+ // A callback based scanner over the connection based on nbio.
+ Scanner :: struct /* #no_copy */ {
++	pending:                      ^nbio.Operation,
+ 	connection:                   ^Connection,
+ 	split:                        Split_Proc,
+ 	split_data:                   rawptr,
+@@ -201,11 +203,20 @@
+ 	s.could_be_too_short = could_be_too_short
+ 
+ 	assert_has_td()
+-	// TODO: some kinda timeout on this.
+-	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read)
++	timeout := nbio.NO_TIMEOUT
++	if s.connection.server.opts.read_timeout > 0 {
++		timeout = s.connection.server.opts.read_timeout - time.tick_since(s.connection.accepted_at)
++		if timeout <= 0 {
++			s._err = .Unknown
++			scanner_scan(s, s.user_data, s.callback)
++			return
++		}
++	}
++	s.pending = nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read, timeout=timeout)
+ }
+ 
+ scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
++	s.pending = nil
+ 	context.temp_allocator = virtual.arena_allocator(&s.connection.temp_allocator)
+ 
+ 	defer scanner_scan(s, s.user_data, s.callback)
+--- a/vendor/odin-http/server.odin
++++ b/vendor/odin-http/server.odin
+@@ -39,6 +39,10 @@
+ 	limit_headers:           int,
+ 	// The thread count to use, defaults to your core count - 1.
+ 	thread_count:            int,
++	// Dagda M0 bounds, per event loop. Zero preserves the upstream behavior.
++	max_connections:         int,
++	read_timeout:            time.Duration,
++	write_timeout:           time.Duration,
+ 
+ 	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
+ 	// // each time it needs to grow.
+@@ -245,6 +249,9 @@
+ 
+ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
+ 	assert_has_td(loc)
++	// Stop accepting before draining; new clients must not extend shutdown.
++	nbio.remove(td.accept)
++	td.accept = nil
+ 
+ 	td.state = .Closing
+ 	defer delete(td.conns)
+@@ -366,6 +373,7 @@
+ 	scanner:        Scanner,
+ 	temp_allocator: virtual.Arena,
+ 	loop:           Loop,
++	accepted_at:    time.Tick,
+ }
+ 
+ // Loop/request cycle state.
+@@ -388,6 +396,10 @@
+ 	log.debugf("closing connection: %i", c.socket)
+ 
+ 	c.state = .Closing
++	// A pending receive owns a pointer to the scanner. Cancel it before the
++	// connection can be freed; otherwise a delayed callback can use freed memory.
++	nbio.remove(c.scanner.pending)
++	c.scanner.pending = nil
+ 
+ 	// RFC 7230 6.6.
+ 
+@@ -414,6 +426,10 @@
+ @(private)
+ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
+ 	td.accept = nil
++	if atomic_load(&server.closing) {
++		if op.accept.err == nil { net.close(op.accept.client) }
++		return
++	}
+ 
+ 	if op.accept.err != nil {
+ 		#partial switch op.accept.err {
+@@ -430,11 +446,16 @@
+ 
+ 	// Accept next connection.
+ 	td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
++	if server.opts.max_connections > 0 && len(td.conns) >= server.opts.max_connections {
++		net.close(op.accept.client)
++		return
++	}
+ 
+ 	c := new(Connection, server.conn_allocator)
+ 	c.state = .New
+ 	c.server = server
+ 	c.socket = op.accept.client
++	c.accepted_at = time.tick_now()
+ 	c.loop.req.client = op.accept.client_endpoint
+ 
+ 	td.conns[c.socket] = c
+@@ -450,7 +471,8 @@
+ 
+ 	// allocator_init(&c.temp_allocator, c.server.conn_allocator)
+ 	// context.temp_allocator = allocator(&c.temp_allocator)
+-	err := virtual.arena_init_growing(&c.temp_allocator)
++	c.temp_allocator.default_commit_size = 64 * mem.Kilobyte
++	err := virtual.arena_init_growing(&c.temp_allocator, 64 * mem.Kilobyte)
+ 	assert(err == nil)
+ 	context.temp_allocator = virtual.arena_allocator(&c.temp_allocator)
+ 

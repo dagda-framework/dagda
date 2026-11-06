@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "odin": {
+    "version": "dev-2026-11a",
+    "platform": "linux-amd64",
+    "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-linux-amd64-dev-2026-11a.tar.gz",
+    "sha256": "65c9f6e97d6f8a30930e151f270ce5aeaa98fe8b2ba49fe067394e2af04f7618"
+  },
+  "odin_http": {
+    "repository": "https://github.com/laytan/odin-http",
+    "revision": "fac113fbd828aad3d71479a534b5de4358b6a07b",
+    "scope": "root server package and upstream license/readme",
+    "local_patch": "patches/odin-http.patch"
+  }
+}
