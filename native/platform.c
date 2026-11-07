@@ -13,6 +13,7 @@ static void request_stop(int signo) {
 }
 
 int dagda_install_signals(void) {
+    stop_requested = 0;
     struct sigaction action = {0};
     action.sa_handler = request_stop;
     sigemptyset(&action.sa_mask);

@@ -1,0 +1,44 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "scope": "M1 tasks 1 and 2: lifecycle, configuration, routing and middleware; not full M1 or production qualification",
+  "passed": true,
+  "source": {
+    "base_commit": "ee80ad748aed15cdfd8e92eaed8c3c5d78aa11a8",
+    "working_tree_modified": true,
+    "binary_sha256": "43bae814ab8086e796c4f5beec2da7cb9f0e70addead962510a5dcc48825ae97"
+  },
+  "unit_tests": {
+    "odin": 14,
+    "python_harness": 7,
+    "passed": true,
+    "evidence": "User terminal output from scripts/test.sh"
+  },
+  "application": {
+    "passed": true,
+    "suite": "M1 lifecycle and routing",
+    "observed_request_ids": 144,
+    "before_reuse": {
+      "rss_kib": 7096,
+      "virtual_kib": 1237640,
+      "threads": 3,
+      "fds": 8
+    },
+    "after_reuse": {
+      "rss_kib": 7096,
+      "virtual_kib": 1237640,
+      "threads": 3,
+      "fds": 8
+    }
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T010037.173337Z",
+    "m0_failures": "build/runtime-checks/20261107T010045.295702Z",
+    "m1_application": "build/runtime-checks/20261107T010359.793985Z"
+  },
+  "verification_note": "M0 suites and unit tests passed in scripts/test.sh. M1 passed on a targeted rerun after replacing unsupported HTTPConnection context-manager usage with contextlib.closing. No runtime change or rebuild was required.",
+  "limitations": [
+    "Typed request bodies, validation and general application testing API remain subsequent M1 work.",
+    "The M0 30-minute soak was not repeated for the expanded application layer."
+  ]
+}

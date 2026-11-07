@@ -1,0 +1,46 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "scope": "M1 typed JSON request/response slice; not full M1 or production qualification",
+  "passed": true,
+  "source": {
+    "base_commit": "ee80ad748aed15cdfd8e92eaed8c3c5d78aa11a8",
+    "working_tree_modified": true,
+    "binary_sha256": "fe267f862e409a4e035648c5f00e7b14a4b60b973f25b42fe3b5a473ed4856b0"
+  },
+  "local_checks": {
+    "build": true,
+    "http_unit_tests": 9,
+    "typed_json_unit_tests": 5,
+    "python_harness_tests": 7,
+    "passed": true
+  },
+  "network": {
+    "passed": true,
+    "suite": "M1 typed JSON",
+    "before": {
+      "rss_kib": 7172,
+      "virtual_kib": 1106852,
+      "threads": 3,
+      "fds": 6
+    },
+    "after": {
+      "rss_kib": 7172,
+      "virtual_kib": 1106852,
+      "threads": 3,
+      "fds": 6
+    }
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T010952.956490Z",
+    "m0_failures": "build/runtime-checks/20261107T011001.146857Z",
+    "m1_application": "build/runtime-checks/20261107T011029.663603Z",
+    "typed_json": "build/runtime-checks/20261107T011223.108351Z"
+  },
+  "verification_note": "JSON network suite passed on a targeted rerun after its response reader was fixed to accept empty transport-level rejection bodies. No runtime change or rebuild was required for that fix. The final additional numeric/array boundary unit test passed locally.",
+  "limitations": [
+    "Business validation and omitted-versus-null tracking remain subsequent work.",
+    "Chunked, compressed and streaming request bodies are unsupported.",
+    "The M0 30-minute soak was not repeated for this application layer."
+  ]
+}

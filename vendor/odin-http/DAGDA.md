@@ -19,6 +19,10 @@ upstream revision above:
 - Reject duplicate Content-Length and combined Transfer-Encoding/Content-Length.
 - Validate header field-name tokens and reject folded lines and disallowed control
   bytes in field values.
+- Add optional request-start/completion observers and response user data so the
+  application can correlate and log parser failures, incomplete requests, and
+  failed writes as well as normal responses.
+- Omit raw request lines and header values from malformed-input diagnostics.
 
 Zero-valued new options retain upstream's unbounded defaults. Dagda explicitly
 sets limits and uses one HTTP event loop, no request bodies, and connection-close

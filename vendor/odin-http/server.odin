@@ -396,6 +396,9 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 	log.debugf("closing connection: %i", c.socket)
 
 	c.state = .Closing
+	if completed := c.server.handler.completed; completed != nil && c.loop.res.user_data != nil {
+		completed(&c.server.handler, &c.loop.req, &c.loop.res, false)
+	}
 	// A pending receive owns a pointer to the scanner. Cancel it before the
 	// connection can be freed; otherwise a delayed callback can use freed memory.
 	nbio.remove(c.scanner.pending)
@@ -521,13 +524,13 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		rline, err := requestline_parse(token, context.temp_allocator)
 		switch err {
 		case .Method_Not_Implemented:
-			log.infof("request-line %q invalid method", token)
+			log.info("request-line has an unsupported method")
 			headers_set_close(&l.res.headers)
 			l.res.status = .Not_Implemented
 			respond(&l.res)
 			return
 		case .Invalid_Version_Format, .Not_Enough_Fields:
-			log.warnf("request-line %q invalid: %s", token, err)
+			log.warnf("invalid request-line: %v", err)
 			clean_request_loop(l.conn, close = true)
 			return
 		case .None:
@@ -565,7 +568,7 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		}
 
 		if _, ok := header_parse(&l.req.headers, token); !ok {
-			log.warnf("header-line %s is invalid", token)
+			log.warn("invalid request header")
 			headers_set_close(&l.res.headers)
 			l.res.status = .Bad_Request
 			respond(&l.res)
@@ -632,6 +635,9 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 	c.loop.req._scanner = &c.scanner
 	request_init(&c.loop.req, allocator)
 	response_init(&c.loop.res, allocator)
+	if started := c.server.handler.started; started != nil {
+		started(&c.server.handler, &c.loop.req, &c.loop.res)
+	}
 
 	c.scanner.max_token_size = c.server.opts.limit_request_line
 	scanner_scan(&c.scanner, &c.loop, on_rline1)

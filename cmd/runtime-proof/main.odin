@@ -139,29 +139,34 @@ handle :: proc(handler: ^http.Handler, request: ^http.Request, response: ^http.R
         reply(response, 200, pool_state_json(runtime.active(&app.pool), runtime.CAPACITY))
         return
     }
-    work := runtime.Work{kind = .Item, argument = 1, deadline_ms = platform.monotonic_ms() + app.deadline_ms}
+    work := runtime.Work{query = "SELECT row_to_json(item)::text FROM (SELECT id, name FROM dagda_m0_items WHERE id = $1::bigint) item", deadline_ms = platform.monotonic_ms() + app.deadline_ms}
+    argument: i64 = 1
     switch request.url.path {
     case "/items":
         id, exists := http.query_get(request.url, "id")
         if exists {
             parsed, valid := strconv.parse_i64(id)
             if !valid || parsed <= 0 { reply(response, 400, `{"error":{"code":"invalid_id"}}`); return }
-            work.argument = parsed
+            argument = parsed
         }
     case "/_test/slow":
         if !app.test_routes { reply(response, 404, `{"error":{"code":"not_found"}}`); return }
         raw, _ := http.query_get(request.url, "ms")
         ms, valid := strconv.parse_i64(raw)
         if !valid || ms < 0 || ms > 10000 { reply(response, 400, `{"error":{"code":"invalid_delay"}}`); return }
-        work.kind = .Slow
-        work.argument = ms
+        work.query = "SELECT json_build_object('slept_ms', $1::int)::text FROM pg_sleep($1::double precision / 1000.0)"
+        argument = ms
     case "/_test/query-error":
         if !app.test_routes { reply(response, 404, `{"error":{"code":"not_found"}}`); return }
-        work.kind = .Query_Error
+        work.query = "SELECT ($1::int / 0)::text"
     case:
         reply(response, 404, `{"error":{"code":"not_found"}}`)
         return
     }
+    value := strings.clone_to_cstring(fmt.tprintf("%d", argument), context.temp_allocator)
+    parameters := make([]cstring, 1, context.temp_allocator)
+    parameters[0] = value
+    work.parameters = parameters
     slot := runtime.reserve(&app.pool, work)
     if slot == nil {
         http.headers_set_unsafe(&response.headers, "retry-after", "1")

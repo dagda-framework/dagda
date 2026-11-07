@@ -1,14 +1,16 @@
+--- a/vendor/odin-http/handlers.odin
++++ b/vendor/odin-http/handlers.odin
+@@ -14,0 +15,3 @@
++	// Optional lifecycle observers, called on the owning event loop.
++	started:   Handler_Proc,
++	completed: proc(handler: ^Handler, req: ^Request, res: ^Response, send_failed: bool),
 --- a/vendor/odin-http/http.odin
 +++ b/vendor/odin-http/http.odin
-@@ -149,18 +149,23 @@
- 
- // Parses the header and adds it to the headers if valid. The given string is copied.
- header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_allocator) -> (key: string, ok: bool) {
+@@ -152,3 +151,0 @@
 -	// Preceding spaces should not be allowed.
 -	(len(line) > 0 && line[0] != ' ') or_return
 -
- 	colon := strings.index_byte(line, ':')
- 	(colon > 0) or_return
+@@ -157,3 +154,11 @@
 -
 -	// There must not be a space before the colon.
 -	(line[colon - 1] != ' ') or_return
@@ -23,80 +25,48 @@
 +	for ch in line[colon + 1:] {
 +		(ch == '\t' || (ch >= 32 && ch != 127)) or_return
 +	}
- 
- 	// TODO/PERF: only actually relevant/needed if the key is one of these.
- 	has_host   := headers_has_unsafe(headers^, "host")
+@@ -163 +168 @@
 -	cl, has_cl := headers_get_unsafe(headers^, "content-length")
 +	_, has_cl := headers_get_unsafe(headers^, "content-length")
- 
- 	value := strings.trim_space(line[colon + 1:])
- 	tmp_key := sanitize_key(headers^, line[:colon])
-@@ -177,7 +182,7 @@
- 	// field-values or a single Content-Length header field having an
- 	// invalid value, then the message framing is invalid and the
- 	// recipient MUST treat it as an unrecoverable error.
+@@ -180 +185 @@
 -	if tmp_key == "content-length" && has_cl && cl != value {
 +	if tmp_key == "content-length" && has_cl {
- 		return
- 	}
- 
 --- a/vendor/odin-http/request.odin
 +++ b/vendor/odin-http/request.odin
-@@ -59,7 +59,7 @@
- 	// perform request smuggling (Section 9.5) or response splitting
- 	// (Section 9.4) and ought to be handled as an error.
- 	if headers_has_unsafe(headers^, "transfer-encoding") && headers_has_unsafe(headers^, "content-length") {
+@@ -62 +62 @@
 -		headers_delete_unsafe(headers, "content-length")
 +		return false
- 	}
- 
- 	return true
 --- a/vendor/odin-http/response.odin
 +++ b/vendor/odin-http/response.odin
-@@ -334,7 +334,9 @@
- 	}
- 
- 	buf := bytes.buffer_to_bytes(&r._buf)
+@@ -17,0 +18 @@
++	user_data:        rawptr,
+@@ -337 +338,3 @@
 -	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
 +	timeout := conn.server.opts.write_timeout
 +	if timeout <= 0 { timeout = nbio.NO_TIMEOUT }
 +	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent, timeout=timeout)
- }
- 
- 
+@@ -348 +351 @@
+-	clean_request_loop(conn)
++	clean_request_loop(conn, send_failed=op.send.err != nil)
+@@ -353 +356 @@
+-clean_request_loop :: proc(conn: ^Connection, close: Maybe(bool) = nil) {
++clean_request_loop :: proc(conn: ^Connection, close: Maybe(bool) = nil, send_failed := false) {
+@@ -354,0 +358,3 @@
++	if completed := conn.server.handler.completed; completed != nil {
++		completed(&conn.server.handler, &conn.loop.req, &conn.loop.res, send_failed)
++	}
 --- a/vendor/odin-http/responses.odin
 +++ b/vendor/odin-http/responses.odin
-@@ -148,7 +148,7 @@
- 	// Ends the body and sends the response.
- 	defer io.close(rw.w)
- 
+@@ -151 +151 @@
 -	if err = json.marshal_to_writer(rw.w, v, &opt); err != nil {
 +	if err = json.marshal_to_writer(rw.w, v, opt); err != nil {
- 		headers_set_close(&r.headers)
- 		response_status(r, .Internal_Server_Error)
- 	}
 --- a/vendor/odin-http/scanner.odin
 +++ b/vendor/odin-http/scanner.odin
-@@ -7,6 +7,7 @@
- import "core:bufio"
- import "core:nbio"
- import "core:net"
+@@ -9,0 +10 @@
 +import "core:time"
- 
- Scan_Callback :: #type proc(user_data: rawptr, token: string, err: bufio.Scanner_Error)
- Split_Proc    :: #type proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool)
-@@ -33,6 +34,7 @@
- 
- // A callback based scanner over the connection based on nbio.
- Scanner :: struct /* #no_copy */ {
+@@ -35,0 +37 @@
 +	pending:                      ^nbio.Operation,
- 	connection:                   ^Connection,
- 	split:                        Split_Proc,
- 	split_data:                   rawptr,
-@@ -201,11 +203,20 @@
- 	s.could_be_too_short = could_be_too_short
- 
- 	assert_has_td()
+@@ -204,2 +206,10 @@
 -	// TODO: some kinda timeout on this.
 -	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read)
 +	timeout := nbio.NO_TIMEOUT
@@ -109,90 +79,55 @@
 +		}
 +	}
 +	s.pending = nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read, timeout=timeout)
- }
- 
- scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
+@@ -208,0 +219 @@
 +	s.pending = nil
- 	context.temp_allocator = virtual.arena_allocator(&s.connection.temp_allocator)
- 
- 	defer scanner_scan(s, s.user_data, s.callback)
 --- a/vendor/odin-http/server.odin
 +++ b/vendor/odin-http/server.odin
-@@ -39,6 +39,10 @@
- 	limit_headers:           int,
- 	// The thread count to use, defaults to your core count - 1.
- 	thread_count:            int,
+@@ -41,0 +42,4 @@
 +	// Dagda M0 bounds, per event loop. Zero preserves the upstream behavior.
 +	max_connections:         int,
 +	read_timeout:            time.Duration,
 +	write_timeout:           time.Duration,
- 
- 	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
- 	// // each time it needs to grow.
-@@ -245,6 +249,9 @@
- 
- _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
- 	assert_has_td(loc)
+@@ -247,0 +252,3 @@
 +	// Stop accepting before draining; new clients must not extend shutdown.
 +	nbio.remove(td.accept)
 +	td.accept = nil
- 
- 	td.state = .Closing
- 	defer delete(td.conns)
-@@ -366,6 +373,7 @@
- 	scanner:        Scanner,
- 	temp_allocator: virtual.Arena,
- 	loop:           Loop,
+@@ -368,0 +376 @@
 +	accepted_at:    time.Tick,
- }
- 
- // Loop/request cycle state.
-@@ -388,6 +396,10 @@
- 	log.debugf("closing connection: %i", c.socket)
- 
- 	c.state = .Closing
+@@ -390,0 +399,7 @@
++	if completed := c.server.handler.completed; completed != nil && c.loop.res.user_data != nil {
++		completed(&c.server.handler, &c.loop.req, &c.loop.res, false)
++	}
 +	// A pending receive owns a pointer to the scanner. Cancel it before the
 +	// connection can be freed; otherwise a delayed callback can use freed memory.
 +	nbio.remove(c.scanner.pending)
 +	c.scanner.pending = nil
- 
- 	// RFC 7230 6.6.
- 
-@@ -414,6 +426,10 @@
- @(private)
- on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
- 	td.accept = nil
+@@ -416,0 +432,4 @@
 +	if atomic_load(&server.closing) {
 +		if op.accept.err == nil { net.close(op.accept.client) }
 +		return
 +	}
- 
- 	if op.accept.err != nil {
- 		#partial switch op.accept.err {
-@@ -430,11 +446,16 @@
- 
- 	// Accept next connection.
- 	td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
+@@ -432,0 +452,4 @@
 +	if server.opts.max_connections > 0 && len(td.conns) >= server.opts.max_connections {
 +		net.close(op.accept.client)
 +		return
 +	}
- 
- 	c := new(Connection, server.conn_allocator)
- 	c.state = .New
- 	c.server = server
- 	c.socket = op.accept.client
+@@ -437,0 +461 @@
 +	c.accepted_at = time.tick_now()
- 	c.loop.req.client = op.accept.client_endpoint
- 
- 	td.conns[c.socket] = c
-@@ -450,7 +471,8 @@
- 
- 	// allocator_init(&c.temp_allocator, c.server.conn_allocator)
- 	// context.temp_allocator = allocator(&c.temp_allocator)
+@@ -453 +477,2 @@
 -	err := virtual.arena_init_growing(&c.temp_allocator)
 +	c.temp_allocator.default_commit_size = 64 * mem.Kilobyte
 +	err := virtual.arena_init_growing(&c.temp_allocator, 64 * mem.Kilobyte)
- 	assert(err == nil)
- 	context.temp_allocator = virtual.arena_allocator(&c.temp_allocator)
- 
+@@ -502 +527 @@
+-			log.infof("request-line %q invalid method", token)
++			log.info("request-line has an unsupported method")
+@@ -508 +533 @@
+-			log.warnf("request-line %q invalid: %s", token, err)
++			log.warnf("invalid request-line: %v", err)
+@@ -546 +571 @@
+-			log.warnf("header-line %s is invalid", token)
++			log.warn("invalid request header")
+@@ -612,0 +638,3 @@
++	if started := c.server.handler.started; started != nil {
++		started(&c.server.handler, &c.loop.req, &c.loop.res)
++	}

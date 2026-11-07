@@ -1,6 +1,5 @@
 package dagda_runtime
 
-import "core:fmt"
 import "core:mem/virtual"
 import "core:nbio"
 import "core:strings"
@@ -13,13 +12,19 @@ CAPACITY :: 8
 WORKERS :: 2
 ARENA_BYTES :: 32 * 1024
 
-Kind :: enum { Item, Slow, Query_Error }
 State :: enum { Free, Queued, Running, Ready }
 
 Work :: struct {
-    kind: Kind,
-    argument: i64,
+    query: cstring,
+    parameters: []cstring,
     deadline_ms: i64,
+}
+
+valid_work :: proc(work: Work) -> bool {
+    if work.query == nil || len(string(work.query)) == 0 || len(string(work.query)) > 4096 || len(work.parameters) > 8 { return false }
+    size := len(string(work.query))
+    for value in work.parameters { size += len(string(value)) + 1 }
+    return size <= 8192
 }
 
 Slot :: struct {
@@ -65,6 +70,7 @@ start :: proc(p: ^Pool, conninfo: cstring) -> bool {
 
 // Called on the event loop. A slot reserves both dispatch and completion space.
 reserve :: proc(p: ^Pool, work: Work) -> ^Slot {
+    if !valid_work(work) { return nil }
     sync.mutex_lock(&p.mu)
     defer sync.mutex_unlock(&p.mu)
     if p.stopping || p.inflight == CAPACITY { return nil }
@@ -77,6 +83,12 @@ reserve :: proc(p: ^Pool, work: Work) -> ^Slot {
         slot.transport_data = nil
         slot.arena = {}
         if virtual.arena_init_buffer(&slot.arena, slot.storage[:]) != nil { return nil }
+        allocator := virtual.arena_allocator(&slot.arena)
+        slot.work.query = strings.clone_to_cstring(string(work.query), allocator)
+        slot.work.parameters = make([]cstring, len(work.parameters), allocator)
+        for value, i in work.parameters {
+            if value != nil { slot.work.parameters[i] = strings.clone_to_cstring(string(value), allocator) }
+        }
         slot.state = .Queued
         p.inflight += 1
         return &slot
@@ -167,18 +179,7 @@ execute :: proc(worker: ^Worker, slot: ^Slot) {
         worker.connection, err = db.connect(worker.pool.conninfo, slot.work.deadline_ms)
     }
     if err == .None {
-        argument := strings.clone_to_cstring(fmt.tprintf("%d", slot.work.argument), allocator)
-        parameters := [1]cstring{argument}
-        query: cstring
-        switch slot.work.kind {
-        case .Item:
-            query = "SELECT row_to_json(item)::text FROM (SELECT id, name FROM dagda_m0_items WHERE id = $1::bigint) item"
-        case .Slow:
-            query = "SELECT json_build_object('slept_ms', $1::int)::text FROM pg_sleep($1::double precision / 1000.0)"
-        case .Query_Error:
-            query = "SELECT ($1::int / 0)::text"
-        }
-        slot.body, err = db.query_text(&worker.connection, query, parameters[:], slot.work.deadline_ms, allocator)
+        slot.body, err = db.query_text(&worker.connection, slot.work.query, slot.work.parameters, slot.work.deadline_ms, allocator)
     }
     switch err {
     case .None: slot.status = 200

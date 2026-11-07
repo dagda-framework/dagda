@@ -15,6 +15,7 @@ Response :: struct {
 
 	// If the response has been sent.
 	sent:             bool,
+	user_data:        rawptr,
 
 	// NOTE: use `http.response_status` if the response body might have been set already.
 	status:           Status,
@@ -347,13 +348,16 @@ on_response_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {
 		if !connection_set_state(conn, .Will_Close) { return }
 	}
 
-	clean_request_loop(conn)
+	clean_request_loop(conn, send_failed=op.send.err != nil)
 }
 
 // Response has been sent, clean up and close/handle next.
 @(private)
-clean_request_loop :: proc(conn: ^Connection, close: Maybe(bool) = nil) {
+clean_request_loop :: proc(conn: ^Connection, close: Maybe(bool) = nil, send_failed := false) {
 	context.temp_allocator = virtual.arena_allocator(&conn.temp_allocator)
+	if completed := conn.server.handler.completed; completed != nil {
+		completed(&conn.server.handler, &conn.loop.req, &conn.loop.res, send_failed)
+	}
 
 	// blocks, size, used := allocator_free_all(&conn.temp_allocator)
 	// log.debugf("temp_allocator had %d blocks of a total size of %m of which %m was used", blocks, size, used)

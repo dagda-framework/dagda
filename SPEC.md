@@ -8,7 +8,7 @@ Confirmed decisions: name Dagda, implementation language Odin, backend-only scop
 
 Dagda will provide a complete path from a new Odin project to a deployed, database-backed API. Its central promise is that routine backend capabilities work together: routing, data access, validation, authentication, durable jobs, testing, and deployment share consistent conventions.
 
-This specification defines the intended behavior. No framework implementation exists yet. The first release is a narrow, usable alpha; production readiness depends on the runtime and failure tests described below.
+This specification defines the intended behavior. The [M0 runtime proof](docs/M0.md) and initial [M1 application packages](docs/M1.md) are implemented; later features remain proposals. The first release is a narrow, usable alpha; production readiness depends on the runtime and failure tests described below.
 
 ## Product goals
 

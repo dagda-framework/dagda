@@ -40,7 +40,7 @@ def process_sample(pid):
 
 
 class RuntimeFixture:
-    def __init__(self, artifacts=None, binary=None):
+    def __init__(self, artifacts=None, binary=None, environment=None):
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         self.artifacts = Path(artifacts or ROOT / 'build/runtime-checks' / stamp).resolve()
         self.binary = Path(binary or ROOT / 'build/dagda-m0').resolve()
@@ -48,6 +48,7 @@ class RuntimeFixture:
         self.output = None
         self.temporary = None
         self.initialized = False
+        self.environment = environment or {}
 
     def __enter__(self):
         self.artifacts.mkdir(parents=True, exist_ok=False)
@@ -76,6 +77,7 @@ class RuntimeFixture:
                 self.port = reservation.getsockname()[1]
             env = dict(self.env, DAGDA_DATABASE_URL=self.conninfo,
                        DAGDA_LISTEN=f'127.0.0.1:{self.port}', DAGDA_TEST_ROUTES='1', DAGDA_DEADLINE_MS='1200')
+            env.update(self.environment)
             self.output = self.server_log.open('w')
             self.process = subprocess.Popen([str(self.binary)], env=env, stdout=self.output, stderr=self.output)
             def ready():
@@ -102,10 +104,10 @@ class RuntimeFixture:
                                 check=True, capture_output=True, text=True, env=self.env, timeout=10)
         return result.stdout.strip()
 
-    def request(self, path, method='GET'):
+    def request(self, path, method='GET', headers=None, body=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
         try:
-            connection.request(method, path)
+            connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
             payload = response.read()
             headers = dict(response.getheaders())

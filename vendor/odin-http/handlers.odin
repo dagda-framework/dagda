@@ -12,6 +12,9 @@ Handler :: struct {
 	user_data: rawptr,
 	next:      Maybe(^Handler),
 	handle:    Handler_Proc,
+	// Optional lifecycle observers, called on the owning event loop.
+	started:   Handler_Proc,
+	completed: proc(handler: ^Handler, req: ^Request, res: ^Response, send_failed: bool),
 }
 
 // TODO: something like http.handler_with_body which gets the body before calling the handler.

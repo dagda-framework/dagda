@@ -1,0 +1,46 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "scope": "M1 explicit field validation and structured validation errors; not full M1 or production qualification",
+  "passed": true,
+  "source": {
+    "base_commit": "ee80ad748aed15cdfd8e92eaed8c3c5d78aa11a8",
+    "working_tree_modified": true,
+    "binary_sha256": "33121c62a23c66113f37208f5d1b04f893bde4c5bd0f24844843182bf6cac951"
+  },
+  "tests": {
+    "odin_unit_tests": 26,
+    "new_validation_unit_tests": 7,
+    "python_harness_tests": 7,
+    "evidence": "The test.sh run reached and completed every integration suite; validation and HTTP unit suites also passed locally."
+  },
+  "network": {
+    "passed": true,
+    "suite": "M1 field validation",
+    "observed_request_ids": 123,
+    "before": {
+      "rss_kib": 7248,
+      "virtual_kib": 1106792,
+      "threads": 3,
+      "fds": 6
+    },
+    "after": {
+      "rss_kib": 7256,
+      "virtual_kib": 1106792,
+      "threads": 3,
+      "fds": 6
+    }
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T011728.439764Z",
+    "m0_failures": "build/runtime-checks/20261107T011736.624151Z",
+    "m1_application": "build/runtime-checks/20261107T011805.104132Z",
+    "typed_json": "build/runtime-checks/20261107T011816.498323Z",
+    "validation": "build/runtime-checks/20261107T011826.727979Z"
+  },
+  "limitations": [
+    "Presence inspection covers exact top-level wire names; nested presence and a general patch/update API remain future work.",
+    "Rules are explicit application checks, with no schema DSL or automatic database validation.",
+    "The historical M0 30-minute soak was not repeated."
+  ]
+}
