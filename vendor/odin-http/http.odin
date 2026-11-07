@@ -149,18 +149,23 @@ method_parse :: proc(m: string) -> (method: Method, ok: bool) #no_bounds_check {
 
 // Parses the header and adds it to the headers if valid. The given string is copied.
 header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_allocator) -> (key: string, ok: bool) {
-	// Preceding spaces should not be allowed.
-	(len(line) > 0 && line[0] != ' ') or_return
-
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return
-
-	// There must not be a space before the colon.
-	(line[colon - 1] != ' ') or_return
+	// Field names are HTTP tokens, never whitespace or separators. This also
+	// rejects obsolete folded lines and whitespace before the colon.
+	for ch in line[:colon] {
+		valid := ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') ||
+		         ('0' <= ch && ch <= '9') || strings.contains_rune("!#$%&'*+-.^_`|~", ch)
+		valid or_return
+	}
+	// HTAB is permitted in field values; other controls and DEL are not.
+	for ch in line[colon + 1:] {
+		(ch == '\t' || (ch >= 32 && ch != 127)) or_return
+	}
 
 	// TODO/PERF: only actually relevant/needed if the key is one of these.
 	has_host   := headers_has_unsafe(headers^, "host")
-	cl, has_cl := headers_get_unsafe(headers^, "content-length")
+	_, has_cl := headers_get_unsafe(headers^, "content-length")
 
 	value := strings.trim_space(line[colon + 1:])
 	tmp_key := sanitize_key(headers^, line[:colon])

@@ -1,0 +1,172 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "scope": "M0 prototype stability under the declared workload; not a maximum-capacity or production qualification result",
+  "environment": {
+    "platform": "Linux-7.2.15-1-omarchy-x86_64-with-glibc2.44",
+    "cpu_model": "12th Gen Intel(R) Core(TM) i7-1270P",
+    "logical_cpus": 16,
+    "memory_total": "MemTotal:       32509764 kB",
+    "postgres": "PostgreSQL 18.6 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 16.2.1 20260810, 64-bit"
+  },
+  "compiler": "dev-2026-11-nightly:9a69916",
+  "source": {
+    "base_commit": "1ea12231f54fd3f1cc7496fd413fee834774b2bd",
+    "working_tree_modified": true,
+    "binary_sha256": "ed34ffaed72a1443f41138ed8611026970e379236ad728221783266982e3677a"
+  },
+  "build_flags": [
+    "-debug",
+    "-o:speed"
+  ],
+  "workload": "50% small JSON, 50% indexed PostgreSQL lookup; new HTTP connection per request",
+  "settings": {
+    "duration": 1800,
+    "warmup": 30,
+    "rate": 40,
+    "concurrency": 8,
+    "sample_interval": 5,
+    "max_growth_mib": 8,
+    "max_slope_mib_per_minute": 0.25
+  },
+  "latency_note": "scheduled latency includes generator scheduling delay; service latency starts in the client worker; quantiles are 1 ms bucket upper bounds",
+  "resources_note": "server process only; excludes PostgreSQL and Python load generator; post-drain descriptor sample includes the final state-probe connection during its close grace period",
+  "passed": true,
+  "full_duration": true,
+  "checks": {
+    "no_request_errors_or_client_drops": true,
+    "monitor_succeeded": true,
+    "admission_bounded": true,
+    "stable_thread_count": true,
+    "memory_samples_sufficient": true,
+    "rss_growth_within_budget": true,
+    "file_descriptors_bounded": true,
+    "late_rss_slope_within_budget": true
+  },
+  "warmup": {
+    "requests": 1200,
+    "errors": {},
+    "error_rate": 0.0
+  },
+  "measurement": {
+    "offered": 72000,
+    "completed": 72000,
+    "successful": 72000,
+    "elapsed_seconds": 1800.0010539889918,
+    "completed_rps": 39.99997657803612,
+    "successful_rps": 39.99997657803612,
+    "error_rate": 0.0,
+    "client_skipped": {},
+    "statuses": {
+      "200": 72000
+    },
+    "errors": {},
+    "latency": {
+      "json": {
+        "scheduled": {
+          "count": 36000,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "p99_ms": 3,
+          "max_ms": 14.906,
+          "bucket_width_ms": 1,
+          "overflow_bucket_ms": 60000
+        },
+        "service": {
+          "count": 36000,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "p99_ms": 3,
+          "max_ms": 13.653,
+          "bucket_width_ms": 1,
+          "overflow_bucket_ms": 60000
+        }
+      },
+      "lookup": {
+        "scheduled": {
+          "count": 36000,
+          "p50_ms": 3,
+          "p95_ms": 4,
+          "p99_ms": 5,
+          "max_ms": 17.065,
+          "bucket_width_ms": 1,
+          "overflow_bucket_ms": 60000
+        },
+        "service": {
+          "count": 36000,
+          "p50_ms": 3,
+          "p95_ms": 4,
+          "p99_ms": 4,
+          "max_ms": 16.207,
+          "bucket_width_ms": 1,
+          "overflow_bucket_ms": 60000
+        }
+      }
+    },
+    "memory": {
+      "early_median_mib": 6.49609375,
+      "late_median_mib": 6.49609375,
+      "growth_mib": 0.0,
+      "late_slope_mib_per_minute": 5.205860484726084e-06,
+      "peak_mib": 6.5,
+      "fd_growth": 0.0
+    },
+    "samples": 360,
+    "monitor_errors": {},
+    "peak_inflight": 1,
+    "thread_counts": [
+      3
+    ]
+  },
+  "measured_resource_ranges": {
+    "rss_kib": {
+      "min": 6652,
+      "max": 6656
+    },
+    "fds": {
+      "min": 27,
+      "max": 29
+    },
+    "threads": {
+      "min": 3,
+      "max": 3
+    }
+  },
+  "post_drain": {
+    "rss_kib": 6576,
+    "virtual_kib": 1237244,
+    "threads": 3,
+    "fds": 9
+  },
+  "failure_checks": {
+    "passed": true,
+    "before_disconnects": {
+      "rss_kib": 7116,
+      "virtual_kib": 1237644,
+      "threads": 3,
+      "fds": 8
+    },
+    "after_disconnects": {
+      "rss_kib": 7136,
+      "virtual_kib": 1237644,
+      "threads": 3,
+      "fds": 8
+    }
+  },
+  "unit_tests": {
+    "odin": 4,
+    "python_harness": 7,
+    "passed": true
+  },
+  "smoke_test": {
+    "passed": true,
+    "duration_seconds": 30.000851849996252,
+    "requests": 1200
+  },
+  "artifacts": {
+    "full_run": "build/runtime-checks/20261106T234430.799588Z",
+    "failure_run": "build/runtime-checks/20261106T233711.603599Z",
+    "smoke_run": "build/runtime-checks/20261106T234335.155643Z"
+  },
+  "decision": "Retain the pinned, patched odin-http transport behind the adapter for M1 prototype development with current limits. Keep-alive, body-consuming routes, broader HTTP conformance and allocator/lifetime instrumentation remain separate gates."
+}

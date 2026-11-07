@@ -2,7 +2,7 @@
 
 Date: 2026-11-06
 
-Status: architecture proposal; [M0 implementation in progress](docs/M0.md)
+Status: architecture proposal; [M0 bounded runtime proof validated](docs/M0.md)
 
 Confirmed decisions: name Dagda, implementation language Odin, backend-only scope
 

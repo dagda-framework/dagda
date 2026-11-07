@@ -2,7 +2,7 @@
 
 Dagda is a batteries-included backend framework being built in Odin. Its intended scope brings application conventions, PostgreSQL, authentication, background jobs, and development tooling into one workflow for building JSON APIs.
 
-**Status:** M0 runtime prototype in progress. The pinned compiler, HTTP adapter, bounded worker pool, and PostgreSQL lookup are implemented. The framework CLI, authentication, migrations, and jobs remain specifications. This prototype is not production-ready.
+**Status:** M0 runtime prototype validated for its bounded local workload: integration/failure tests and a 30-minute stability run pass. The pinned compiler, HTTP adapter, bounded worker pool, and PostgreSQL lookup are implemented. M1 application foundations are next; the framework CLI, authentication, migrations, and jobs remain specifications. This prototype is not production-ready.
 
 Read the [project specification](SPEC.md) for scope, runtime design, release milestones, and acceptance criteria.
 
@@ -13,6 +13,7 @@ bash scripts/setup-odin.sh
 ./scripts/build.sh
 ./scripts/test-unit.sh
 ./scripts/test.sh
+./scripts/load-test.sh # 30-second warmup + 30-minute stability measurement
 ```
 
 Currently requires Linux x86_64 with permitted `io_uring`, a C compiler, libpq 17+, Python 3, and PostgreSQL server tools for integration tests. Tests create and remove their own temporary database.

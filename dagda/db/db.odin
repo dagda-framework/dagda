@@ -139,6 +139,12 @@ query_text :: proc(conn: ^^Conn, query: cstring, parameters: []cstring,
         seen = true
         PQclear(result)
     }
+    // A disconnected backend can deliver a fatal result before libpq marks the
+    // connection bad. It is an availability failure, not an application SQL error.
+    if PQstatus(conn^) != 0 {
+        close(conn)
+        return "", .Unavailable
+    }
     if !seen && query_error == .None { query_error = .Unexpected_Result }
     return value, query_error
 }

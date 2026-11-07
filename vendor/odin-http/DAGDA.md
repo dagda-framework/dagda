@@ -17,6 +17,8 @@ upstream revision above:
   before connection storage is freed.
 - Reduce the initial connection arena commitment to 64 KiB.
 - Reject duplicate Content-Length and combined Transfer-Encoding/Content-Length.
+- Validate header field-name tokens and reject folded lines and disallowed control
+  bytes in field values.
 
 Zero-valued new options retain upstream's unbounded defaults. Dagda explicitly
 sets limits and uses one HTTP event loop, no request bodies, and connection-close
