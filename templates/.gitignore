@@ -1,0 +1,6 @@
+/build/
+/vendor/dagda/build/
+/.tools/
+.env
+.env.*
+!.env.example

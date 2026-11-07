@@ -1,0 +1,49 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "passed": true,
+  "scope": "M1 CLI skeleton and clean generated application acceptance; full regression suite",
+  "source": {
+    "base_commit": "681f3d039dc3c03a63d04a886b7f7251be814fd8",
+    "working_tree_modified": true,
+    "cli_sha256": "db717242850baf6f6b47e755896871ab96ff881ac8bd9a113f00d71172851836"
+  },
+  "command": "./scripts/test.sh",
+  "checks": {
+    "odin_tests": 38,
+    "cli_unit_tests": 3,
+    "generated_application_tests": 2,
+    "python_harness_tests": 7,
+    "integration_suites": 6
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T014814.998869Z",
+    "m0_failures": "build/runtime-checks/20261107T014823.230178Z",
+    "m1_application": "build/runtime-checks/20261107T014851.646368Z",
+    "typed_json": "build/runtime-checks/20261107T014904.276384Z",
+    "validation": "build/runtime-checks/20261107T014914.526835Z",
+    "generated_application": "build/runtime-checks/20261107T014947.756788Z"
+  },
+  "generated_application": {
+    "passed": true,
+    "suite": "M1 generated application and CLI",
+    "build": {
+      "app": "billing",
+      "framework_revision": "681f3d039dc3c03a63d04a886b7f7251be814fd8-dirty",
+      "framework_source_sha256": "166b881cb9889b1e8275a9a1abbe9e835c49b02db2f1695e2c5950c17894eaab",
+      "compiler": "dev-2026-11-nightly:9a69916",
+      "mode": "release"
+    },
+    "cli_sha256": "db717242850baf6f6b47e755896871ab96ff881ac8bd9a113f00d71172851836",
+    "application_sha256": "295c2c2a4c2f0e6008bcf779d9dfd6c89282a30120fb450413bafe93f0c9b1d7",
+    "shutdown_exit_code": 0
+  },
+  "notes": [
+    "All checks ran in the agent shell; no terminal handoff required.",
+    "Copied CLI generated and built an app outside the checkout in a path containing spaces and a dollar sign.",
+    "Doctor used its separate checker while the release app served; graceful shutdown returned zero.",
+    "M1 acceptance criterion met: clean generated app runs and request tests pass.",
+    "No new 30-minute soak was run; prior M0 stability evidence remains separate.",
+    "Linux x86_64 only. Later CLI commands and production qualification remain outside this scope."
+  ]
+}

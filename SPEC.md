@@ -83,6 +83,10 @@ Version 0.1 must complete the vertical slice across these areas rather than expo
 
 ## Application and CLI
 
+The M1 skeleton implements `new`, `doctor`, `test`, and `build` as described in
+[the CLI guide](docs/CLI.md). The table below describes the broader target; later
+commands and container recipe generation remain planned.
+
 The development CLI is named `dagda`. The generated application is compiled from ordinary Odin packages. The CLI invokes the pinned toolchain and app commands rather than duplicating application behavior in a separate runtime.
 
 | Command | Contract |

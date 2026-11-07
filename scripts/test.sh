@@ -9,3 +9,4 @@ python3 tests/failures.py
 python3 tests/application.py
 python3 tests/json_api.py
 python3 tests/validation_api.py
+python3 tests/cli.py
