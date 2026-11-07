@@ -33,6 +33,7 @@ Slot :: struct {
     arena: virtual.Arena,
     storage: [ARENA_BYTES]byte,
     status: int,
+    error: db.Error,
     body: string,
     completion: ^nbio.Operation, // allocated on the destination event loop
     transport_data: rawptr, // accessed only by the event loop
@@ -78,6 +79,7 @@ reserve :: proc(p: ^Pool, work: Work) -> ^Slot {
         if slot.state != .Free { continue }
         slot.work = work
         slot.status = 500
+        slot.error = .None
         slot.body = ""
         slot.completion = nil
         slot.transport_data = nil
@@ -181,6 +183,7 @@ execute :: proc(worker: ^Worker, slot: ^Slot) {
     if err == .None {
         slot.body, err = db.query_text(&worker.connection, slot.work.query, slot.work.parameters, slot.work.deadline_ms, allocator)
     }
+    slot.error = err
     switch err {
     case .None: slot.status = 200
     case .Deadline:

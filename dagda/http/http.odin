@@ -53,6 +53,8 @@ Context :: struct {
     _handler: Handler,
     _global, _local: []Middleware,
     _reply: Reply_Proc,
+    _reply_data: rawptr,
+    _query_attempted: bool,
     _logger: Access_Logger,
     _logger_data: rawptr,
     _result: Result_Handler,
@@ -89,14 +91,13 @@ set_header :: proc(c: ^Context, name, value: string) -> bool {
     return true
 }
 
-// Raw, already-encoded JSON is the M1 step-1/2 response API. Typed encoding and
-// request body decoding are separate work. Responses are capped at 8 KiB.
+// Already-encoded JSON, including successful PostgreSQL results. Responses are
+// capped at 8 KiB. Application errors should use fail/respond_error.
 json_text :: proc(c: ^Context, status: int, body: string) -> bool {
     status, body := status, body
     if c._state != .Open { return false }
     if status < 200 || status > 599 || len(body) > 8192 {
-        status = 500
-        body = `{"error":{"code":"invalid_response"}}`
+        return fail(c, .Invalid_Response)
     }
     c._state = .Responded
     if !c._defer_log { log_completed(c, status, "response") }
@@ -142,21 +143,22 @@ dispatch :: proc(c: ^Context, handler: Handler, data: rawptr = nil,
     c._global = global_middleware
     c._local = route_middleware
     invoke(c, 0)
-    if c._state == .Open { json_text(c, 500, `{"error":{"code":"handler_did_not_respond"}}`) }
+    if c._state == .Open { fail(c, .Handler_Did_Not_Respond) }
 }
 
 // Copies SQL and parameters before returning. No transport or caller-owned
 // string reaches a worker. At most one database operation is pending per request.
 query_text :: proc(c: ^Context, sql: cstring, parameters: []cstring = nil, result: Result_Handler = nil) -> bool {
     if c._state != .Open { return false }
+    c._query_attempted = true
     work := runtime.Work{query = sql, parameters = parameters, deadline_ms = c.deadline_ms}
     if !runtime.valid_work(work) || c._pool == nil {
-        return json_text(c, 500, `{"error":{"code":"invalid_database_work"}}`)
+        return fail(c, .Invalid_Database_Work)
     }
     slot := runtime.reserve(c._pool, work)
     if slot == nil {
         set_header(c, "retry-after", "1")
-        return json_text(c, 503, `{"error":{"code":"overloaded"}}`)
+        return fail(c, .Overloaded)
     }
     c._state = .Pending
     c._result = result
@@ -174,28 +176,30 @@ complete :: proc(op: ^nbio.Operation) {
     context.allocator = c.allocator
     context.temp_allocator = c.allocator
     status := slot.status
+    error := slot.error
     body := strings.clone(slot.body, c.allocator)
     runtime.release(c._pool, slot)
-    c._state = .Open
-    result := c._result
-    c._result = nil
-    if result != nil { result(c, status, body) } else { json_text(c, status, body) }
-    if c._state == .Open { json_text(c, 500, `{"error":{"code":"handler_did_not_respond"}}`) }
+    query_result(c, status, body, error)
 }
 
+// Shared response semantics for the socket adapter and in-process test client.
+response_parts :: proc(c: ^Context, status: int, body: string) -> (payload: string, headers: []Header) {
+    length := len(body)
+    if status == 204 || status == 304 { length = 0 }
+    headers = make([]Header, 4 + len(c.response_headers), c.allocator)
+    headers[0] = {"connection", "close"}
+    headers[1] = {"content-type", "application/json"}
+    headers[2] = {"x-request-id", c.request_id}
+    headers[3] = {"content-length", fmt.tprintf("%d", length)}
+    copy(headers[4:], c.response_headers[:])
+    payload = "" if c.method == .Head || status == 204 || status == 304 else body
+    return
+}
 write_response :: proc(c: ^Context, status: int, body: string) {
-    body := body
+    payload, headers := response_parts(c, status, body)
     response := c._response
     response.status = transport.Status(status)
-    transport.headers_set_close(&response.headers)
-    transport.headers_set_content_type(&response.headers, "application/json")
-    transport.headers_set_unsafe(&response.headers, "x-request-id", c.request_id)
-    for entry in c.response_headers { transport.headers_set_unsafe(&response.headers, entry.name, entry.value) }
-    // HEAD is explicit in the router and never sends response payload bytes.
-    if c.method == .Head && status != 204 && status != 304 {
-        transport.headers_set_unsafe(&response.headers, "content-length", fmt.tprintf("%d", len(body)))
-    }
-    if c.method == .Head || status == 204 || status == 304 { body = "" }
-    transport.body_set(response, body)
+    for header in headers { transport.headers_set_unsafe(&response.headers, header.name, header.value) }
+    transport.body_set(response, payload)
     transport.respond(response)
 }

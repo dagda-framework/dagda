@@ -26,7 +26,7 @@ respond_json :: proc(c: ^Context, status: int, value: $T) -> bool {
     if c._state != .Open { return false }
     w: JSON_Writer
     error := json.marshal_to_writer(io.Writer{procedure=json_write, data=&w}, value, {spec=.JSON})
-    if error != nil { return json_text(c, 500, `{"error":{"code":"invalid_response"}}`) }
+    if error != nil { return fail(c, .Invalid_Response) }
     // write_response copies body bytes into transport storage before returning.
     return json_text(c, status, string(w.bytes[:w.count]))
 }
@@ -36,7 +36,7 @@ respond_json :: proc(c: ^Context, status: int, value: $T) -> bool {
 decode_json :: proc(c: ^Context, destination: ^$T) -> bool {
     if c._state != .Open { return false }
     if destination == nil || c._json_decoded {
-        json_text(c, 500, `{"error":{"code":"invalid_json_destination"}}`)
+        fail(c, .Invalid_JSON_Destination)
         return false
     }
     c._json_decoded = true
@@ -44,22 +44,22 @@ decode_json :: proc(c: ^Context, destination: ^$T) -> bool {
     context.temp_allocator = c.allocator
     media, _ := header(c, "content-type")
     if !json_media_type(media) {
-        json_text(c, 415, `{"error":{"code":"unsupported_media_type"}}`)
+        fail(c, .Unsupported_Media_Type)
         return false
     }
     if !json_syntax_safe(c.body) {
-        json_text(c, 400, `{"error":{"code":"invalid_json"}}`)
+        fail(c, .Invalid_JSON)
         return false
     }
     parser := json.make_parser(c.body, spec=.JSON, parse_integers=true, allocator=c.allocator)
     value, error := json.parse_value(&parser)
     if error != nil || parser.curr_token.kind != .EOF || (parser.curr_token_err != nil && parser.curr_token_err != .EOF) || !json_matches(value, type_info_of(T)) {
-        json_text(c, 400, `{"error":{"code":"invalid_json"}}`)
+        fail(c, .Invalid_JSON)
         return false
     }
     decoded: T
     if json.unmarshal_string(c.body, &decoded, spec=.JSON, allocator=c.allocator) != nil {
-        json_text(c, 400, `{"error":{"code":"invalid_json"}}`)
+        fail(c, .Invalid_JSON)
         return false
     }
     destination^ = decoded
@@ -82,7 +82,7 @@ json_media_type :: proc(value: string) -> bool {
 
 // Bound recursion before calling the standard parser. Tokenization also checks
 // numeric range before the standard decoder can narrow an integer by casting.
-json_syntax_safe :: proc(body: string) -> bool {
+json_syntax_safe :: proc(body: string, bounded_integers := true) -> bool {
     if len(body) == 0 || len(body) > MAX_JSON_BYTES || !utf8.valid_string(body) { return false }
     tokenizer := json.make_tokenizer(body, .JSON, true)
     depth := 0
@@ -103,7 +103,9 @@ json_syntax_safe :: proc(body: string) -> bool {
             depth -= 1
             if depth < 0 { return false }
         case .Integer:
-            if _, ok := strconv.parse_i64(token.text); !ok { return false }
+            if bounded_integers {
+                if _, ok := strconv.parse_i64(token.text); !ok { return false }
+            }
         case .Float:
             number, ok := strconv.parse_f64(token.text)
             if !ok || math.is_nan(number) || math.is_inf(number) { return false }

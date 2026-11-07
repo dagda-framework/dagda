@@ -1,0 +1,100 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "passed": true,
+  "scope": "M1 Odin application testing and common application error envelopes; not CLI completion or production qualification",
+  "source": {
+    "base_commit": "fadb8f2d3a82e45e309052bce2c245629f1c7780",
+    "working_tree_modified": true,
+    "tested_binary_sha256": "472f7f932291052e6ba129e59950207075845038cd8f4dd06ed9c541b3cdf5f0"
+  },
+  "checks": {
+    "odin_tests": 35,
+    "network_run_odin_tests": 34,
+    "python_harness_tests": 7,
+    "integration_suites": 5,
+    "in_process_testing_tests": 5,
+    "example_application_tests": 2,
+    "http_unit_tests": 14
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T013026.885240Z",
+    "m0_failures": "build/runtime-checks/20261107T013035.110677Z",
+    "m1_application": "build/runtime-checks/20261107T013103.523450Z",
+    "typed_json": "build/runtime-checks/20261107T013116.076541Z",
+    "validation": "build/runtime-checks/20261107T013126.280739Z"
+  },
+  "results": {
+    "m0_failures": {
+      "passed": true,
+      "before_disconnects": {
+        "rss_kib": 7080,
+        "virtual_kib": 1237648,
+        "threads": 3,
+        "fds": 8
+      },
+      "after_disconnects": {
+        "rss_kib": 7100,
+        "virtual_kib": 1237568,
+        "threads": 3,
+        "fds": 8
+      }
+    },
+    "m1_application": {
+      "passed": true,
+      "suite": "M1 lifecycle and routing",
+      "observed_request_ids": 147,
+      "before_reuse": {
+        "rss_kib": 7340,
+        "virtual_kib": 1237868,
+        "threads": 3,
+        "fds": 8
+      },
+      "after_reuse": {
+        "rss_kib": 7340,
+        "virtual_kib": 1237868,
+        "threads": 3,
+        "fds": 8
+      }
+    },
+    "typed_json": {
+      "passed": true,
+      "suite": "M1 typed JSON",
+      "before": {
+        "rss_kib": 7488,
+        "virtual_kib": 1106868,
+        "threads": 3,
+        "fds": 6
+      },
+      "after": {
+        "rss_kib": 7488,
+        "virtual_kib": 1106868,
+        "threads": 3,
+        "fds": 6
+      }
+    },
+    "validation": {
+      "passed": true,
+      "suite": "M1 field validation",
+      "observed_request_ids": 123,
+      "before": {
+        "rss_kib": 7252,
+        "virtual_kib": 1106796,
+        "threads": 3,
+        "fds": 6
+      },
+      "after": {
+        "rss_kib": 7260,
+        "virtual_kib": 1106796,
+        "threads": 3,
+        "fds": 6
+      }
+    }
+  },
+  "verification_note": "The full terminal script reached and passed all network suites with 34 Odin tests. A subsequent test-client-only unsigned-64 response decoding case passed locally along with all 14 HTTP tests, bringing the current Odin total to 35. The response test decoder can bypass the signed-64 input check; production request decoding retains its default bound.",
+  "limitations": [
+    "In-process application tests do not run lifecycle hooks, sockets, external log sinks, or database operations. Database attempts fail explicitly.",
+    "The common envelope applies to application errors; raw transport parser rejections and the M0 proof adapter retain their existing responses.",
+    "Historical M0 soak was not repeated."
+  ]
+}

@@ -122,11 +122,11 @@ typed_json_response_failures_are_atomic :: proc(t: ^testing.T) {
     c := Context{allocator=allocator, _reply=json_reply, user_data=&probe}
     testing.expect(t, respond_json(&c, 200, struct {value: f64}{math.inf_f64(1)}))
     testing.expect_value(t, probe.status, 500)
-    testing.expect_value(t, probe.body, `{"error":{"code":"invalid_response"}}`)
+    testing.expect_value(t, probe.body, `{"error":{"code":"invalid_response","message":"Internal server error"},"request_id":""}`)
     c._state = .Open
     testing.expect(t, respond_json(&c, 200, strings.repeat("x", MAX_JSON_BYTES, allocator)))
     testing.expect_value(t, probe.status, 500)
-    testing.expect_value(t, probe.body, `{"error":{"code":"invalid_response"}}`)
+    testing.expect_value(t, probe.body, `{"error":{"code":"invalid_response","message":"Internal server error"},"request_id":""}`)
     c._state = .Open
     testing.expect(t, respond_json(&c, 200, strings.repeat("x", MAX_JSON_BYTES-2, allocator)))
     testing.expect_value(t, probe.status, 200)

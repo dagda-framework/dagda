@@ -9,4 +9,6 @@ cc -std=c11 -Wall -Wextra -Werror -O2 -c native/platform.c -o build/platform.o
 ./scripts/odin.sh test dagda/routes -out:build/routes-tests -debug "$@"
 ./scripts/odin.sh test dagda/validation -out:build/validation-tests -debug "$@"
 ./scripts/odin.sh test dagda/http -out:build/http-tests -debug "$@"
+./scripts/odin.sh test dagda/testing -out:build/testing-tests -debug "$@"
+./scripts/odin.sh test examples/api -out:build/api-tests -debug "$@"
 ./scripts/odin.sh test dagda/runtime -out:build/runtime-tests -debug "$@"

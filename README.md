@@ -2,12 +2,12 @@
 
 Dagda is a batteries-included backend framework being built in Odin. Its intended scope brings application conventions, PostgreSQL, authentication, background jobs, and development tooling into one workflow for building JSON APIs.
 
-**Status:** M0 runtime prototype validated for its bounded local workload: integration/failure tests and a 30-minute stability run pass. Initial M1 application lifecycle, configuration, routing, middleware, request IDs, and access logs are implemented with an example API and passing integration checks. Typed JSON request/response support passes unit and network integration checks, including bounded uploads and shutdown. Field validation and structured 422 errors also pass Odin unit and HTTP integration checks. The framework CLI, authentication, migrations, and jobs remain specifications. This prototype is not production-ready.
+**Status:** M0 runtime prototype validated for its bounded local workload: integration/failure tests and a 30-minute stability run pass. Initial M1 application lifecycle, configuration, routing, middleware, request IDs, and access logs are implemented with an example API and passing integration checks. Typed JSON request/response support passes unit and network integration checks, including bounded uploads and shutdown. Field validation and structured 422 errors also pass Odin unit and HTTP integration checks. An Odin application-testing API and common application errors now pass local tests and network regressions. The framework CLI, authentication, migrations, and jobs remain specifications. This prototype is not production-ready.
 
 Read the [project specification](SPEC.md) for scope, runtime design, release milestones, and acceptance criteria.
 
 For the runtime proof, see [M0 setup, architecture, and checks](docs/M0.md).
-The first application packages and example are described in [M1 lifecycle, configuration, routing, and middleware](docs/M1.md). See [typed JSON](docs/JSON.md) for request/response APIs and limits, and [field validation](docs/VALIDATION.md) for rules and structured errors.
+The first application packages and example are described in [M1 lifecycle, configuration, routing, and middleware](docs/M1.md). See [typed JSON](docs/JSON.md) for request/response APIs and limits, and [field validation](docs/VALIDATION.md) for rules and structured errors. [Odin application tests](docs/TESTING.md) and the [common error contract](docs/ERRORS.md) cover the latest development APIs.
 
 ```sh
 bash scripts/setup-odin.sh

@@ -32,6 +32,9 @@ def main():
             assert re.fullmatch(r'[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', request_id), request_id
             assert request_id not in observed
             observed[request_id] = status
+            if status >= 400:
+                assert body['request_id'] == request_id, body
+                assert body['error']['code'] and body['error']['message'], body
             return body, headers
 
         check('/', 200, {'name': 'Dagda'})
@@ -81,9 +84,16 @@ def main():
         assert after_reuse['rss_kib'] <= baseline['rss_kib'] + 8192, (baseline, after_reuse)
         print('PASS repeated request-context/worker reuse preserves response bytes and bounded resources', flush=True)
 
+        body, _ = check('/_test/sql-error', 500)
+        assert body['error'] == {'code': 'query_failed', 'message': 'Internal server error'}
+        body, _ = check('/_test/slow?ms=2000', 503)
+        assert body['error']['code'] == 'deadline_exceeded'
         fixture.stop_database()
         check('/health/live', 200, {'status': 'ok'})
-        check('/health/ready', 503, {'status': 'not_ready'})
+        body, _ = check('/health/ready', 503)
+        assert body['error']['code'] == 'not_ready'
+        body, _ = check('/items/1', 503)
+        assert body['error']['code'] == 'database_unavailable'
         fixture.start_database()
         wait_until(lambda: fixture.request('/health/ready')[:2] == (200, {'status': 'ready'}))
         check('/items/1', 200, {'id': 1, 'name': 'Dagda'})

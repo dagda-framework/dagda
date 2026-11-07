@@ -128,9 +128,9 @@ rather than modifying its internal counters/entries.
   No submitted values or validation diagnostics are added to access logs.
 
 Malformed JSON, type mismatches, unknown fields, and unsupported media types keep
-their existing 400/415 responses. They do not run business validation. This slice
-standardizes validation responses; it does not migrate every existing framework
-error to the richer envelope.
+their existing 400/415 responses. They do not run business validation. The [common application error envelope](ERRORS.md) now also covers those
+application-layer failures. Low-level transport parser rejections remain outside
+that envelope.
 
 ## Tests
 

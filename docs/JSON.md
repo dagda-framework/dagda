@@ -103,8 +103,8 @@ while a database operation owns it.
 | Expect | 417 `expectation_failed` |
 | Encoding failure or response too large | 500 `invalid_response` |
 
-Transport-level framing failures may precede application errors. Error responses
-never echo input values or parser diagnostics. Access logs omit body contents.
+Transport-level framing failures may precede application errors. Application failures use the [common error envelope](ERRORS.md), including a
+public message and request ID. Error responses never echo input values or parser diagnostics. Access logs omit body contents.
 
 ## Verification
 

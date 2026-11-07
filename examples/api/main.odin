@@ -21,6 +21,12 @@ run :: proc() -> int {
     hooks := Hook_State{record = settings.environment == .Test,
                         fail = settings.environment == .Test && os.get_env("DAGDA_TEST_START_FAIL", context.temp_allocator) == "1"}
     application.hooks = app.Hooks{start = on_start, stop = on_stop, data = &hooks}
+    configure(application)
+    if app.run(application) != .None { return 1 }
+    return 0
+}
+// Shared route registration for the executable and Odin application tests.
+configure :: proc(application: ^app.App) {
     assert(app.use(application, http.Middleware{handle = identify}))
     assert(app.route(application, .Get, "/", index) == .None)
     assert(app.route(application, .Get, "/items/:id", item) == .None)
@@ -31,9 +37,10 @@ run :: proc() -> int {
     assert(app.route(application, .Head, "/", index) == .None)
     restricted := []http.Middleware{{handle = require_demo_key}}
     assert(app.route(application, .Get, "/private", index, middleware=restricted) == .None)
-    if settings.environment == .Test { assert(app.route(application, .Get, "/_test/slow", slow) == .None) }
-    if app.run(application) != .None { return 1 }
-    return 0
+    if application.config.environment == .Test {
+        assert(app.route(application, .Get, "/_test/slow", slow) == .None)
+        assert(app.route(application, .Get, "/_test/sql-error", sql_error) == .None)
+    }
 }
 Hook_State :: struct { record, fail: bool }
 on_start :: proc(data: rawptr) -> bool {
@@ -52,16 +59,16 @@ identify :: proc(c: ^http.Context, next: ^http.Next, _: rawptr) {
 // Demonstrates short-circuit middleware only; this is not an authentication API.
 require_demo_key :: proc(c: ^http.Context, next: ^http.Next, _: rawptr) {
     value, _ := http.header(c, "x-demo-key")
-    if value != "example" { http.json_text(c, 401, `{"error":{"code":"demo_key_required"}}`); return }
+    if value != "example" { http.respond_error(c, 401, "demo_key_required", "Demo key required"); return }
     http.next(next)
 }
 index :: proc(c: ^http.Context) { http.respond_json(c, 200, struct {name: string}{"Dagda"}) }
 new_item :: proc(c: ^http.Context) { http.json_text(c, 200, `{"route":"static"}`) }
-create_item :: proc(c: ^http.Context) { http.json_text(c, 501, `{"error":{"code":"not_implemented"}}`) }
+create_item :: proc(c: ^http.Context) { http.respond_error(c, 501, "not_implemented", "Not implemented") }
 item :: proc(c: ^http.Context) {
     raw, _ := http.param(c, "id")
     id, ok := strconv.parse_i64(raw)
-    if !ok || id <= 0 { http.json_text(c, 400, `{"error":{"code":"invalid_id"}}`); return }
+    if !ok || id <= 0 { http.respond_error(c, 400, "invalid_id", "Invalid item ID"); return }
     params := make([]cstring, 1, c.allocator)
     params[0] = strings.clone_to_cstring(raw, c.allocator)
     http.query_text(c, "SELECT row_to_json(item)::text FROM (SELECT id, name FROM dagda_m0_items WHERE id = $1::bigint) item", params)
@@ -69,7 +76,7 @@ item :: proc(c: ^http.Context) {
 slow :: proc(c: ^http.Context) {
     raw, _ := http.query(c, "ms")
     ms, ok := strconv.parse_i64(raw)
-    if !ok || ms < 0 || ms > 5000 { http.json_text(c, 400, `{"error":{"code":"invalid_delay"}}`); return }
+    if !ok || ms < 0 || ms > 5000 { http.respond_error(c, 400, "invalid_delay", "Invalid delay"); return }
     params := make([]cstring, 1, c.allocator)
     params[0] = strings.clone_to_cstring(raw, c.allocator)
     http.query_text(c, "SELECT json_build_object('slept_ms', $1::int)::text FROM pg_sleep($1::double precision / 1000.0)", params)
@@ -109,3 +116,6 @@ validate_input :: proc(c: ^http.Context) {
     if !http.validate(c, &errors) { return }
     http.respond_json(c, 200, input)
 }
+
+// Used only by the isolated network integration fixture.
+sql_error :: proc(c: ^http.Context) { http.query_text(c, "SELECT 1 / 0") }

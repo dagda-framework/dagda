@@ -26,6 +26,9 @@ def main():
             assert status == expected, (body[:100], status, result)
             assert received['content-type'] == 'application/json'
             assert received['x-request-id']
+            if status >= 400:
+                assert result['request_id'] == received['x-request-id'], result
+                assert result['error']['code'] and result['error']['message'], result
             return result
 
         dto = {'name': 'Dagda ☘\n"', 'count': 2147483647, 'enabled': True,

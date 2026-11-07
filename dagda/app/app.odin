@@ -176,47 +176,56 @@ handle :: proc(handler: ^transport.Handler, request: ^transport.Request, respons
     c.path = request.url.path
     c.route = "<unmatched>"
     if a.state != .Running {
-        http.json_text(c, 503, `{"error":{"code":"draining"}}`)
+        http.fail(c, .Draining)
         return
     }
-    if transport.headers_has_unsafe(request.headers, "transfer-encoding") {
-        http.json_text(c, 400, `{"error":{"code":"body_not_supported"}}`)
+    size, ok := request_body_length(c)
+    if !ok { return }
+    if size > 0 {
+        transport.body(request, http.MAX_JSON_BYTES, c, body_ready)
         return
-    }
-    if transport.headers_has_unsafe(request.headers, "expect") {
-        http.json_text(c, 417, `{"error":{"code":"expectation_failed"}}`)
-        return
-    }
-    if transport.headers_has_unsafe(request.headers, "content-encoding") {
-        http.json_text(c, 415, `{"error":{"code":"unsupported_content_encoding"}}`)
-        return
-    }
-    if length, present := transport.headers_get_unsafe(request.headers, "content-length"); present {
-        digits := len(length) > 0
-        for ch in length { if ch < '0' || ch > '9' { digits = false; break } }
-        if !digits { http.json_text(c, 400, `{"error":{"code":"invalid_content_length"}}`); return }
-        size, ok := strconv.parse_u64(length)
-        if !ok { http.json_text(c, 400, `{"error":{"code":"invalid_content_length"}}`); return }
-        if size > http.MAX_JSON_BYTES { http.json_text(c, 413, `{"error":{"code":"body_too_large"}}`); return }
-        if size > 0 {
-            transport.body(request, http.MAX_JSON_BYTES, c, body_ready)
-            return
-        }
     }
     dispatch_request(a, c)
+}
+
+// Shared by the network adapter and the in-process application test client.
+// The transport parser remains responsible for HTTP framing/header syntax.
+request_body_length :: proc(c: ^http.Context) -> (int, bool) {
+    if transport.headers_has_unsafe(c._request.headers, "transfer-encoding") {
+        http.fail(c, .Body_Not_Supported)
+        return 0, false
+    }
+    if transport.headers_has_unsafe(c._request.headers, "expect") {
+        http.fail(c, .Expectation_Failed)
+        return 0, false
+    }
+    if transport.headers_has_unsafe(c._request.headers, "content-encoding") {
+        http.fail(c, .Unsupported_Content_Encoding)
+        return 0, false
+    }
+    if length, present := transport.headers_get_unsafe(c._request.headers, "content-length"); present {
+        digits := len(length) > 0
+        for ch in length { if ch < '0' || ch > '9' { digits = false; break } }
+        if !digits { http.fail(c, .Invalid_Content_Length); return 0, false }
+        size, ok := strconv.parse_u64(length)
+        if !ok { http.fail(c, .Invalid_Content_Length); return 0, false }
+        if size > http.MAX_JSON_BYTES { http.fail(c, .Body_Too_Large); return 0, false }
+        return int(size), true
+    }
+    return 0, true
 }
 body_ready :: proc(data: rawptr, body: transport.Body, error: transport.Body_Error) {
     c := cast(^http.Context)data
     context.allocator = c.allocator
     context.temp_allocator = c.allocator
     if error != nil {
-        http.json_text(c, 400, `{"error":{"code":"incomplete_body"}}`)
+        http.fail(c, .Incomplete_Body)
         return
     }
     // The scanner's buffer can move; retain a request-owned copy for async handlers.
     c.body = strings.clone(body, c.allocator)
     a := cast(^App)c._response._conn.server.handler.user_data
-    if a.state != .Running { http.json_text(c, 503, `{"error":{"code":"draining"}}`); return }
+    if a.state != .Running { http.fail(c, .Draining); return }
     dispatch_request(a, c)
 }
 dispatch_request :: proc(a: ^App, c: ^http.Context) {
@@ -247,13 +256,13 @@ dispatch_request :: proc(a: ^App, c: ^http.Context) {
 liveness :: proc(c: ^http.Context) { http.json_text(c, 200, `{"status":"ok"}`) }
 readiness :: proc(c: ^http.Context) {
     a := cast(^App)c.user_data
-    if a.state != .Running { http.json_text(c, 503, `{"status":"not_ready"}`); return }
+    if a.state != .Running { http.fail(c, .Not_Ready); return }
     http.query_text(c, "SELECT 'ready'", result=ready_result)
 }
 ready_result :: proc(c: ^http.Context, status: int, _: string) {
     if status == 200 { http.json_text(c, 200, `{"status":"ready"}`) }
-    else { http.json_text(c, 503, `{"status":"not_ready"}`) }
+    else { http.fail(c, .Not_Ready) }
 }
-not_found :: proc(c: ^http.Context) { http.json_text(c, 404, `{"error":{"code":"not_found"}}`) }
-method_not_allowed :: proc(c: ^http.Context) { http.json_text(c, 405, `{"error":{"code":"method_not_allowed"}}`) }
-bad_path :: proc(c: ^http.Context) { http.json_text(c, 400, `{"error":{"code":"invalid_path"}}`) }
+not_found :: proc(c: ^http.Context) { http.fail(c, .Not_Found) }
+method_not_allowed :: proc(c: ^http.Context) { http.fail(c, .Method_Not_Allowed) }
+bad_path :: proc(c: ^http.Context) { http.fail(c, .Invalid_Path) }
