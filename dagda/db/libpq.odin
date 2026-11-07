@@ -25,6 +25,14 @@ foreign libpq {
     PQsendQueryParams :: proc(conn: ^Conn, query: cstring, count: i32,
         types: [^]u32, values: [^]cstring, lengths: [^]i32,
         formats: [^]i32, result_format: i32) -> i32 ---
+    PQsetSingleRowMode :: proc(conn: ^Conn) -> i32 ---
+    PQtransactionStatus :: proc(conn: ^Conn) -> i32 ---
+    PQnfields :: proc(result: ^Result) -> i32 ---
+    PQfname :: proc(result: ^Result, column: i32) -> cstring ---
+    PQftype :: proc(result: ^Result, column: i32) -> u32 ---
+    PQresultErrorField :: proc(result: ^Result, code: i32) -> cstring ---
+    PQcmdTuples :: proc(result: ^Result) -> cstring ---
+    PQcmdStatus :: proc(result: ^Result) -> cstring ---
     PQflush :: proc(conn: ^Conn) -> i32 ---
     PQconsumeInput :: proc(conn: ^Conn) -> i32 ---
     PQisBusy :: proc(conn: ^Conn) -> i32 ---

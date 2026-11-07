@@ -4,6 +4,7 @@ import "core:nbio"
 import "core:testing"
 import "core:time"
 import platform "../platform"
+import db "../db"
 
 Test_Handoff :: struct {
     pool: ^Pool,
@@ -78,4 +79,20 @@ work_owns_query_and_parameter_bytes :: proc(t: ^testing.T) {
     release(p, slot)
     testing.expect_value(t, active(p), 0)
     testing.expect(t, !valid_work(Work{}))
+}
+
+@(test)
+work_owns_database_callback_input :: proc(t: ^testing.T) {
+    p := new(Pool)
+    defer free(p)
+    input := [3]byte{'o','n','e'}
+    callback :: proc(_: ^db.Session, _: []byte) -> (string, db.Failure) { return "{}", {} }
+    slot := reserve(p, Work{task=callback, input=input[:]})
+    if !testing.expect(t, slot != nil) { return }
+    input[0] = 'X'
+    testing.expect_value(t, string(slot.work.input), "one")
+    slot.state = .Ready
+    release(p, slot)
+    testing.expect_value(t, active(p), 0)
+    testing.expect(t, !valid_work(Work{task=callback, query="SELECT 1"}))
 }

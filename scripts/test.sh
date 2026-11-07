@@ -10,3 +10,4 @@ python3 tests/application.py
 python3 tests/json_api.py
 python3 tests/validation_api.py
 python3 tests/cli.py
+python3 tests/database.py

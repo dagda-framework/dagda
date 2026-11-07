@@ -1,0 +1,52 @@
+{
+  "date_local": "2026-11-06",
+  "timezone": "America/Chicago",
+  "passed": true,
+  "scope": "M2 database API foundation: queries, typed mapping, structured errors, worker transactions; not full M2",
+  "source": {
+    "base_commit": "4957918fdc76ba2544e6c27314379d9e06bc45c6",
+    "working_tree_modified": true,
+    "example_binary_sha256": "6eb91c78681270f7e8469093e1f3d99cb82d76a3fecc7d6625f00fb9b78e785e"
+  },
+  "command": "./scripts/test.sh",
+  "checks": {
+    "odin_tests": 45,
+    "database_unit_tests": 3,
+    "database_integration_tests": 4,
+    "python_harness_tests": 7,
+    "integration_suites": 7,
+    "odin_memory_warnings": 0
+  },
+  "artifacts": {
+    "m0_integration": "build/runtime-checks/20261107T022426.686989Z",
+    "m0_failures": "build/runtime-checks/20261107T022434.878110Z",
+    "m1_application": "build/runtime-checks/20261107T022503.241531Z",
+    "typed_json": "build/runtime-checks/20261107T022515.791541Z",
+    "validation": "build/runtime-checks/20261107T022525.947243Z",
+    "generated_application": "build/runtime-checks/20261107T022556.891000Z",
+    "database_api": "build/runtime-checks/20261107T022602.216035Z"
+  },
+  "database_api": {
+    "passed": true,
+    "suite": "M2 database API",
+    "odin_integration_tests": 4,
+    "worker_checks": [
+      "commit",
+      "constraint rollback",
+      "abandoned transaction cleanup",
+      "request IDs",
+      "event-loop liveness",
+      "deadline cancellation",
+      "connection reuse",
+      "balance conservation"
+    ]
+  },
+  "notes": [
+    "All checks ran locally in the agent shell with isolated PostgreSQL fixtures.",
+    "Transactions verified commit, statement failure rollback, deferred commit constraint failure, and abandoned transaction cleanup.",
+    "Commit timeout returns Commit_Unknown and discards the connection; no automatic retry.",
+    "Result-limit failures return empty safe-to-destroy results; Odin memory warnings are treated as failures in the database gate.",
+    "No new 30-minute soak or production qualification run.",
+    "Migrations, seeds CLI, general pool leasing outside HTTP workers, resource generation, and invoice CRUD remain later M2 work."
+  ]
+}

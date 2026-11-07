@@ -38,6 +38,8 @@ configure :: proc(application: ^app.App) {
     restricted := []http.Middleware{{handle = require_demo_key}}
     assert(app.route(application, .Get, "/private", index, middleware=restricted) == .None)
     if application.config.environment == .Test {
+        assert(app.route(application, .Post, "/_test/transfer", transfer) == .None)
+        assert(app.route(application, .Post, "/_test/abandon", abandon_transaction) == .None)
         assert(app.route(application, .Get, "/_test/slow", slow) == .None)
         assert(app.route(application, .Get, "/_test/sql-error", sql_error) == .None)
     }

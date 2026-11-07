@@ -14,13 +14,17 @@ ARENA_BYTES :: 32 * 1024
 
 State :: enum { Free, Queued, Running, Ready }
 
+Database_Work :: proc(session: ^db.Session, input: []byte) -> (body: string, failure: db.Failure)
 Work :: struct {
+    task: Database_Work,
+    input: []byte,
     query: cstring,
     parameters: []cstring,
     deadline_ms: i64,
 }
 
 valid_work :: proc(work: Work) -> bool {
+    if work.task != nil { return work.query == nil && len(work.parameters) == 0 && len(work.input) <= 8192 }
     if work.query == nil || len(string(work.query)) == 0 || len(string(work.query)) > 4096 || len(work.parameters) > 8 { return false }
     size := len(string(work.query))
     for value in work.parameters { size += len(string(value)) + 1 }
@@ -34,6 +38,7 @@ Slot :: struct {
     storage: [ARENA_BYTES]byte,
     status: int,
     error: db.Error,
+    failure: db.Failure,
     body: string,
     completion: ^nbio.Operation, // allocated on the destination event loop
     transport_data: rawptr, // accessed only by the event loop
@@ -80,13 +85,17 @@ reserve :: proc(p: ^Pool, work: Work) -> ^Slot {
         slot.work = work
         slot.status = 500
         slot.error = .None
+        slot.failure = {}
         slot.body = ""
         slot.completion = nil
         slot.transport_data = nil
         slot.arena = {}
         if virtual.arena_init_buffer(&slot.arena, slot.storage[:]) != nil { return nil }
         allocator := virtual.arena_allocator(&slot.arena)
-        slot.work.query = strings.clone_to_cstring(string(work.query), allocator)
+        if work.task != nil {
+            slot.work.input = make([]byte, len(work.input), allocator)
+            copy(slot.work.input, work.input)
+        } else { slot.work.query = strings.clone_to_cstring(string(work.query), allocator) }
         slot.work.parameters = make([]cstring, len(work.parameters), allocator)
         for value, i in work.parameters {
             if value != nil { slot.work.parameters[i] = strings.clone_to_cstring(string(value), allocator) }
@@ -170,7 +179,40 @@ worker_main :: proc(worker: ^Worker) {
     }
 }
 
+execute_task :: proc(worker: ^Worker, slot: ^Slot) {
+    // Restore valid slot allocators before publishing completion to nbio.
+    defer {
+        context.allocator = virtual.arena_allocator(&slot.arena)
+        context.temp_allocator = context.allocator
+    }
+    arena: virtual.Arena
+    if virtual.arena_init_growing(&arena) != nil {
+        slot.failure = {kind=.Unavailable}
+        return
+    }
+    defer virtual.arena_destroy(&arena)
+    context.allocator = virtual.arena_allocator(&arena)
+    context.temp_allocator = context.allocator
+    session := db.Session{connection=&worker.connection, deadline_ms=slot.work.deadline_ms}
+    if platform.monotonic_ms() >= session.deadline_ms { slot.failure = {kind=.Deadline}; return }
+    if worker.connection == nil {
+        error: db.Error
+        worker.connection, error = db.connect(worker.pool.conninfo, session.deadline_ms)
+        if error != .None { slot.failure = db.legacy_failure(error); return }
+    }
+    body, failure := slot.work.task(&session, slot.work.input)
+    cleanup := db.finish(&session)
+    if failure.kind == .None { failure = cleanup }
+    if len(body) > 8192 { failure = {kind=.Result_Limit} }
+    slot.failure = failure
+    if failure.kind == .None {
+        slot.body = strings.clone(body, virtual.arena_allocator(&slot.arena))
+        slot.status = 200
+    }
+}
+
 execute :: proc(worker: ^Worker, slot: ^Slot) {
+    if slot.work.task != nil { execute_task(worker, slot); return }
     allocator := virtual.arena_allocator(&slot.arena)
     context.allocator = allocator
     context.temp_allocator = allocator
@@ -183,6 +225,8 @@ execute :: proc(worker: ^Worker, slot: ^Slot) {
     if err == .None {
         slot.body, err = db.query_text(&worker.connection, slot.work.query, slot.work.parameters, slot.work.deadline_ms, allocator)
     }
+    cleanup_session := db.Session{connection=&worker.connection, deadline_ms=slot.work.deadline_ms}
+    if cleanup := db.finish(&cleanup_session); cleanup.kind != .None && err == .None { err = .Query }
     slot.error = err
     switch err {
     case .None: slot.status = 200

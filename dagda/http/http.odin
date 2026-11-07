@@ -7,6 +7,7 @@ import "core:nbio"
 import "core:strings"
 import transport "../../vendor/odin-http"
 import runtime "../runtime"
+import db "../db"
 import platform "../platform"
 
 Method :: transport.Method
@@ -58,6 +59,7 @@ Context :: struct {
     _logger: Access_Logger,
     _logger_data: rawptr,
     _result: Result_Handler,
+    _database_result: Database_Result_Handler,
 }
 Next :: struct { _request: ^Context, _index: int, _used: bool }
 
@@ -177,9 +179,11 @@ complete :: proc(op: ^nbio.Operation) {
     context.temp_allocator = c.allocator
     status := slot.status
     error := slot.error
+    failure := slot.failure
+    task := slot.work.task != nil
     body := strings.clone(slot.body, c.allocator)
     runtime.release(c._pool, slot)
-    query_result(c, status, body, error)
+    if task { database_result(c, body, failure) } else { query_result(c, status, body, error) }
 }
 
 // Shared response semantics for the socket adapter and in-process test client.
@@ -202,4 +206,41 @@ write_response :: proc(c: ^Context, status: int, body: string) {
     for header in headers { transport.headers_set_unsafe(&response.headers, header.name, header.value) }
     transport.body_set(response, payload)
     transport.respond(response)
+}
+
+// Work receives copied bytes and an exclusive Session, never the HTTP Context.
+// The result callback runs back on the event loop after slot storage is released.
+Database_Result_Handler :: proc(c: ^Context, body: string, failure: db.Failure)
+database :: proc(c: ^Context, work: runtime.Database_Work, input: []byte = nil, result: Database_Result_Handler = nil) -> bool {
+    if c._state != .Open { return false }
+    c._query_attempted = true
+    job := runtime.Work{task=work, input=input, deadline_ms=c.deadline_ms}
+    if work == nil || !runtime.valid_work(job) || c._pool == nil { return fail(c, .Invalid_Database_Work) }
+    slot := runtime.reserve(c._pool, job)
+    if slot == nil { set_header(c, "retry-after", "1"); return fail(c, .Overloaded) }
+    c._state = .Pending
+    c._database_result = result
+    completion := nbio.prep_timeout(0, complete)
+    completion.user_data[0] = c
+    completion.user_data[1] = slot
+    slot.completion = completion
+    slot.transport_data = c
+    runtime.submit(c._pool, slot)
+    return true
+}
+database_result :: proc(c: ^Context, body: string, failure: db.Failure) {
+    c._state = .Open
+    callback := c._database_result
+    c._database_result = nil
+    if callback != nil { callback(c, body, failure) } else if failure.kind == .None {
+        json_text(c, 200, body)
+    } else {
+        #partial switch failure.kind {
+        case .Deadline, .Canceled: fail(c, .Deadline_Exceeded)
+        case .Unavailable: fail(c, .Database_Unavailable)
+        case .Commit_Unknown: respond_error(c, 500, "commit_outcome_unknown", "Commit outcome is unknown")
+        case: fail(c, .Query_Failed)
+        }
+    }
+    if c._state == .Open { fail(c, .Handler_Did_Not_Respond) }
 }
