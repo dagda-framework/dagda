@@ -43,6 +43,83 @@ def headline(client_bin, sock):
     return resp["elements"][0]
 
 
+def composing_geometry(png_path, bounds):
+    """(preedit highlight bbox, caret column) inside the headline."""
+    w, h, rgb = base.decode_png_rgb(png_path)
+    x0, y0 = max(0, int(bounds["x"])), max(0, int(bounds["y"]))
+    x1, y1 = min(w, int(bounds["x"] + bounds["width"])), min(h, int(bounds["y"] + bounds["height"]))
+    bg = []
+    amber_cols = {}
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            px = base.pixel_at(w, rgb, x, y)
+            if base.rgb_close(px, base.PREEDIT_BG_RGB):
+                bg.append((x, y))
+            elif base.rgb_close(px, base.CARET_AMBER_RGB):
+                amber_cols[x] = amber_cols.get(x, 0) + 1
+    assert bg, f"no composing highlight in {png_path}"
+    bbox = (min(q[0] for q in bg), min(q[1] for q in bg), max(q[0] for q in bg), max(q[1] for q in bg))
+    # The caret is the amber column with a tall vertical run;
+    # the underline is only a few rows high.
+    tall = [x for x, n in amber_cols.items() if n >= 8]
+    assert tall, f"no caret column in {png_path}: {amber_cols}"
+    return bbox, max(tall)
+
+
+def headline_ink(png_path, bounds):
+    """(ink bbox, cropped headline pixels) for painted-text checks."""
+    w, h, rgb = base.decode_png_rgb(png_path)
+    x0, y0 = max(0, int(bounds["x"])), max(0, int(bounds["y"]))
+    x1, y1 = min(w, int(bounds["x"] + bounds["width"])), min(h, int(bounds["y"] + bounds["height"]))
+    ink = []
+    crop = bytearray()
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            px = base.pixel_at(w, rgb, x, y)
+            is_ink = px[0] > 220 and px[1] > 220 and px[2] > 220
+            crop.append(1 if is_ink else 0)  # glyph mask only: caret/focus pixels excluded
+            if is_ink:
+                ink.append((x, y))
+    assert ink, f"no painted headline ink in {png_path}"
+    bbox = (min(q[0] for q in ink), min(q[1] for q in ink), max(q[0] for q in ink), max(q[1] for q in ink))
+    return bbox, bytes(crop)
+
+
+def verify_single_line_regression(canvas_bin, client_bin, tmp):
+    """A newline commit is rejected and the next keyboard edit works."""
+    sock_dir = tmp / "sock-single-line"
+    sock_dir.mkdir()
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "canvas.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(canvas_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, cwd=ROOT)
+        reader = base.DeadlineLineReader(proc.stdout)
+        assert reader.read_line("single-line startup", timeout=5.0) == f"Listening {sock}"
+        base.send_control(proc, reader, f"screenshot {tmp}/single-line-init.png")
+        first = headline(client_bin, sock)
+        hid = first["id"]
+        _, edits = client(client_bin, sock, "edits", str(hid))
+        code, bad = client(client_bin, sock, "commit", str(hid), "replace_text", str(edits["revision"]), "text", "A\nB", expect_ok=False)
+        assert code == 1 and bad["ok"] is False, (code, bad)
+        assert headline(client_bin, sock)["text"] == "Slide Canvas"
+        assert status(client_bin, sock).endswith("rev=0, undo=0"), status(client_bin, sock)
+        # The next keyboard edit succeeds against the untouched state.
+        hb = first["bounds"]
+        base.send_control(proc, reader, f"click {hb['x'] + hb['width'] - 10.0:.2f} {hb['y'] + hb['height'] * 0.5:.2f}")
+        base.send_control(proc, reader, "text Q")
+        base.wait_for_role_text(client_bin, sock, "slide.headline", "Slide CanvasQ")
+        base.wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=1, undo=1")
+        base.send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        proc = None
+        print("[single-line] newline commit rejected; state untouched; next keyboard edit succeeded")
+    finally:
+        base.stop_process(proc)
+
+
 def status(client_bin, sock):
     _, resp = client(client_bin, sock, "inspect", "slide.status")
     return resp["elements"][0]["text"]
@@ -87,7 +164,9 @@ def main():
         base.send_control(proc, reader, "preedit e")
         base.wait_for_headline_composing(proc, reader, client_bin, sock, tmp / "composing-before.png",
                                          "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
-        print("[2] visible preedit over selected 'Canvas'")
+        geo_before = composing_geometry(tmp / "composing-before.png", hb)
+        orig_ink, orig_crop = headline_ink(tmp / "init.png", hb)
+        print(f"[2] visible preedit over selected 'Canvas': highlight={geo_before[0]} caret_x={geo_before[1]} ink={orig_ink}")
 
         # The agent previews its replacement at R.
         _, preview = client(client_bin, sock, "preview", str(headline_id), "replace_text", str(R), "text", "Agent draft")
@@ -99,7 +178,9 @@ def main():
         # this capture after the agent preview.
         base.wait_for_headline_composing(proc, reader, client_bin, sock, composing_capture,
                                          "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
-        print(f"[3] agent preview received; inspection unchanged at R={R}; composing retained ({composing_capture})")
+        geo_after = composing_geometry(composing_capture, hb)
+        assert geo_after == geo_before, f"composing highlight/caret moved across preview: {geo_before} -> {geo_after}"
+        print(f"[3] agent preview received; inspection unchanged at R={R}; composing highlight/caret identical ({composing_capture})")
 
         # Finish the composition with é, without clicking or
         # refocusing: the original selection survived the preview.
@@ -109,7 +190,12 @@ def main():
         base.wait_for_role_text(client_bin, sock, "slide.status", f"selected=false, clicks=0, rev={R + 1}, undo=1")
         _, edits_now = client(client_bin, sock, "edits", str(headline_id))
         assert edits_now["revision"] == R + 1, edits_now
-        print(f"[4] composition finished: 'Slide é' at R+1={R + 1}, exactly one undo entry")
+        # The window must actually paint the new headline: its
+        # glyph ink is much narrower than the original's.
+        base.send_control(proc, reader, f"screenshot {tmp}/committed.png")
+        committed_ink, _ = headline_ink(tmp / "committed.png", hb)
+        assert committed_ink[2] - committed_ink[0] < (orig_ink[2] - orig_ink[0]) * 0.75, (orig_ink, committed_ink)
+        print(f"[4] composition finished: 'Slide é' at R+1={R + 1}, one undo entry; painted ink {orig_ink} -> {committed_ink}")
 
         # The agent commit at the original R is now stale.
         code, stale = client(client_bin, sock, "commit", str(headline_id), "replace_text", str(R), "text", "Agent draft", expect_ok=False)
@@ -123,11 +209,18 @@ def main():
         restored = base.wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
         assert restored["elements"][0]["text"].encode("utf-8") == b"Slide Canvas"
         base.wait_for_role_text(client_bin, sock, "slide.status", f"selected=false, clicks=0, rev={R + 2}, undo=0")
-        print(f"[6] Ctrl+Z: exact 'Slide Canvas' bytes in both views at R+2={R + 2}, undo consumed")
+        # And it paints the original headline again, pixel for
+        # pixel in the cropped headline region.
+        base.send_control(proc, reader, f"screenshot {tmp}/undone.png")
+        undone_ink, undone_crop = headline_ink(tmp / "undone.png", hb)
+        mask_diff = sum(1 for a, b in zip(orig_crop, undone_crop) if a != b) / max(1, len(orig_crop))
+        assert undone_ink == orig_ink and mask_diff < 0.01, (orig_ink, undone_ink, mask_diff)
+        print(f"[6] Ctrl+Z: exact 'Slide Canvas' bytes and painted pixels in both views at R+2={R + 2}, undo consumed")
 
         base.send_control(proc, reader, "quit")
         proc.wait(timeout=5)
         proc = None
+        verify_single_line_regression(canvas_bin, client_bin, tmp)
         print("agent preview acceptance: all checks passed")
         return 0
     finally:
