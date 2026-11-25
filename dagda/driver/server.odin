@@ -114,6 +114,34 @@ server_poll :: proc(
 	rebuild_ctx: rawptr,
 	rebuild_frame: proc(ctx: rawptr) -> bool,
 ) -> (any_applied: bool, rebuild_failed: bool) {
+	return server_poll_source(srv, frame, handler, user_data, {}, false, rebuild_ctx, rebuild_frame)
+}
+
+// server_poll_edits is server_poll with an advertised-edit source:
+// edits / preview / commit requests dispatch through it while
+// inspect and invoke keep their existing behavior.
+server_poll_edits :: proc(
+	srv: ^Server,
+	frame: ^dagda.Frame,
+	handler: dagda.Action_Handler,
+	user_data: rawptr,
+	source: Edit_Source,
+	rebuild_ctx: rawptr,
+	rebuild_frame: proc(ctx: rawptr) -> bool,
+) -> (any_applied: bool, rebuild_failed: bool) {
+	return server_poll_source(srv, frame, handler, user_data, source, true, rebuild_ctx, rebuild_frame)
+}
+
+server_poll_source :: proc(
+	srv: ^Server,
+	frame: ^dagda.Frame,
+	handler: dagda.Action_Handler,
+	user_data: rawptr,
+	source: Edit_Source,
+	use_edits: bool,
+	rebuild_ctx: rawptr,
+	rebuild_frame: proc(ctx: rawptr) -> bool,
+) -> (any_applied: bool, rebuild_failed: bool) {
 	if !srv.active {
 		return false, false
 	}
@@ -183,7 +211,13 @@ server_poll :: proc(
 							line_end -= 1
 						}
 						line := string(client.in_buf[:line_end])
-						reply, applied := dispatch(frame^, handler, user_data, line)
+						reply: string
+						applied: bool
+						if use_edits {
+							reply, applied = dispatch_edits(frame^, handler, user_data, source, line)
+						} else {
+							reply, applied = dispatch(frame^, handler, user_data, line)
+						}
 
 						remaining := len(client.in_buf) - (nl + 1)
 						if remaining > 0 {

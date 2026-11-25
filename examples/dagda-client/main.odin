@@ -10,6 +10,12 @@ import "dagda:dagda/driver"
 usage :: proc() {
 	fmt.eprintln("usage: dagda-client <socket-path> inspect [role]")
 	fmt.eprintln("       dagda-client <socket-path> invoke  <id> <action>")
+	fmt.eprintln("       dagda-client <socket-path> edits   <id>")
+	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> text <text>")
+	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> none")
+	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> rect <x> <y> <width> <height>")
+	fmt.eprintln("       dagda-client <socket-path> commit  <id> <edit> <base_revision> text <text>")
+	fmt.eprintln("       dagda-client <socket-path> commit  <id> <edit> <base_revision> rect <x> <y> <width> <height>")
 }
 
 run_client :: proc() -> int {
@@ -47,6 +53,68 @@ run_client :: proc() -> int {
 		}
 		fmt.sbprintf(&b, "{{\"op\":\"invoke\",\"id\":%d,\"action\":", id)
 		driver.write_json_string(&b, os.args[4])
+		strings.write_byte(&b, '}')
+	case "edits":
+		if len(os.args) != 4 {
+			usage()
+			return 2
+		}
+		id, ok_id := strconv.parse_u64(os.args[3])
+		if !ok_id {
+			usage()
+			return 2
+		}
+		fmt.sbprintf(&b, "{{\"op\":\"edits\",\"id\":%d}}", id)
+	case "preview", "commit":
+		// dagda-client <sock> preview|commit <id> <edit> <base_revision> text <text>
+		// dagda-client <sock> preview|commit <id> <edit> <base_revision> rect <x> <y> <w> <h>
+		if len(os.args) < 7 {
+			usage()
+			return 2
+		}
+		id, ok_id := strconv.parse_u64(os.args[3])
+		rev, ok_rev := strconv.parse_u64(os.args[5])
+		if !ok_id || !ok_rev {
+			usage()
+			return 2
+		}
+		fmt.sbprintf(&b, "{{\"op\":%q,\"id\":%d,\"edit\":", cmd, id)
+		driver.write_json_string(&b, os.args[4])
+		fmt.sbprintf(&b, ",\"base_revision\":%d,\"argument\":", rev)
+		switch os.args[6] {
+		case "none":
+			if len(os.args) != 7 {
+				usage()
+				return 2
+			}
+			strings.write_string(&b, "{\"kind\":\"none\"}")
+		case "text":
+			if len(os.args) != 8 {
+				usage()
+				return 2
+			}
+			strings.write_string(&b, "{\"kind\":\"text\",\"text\":")
+			driver.write_json_string(&b, os.args[7])
+			strings.write_byte(&b, '}')
+		case "rect":
+			if len(os.args) != 11 {
+				usage()
+				return 2
+			}
+			nums: [4]f64
+			for i in 0 ..< 4 {
+				v, ok_num := strconv.parse_f64(os.args[7 + i])
+				if !ok_num {
+					usage()
+					return 2
+				}
+				nums[i] = v
+			}
+			fmt.sbprintf(&b, "{{\"kind\":\"rect\",\"rect\":{{\"x\":%g,\"y\":%g,\"width\":%g,\"height\":%g}}}}", nums[0], nums[1], nums[2], nums[3])
+		case:
+			usage()
+			return 2
+		}
 		strings.write_byte(&b, '}')
 	case:
 		usage()
