@@ -85,12 +85,29 @@ def test_reader_deadline():
         "sys.stdout.write(chr(10)); sys.stdout.flush()",
     ])
     slow = sp.Popen([sys.executable, "-c", slow_src], stdout=sp.PIPE)
-    fast = sp.Popen([sys.executable, "-c", "print('one\\ntwo', flush=True)"], stdout=sp.PIPE)
-    reader = AppReader(fast)
-    assert reader.line(timeout=5) == "one"
-    assert reader.line(timeout=5) == "two"
-    fast.wait(timeout=5)
-    print("reader deadline + buffered replies: ok")
+    fast = None
+    try:
+        # Deadline (1s) is longer than one inter-byte gap (0.4s)
+        # and shorter than the time to the newline (~1.2s).
+        reader = AppReader(slow)
+        try:
+            reader.line(timeout=1)
+            raise AssertionError("slow line should have exceeded its total deadline")
+        except AssertionError as e:
+            assert "timed out" in str(e), e
+        # One chunk carrying two replies serves two calls.
+        fast = sp.Popen([sys.executable, "-c", "print('one\\ntwo', flush=True)"], stdout=sp.PIPE)
+        reader = AppReader(fast)
+        assert reader.line(timeout=5) == "one"
+        assert reader.line(timeout=5) == "two"
+        fast.wait(timeout=5)
+        print("reader deadline + buffered replies: ok")
+    finally:
+        for child in (slow, fast):
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
 
 
 def main():
