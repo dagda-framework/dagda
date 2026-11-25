@@ -2,6 +2,7 @@ package sdlhost
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:sys/posix"
 import "core:testing"
 import "core:thread"
@@ -574,4 +575,285 @@ test_cancel_clears_pressed_state_and_redraws_even_when_handler_returns_false :: 
 	testing.expect_value(t, h.has_pressed, false)
 	testing.expect_value(t, h.pressed_id, dagda.Object_Id(0))
 	testing.expect_value(t, h.needs_redraw, true)
+}
+
+@(test)
+test_canvas_editable_text_preedit_cancel_commit_undo_and_grapheme_backspace :: proc(t: ^testing.T) {
+	Text_App :: struct {
+		text:     string,
+		rev:      u64,
+		undo:     [dynamic]string,
+		elements: [1]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Text_App) -> dagda.Frame {
+		s.elements[0] = {
+			info   = {id = 1, role = "slide.headline"},
+			kind   = .Label,
+			text   = s.text,
+			bounds = {x = 80, y = 60, width = 640, height = 80},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Text_App)(user_data)
+		if id != 1 || new_text == s.text {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		append(&s.undo, s.text)
+		s.text = cloned
+		s.rev += 1
+		return true
+	}
+	on_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
+		s := (^Text_App)(user_data)
+		if id != 1 || len(s.undo) == 0 {
+			return false
+		}
+		delete(s.text)
+		s.text = pop(&s.undo)
+		s.rev += 1
+		return true
+	}
+
+	s := Text_App{text = strings.clone("Slide Canvas")}
+	defer {
+		delete(s.text)
+		for u in s.undo {
+			delete(u)
+		}
+		delete(s.undo)
+	}
+
+	cfg := Editable_Text_Config{
+		enabled   = true,
+		target_id = 1,
+		on_commit = on_commit,
+		on_undo   = on_undo,
+	}
+	frame := make_frame(&s)
+	defer dagda.frame_destroy(&frame)
+
+	te: Text_Edit_State
+	defer text_edit_destroy(&te)
+
+	dispatch_ev :: proc(te: ^Text_Edit_State, frame: ^dagda.Frame, s: ^Text_App, cfg: Editable_Text_Config, ev: ^sdl.Event) {
+		res := text_edit_handle_event(te, nil, frame^, cfg, s, ev)
+		if res.needs_rebuild {
+			dagda.frame_destroy(frame)
+			frame^ = make_frame(s)
+			if res.has_pending_edit {
+				text_edit_apply_committed(te, frame^, cfg, &res.pending_edit)
+			} else {
+				text_edit_reconcile(te, nil, frame^, cfg)
+			}
+		}
+	}
+
+	key_ev :: proc(key: sdl.Keycode, mod: sdl.Keymod = {}) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = key
+		ev.key.mod = mod
+		return ev
+	}
+
+	// Focus headline and select "Canvas" (6 graphemes from end).
+	testing.expect(t, text_edit_focus(&te, nil, frame, cfg))
+	for _ in 0 ..< 6 {
+		ev := key_ev(sdl.K_LEFT, sdl.KMOD_LSHIFT)
+		dispatch_ev(&te, &frame, &s, cfg, &ev)
+	}
+	sel_s, sel_e := dagda.selection_bounds(&te.session)
+	testing.expect_value(t, sel_s, 6)
+	testing.expect_value(t, sel_e, 12)
+
+	// Show live preedit and cancel with Escape: text, revision, and selection stay intact.
+	pre_ev: sdl.Event
+	pre_ev.type = .TEXT_EDITING
+	pre_ev.edit.text = "Draft"
+	pre_ev.edit.start = 0
+	pre_ev.edit.length = 5
+	dispatch_ev(&te, &frame, &s, cfg, &pre_ev)
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+	testing.expect_value(t, te.session.preedit, "Draft")
+	testing.expect_value(t, s.text, "Slide Canvas")
+	testing.expect_value(t, s.rev, u64(0))
+
+	esc := key_ev(sdl.K_ESCAPE)
+	dispatch_ev(&te, &frame, &s, cfg, &esc)
+	testing.expect_value(t, dagda.is_composing(&te.session), false)
+	testing.expect_value(t, s.text, "Slide Canvas")
+	testing.expect_value(t, s.rev, u64(0))
+	sel_s, sel_e = dagda.selection_bounds(&te.session)
+	testing.expect_value(t, sel_s, 6)
+	testing.expect_value(t, sel_e, 12)
+
+	// Compose "e", send Enter (swallowed while composing), then TEXT_INPUT "é" ->
+	// selected range "Canvas" is replaced by "é" exactly once (1 rev, 1 undo).
+	pre_ev.edit.text = "e"
+	pre_ev.edit.length = 1
+	dispatch_ev(&te, &frame, &s, cfg, &pre_ev)
+	enter := key_ev(sdl.K_RETURN)
+	dispatch_ev(&te, &frame, &s, cfg, &enter)
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+	testing.expect_value(t, s.text, "Slide Canvas")
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, len(s.undo), 0)
+
+	ti_commit: sdl.Event
+	ti_commit.type = .TEXT_INPUT
+	ti_commit.text.text = "é"
+	dispatch_ev(&te, &frame, &s, cfg, &ti_commit)
+	testing.expect_value(t, dagda.is_composing(&te.session), false)
+	testing.expect_value(t, s.text, "Slide é")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, len(s.undo), 1)
+
+	// Undo via Ctrl+Z -> exact original bytes "Slide Canvas".
+	undo_ev := key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	dispatch_ev(&te, &frame, &s, cfg, &undo_ev)
+	testing.expect_value(t, s.text, "Slide Canvas")
+	testing.expect_value(t, s.rev, u64(2))
+	testing.expect_value(t, len(s.undo), 0)
+
+	// Insert decomposed é ("e\u0301", 3 UTF-8 bytes) at end, then Backspace removes it as 1 grapheme.
+	end_ev := key_ev(sdl.K_END)
+	dispatch_ev(&te, &frame, &s, cfg, &end_ev)
+	ti: sdl.Event
+	ti.type = .TEXT_INPUT
+	ti.text.text = "e\u0301"
+	dispatch_ev(&te, &frame, &s, cfg, &ti)
+	testing.expect_value(t, s.text, "Slide Canvase\u0301")
+	testing.expect_value(t, len(s.text), len("Slide Canvas") + 3)
+
+	bs := key_ev(sdl.K_BACKSPACE)
+	dispatch_ev(&te, &frame, &s, cfg, &bs)
+	testing.expect_value(t, s.text, "Slide Canvas")
+}
+
+@(test)
+test_canvas_editable_text_rejected_proposal_preserves_selection_and_composition :: proc(t: ^testing.T) {
+	Reject_App :: struct {
+		text:     string,
+		rev:      u64,
+		reject:   bool,
+		elements: [1]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Reject_App) -> dagda.Frame {
+		s.elements[0] = {
+			info   = {id = 1, role = "slide.headline"},
+			kind   = .Label,
+			text   = s.text,
+			bounds = {x = 80, y = 60, width = 640, height = 80},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Reject_App)(user_data)
+		if id != 1 || s.reject {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.text)
+		s.text = cloned
+		s.rev += 1
+		return true
+	}
+
+	s := Reject_App{text = strings.clone("Slide Canvas"), reject = true}
+	defer delete(s.text)
+
+	cfg := Editable_Text_Config{enabled = true, target_id = 1, on_commit = on_commit}
+	frame := make_frame(&s)
+	defer dagda.frame_destroy(&frame)
+
+	te: Text_Edit_State
+	defer text_edit_destroy(&te)
+
+	testing.expect(t, text_edit_focus(&te, nil, frame, cfg))
+	// Select "Canvas" (bytes 6..12) and start preedit "e".
+	te.session.anchor = 6
+	te.session.caret = 12
+
+	pre_ev: sdl.Event
+	pre_ev.type = .TEXT_EDITING
+	pre_ev.edit.text = "e"
+	pre_ev.edit.start = 0
+	pre_ev.edit.length = 1
+	_ = text_edit_handle_event(&te, nil, frame, cfg, &s, &pre_ev)
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+
+	// App rejects TEXT_INPUT "é": selection (6, 12) and active preedit "e" must survive for retry.
+	ti: sdl.Event
+	ti.type = .TEXT_INPUT
+	ti.text.text = "é"
+	res := text_edit_handle_event(&te, nil, frame, cfg, &s, &ti)
+	testing.expect_value(t, res.needs_rebuild, false)
+	testing.expect_value(t, s.text, "Slide Canvas")
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+	testing.expect_value(t, te.session.preedit, "e")
+	sel_s, sel_e := dagda.selection_bounds(&te.session)
+	testing.expect_value(t, sel_s, 6)
+	testing.expect_value(t, sel_e, 12)
+
+	// Retry once app accepts: replaces "Canvas" with "é" and clears composition.
+	s.reject = false
+	res = text_edit_handle_event(&te, nil, frame, cfg, &s, &ti)
+	testing.expect_value(t, res.needs_rebuild, true)
+	dagda.frame_destroy(&frame)
+	frame = make_frame(&s)
+	text_edit_apply_committed(&te, frame, cfg, &res.pending_edit)
+	testing.expect_value(t, s.text, "Slide é")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, dagda.is_composing(&te.session), false)
+}
+
+@(test)
+test_canvas_editable_text_click_places_caret_at_two_viewports :: proc(t: ^testing.T) {
+	font: Font
+	if !font_init(&font) {
+		return
+	}
+	defer font_destroy(&font)
+
+	els := [1]dagda.Canvas_Element{
+		{info = {id = 1, role = "slide.headline"}, kind = .Label, text = "Slide Canvas", bounds = {x = 80, y = 60, width = 640, height = 80}},
+	}
+	cfg := Editable_Text_Config{enabled = true, target_id = 1}
+
+	viewports := [2]dagda.Size{{width = 800, height = 540}, {width = 640, height = 480}}
+	for vp in viewports {
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, vp)
+		testing.expect(t, ok)
+		defer dagda.frame_destroy(&frame)
+
+		el, found := dagda.find(frame, 1)
+		testing.expect(t, found)
+		text_x, _, px := text_edit_layout(frame, el.bounds)
+		slide_w := font_measure_width(&font, "Slide", px)
+
+		te: Text_Edit_State
+		defer text_edit_destroy(&te)
+
+		// Click right after "Slide" -> caret lands at byte offset 5.
+		_ = text_edit_click(&te, nil, &font, frame, cfg, text_x + slide_w)
+		testing.expect_value(t, te.session.caret, 5)
+		testing.expect_value(t, te.session.anchor, 5)
+
+		// Click before text origin -> caret lands at byte offset 0.
+		_ = text_edit_click(&te, nil, &font, frame, cfg, text_x - 4)
+		testing.expect_value(t, te.session.caret, 0)
+	}
 }

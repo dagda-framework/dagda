@@ -1,0 +1,477 @@
+package sdlhost
+
+import "core:c"
+import "core:unicode/utf8"
+import "dagda:dagda"
+import sdl "vendor:sdl3"
+
+// Text_Commit_Handler commits a proposed full replacement string for an
+// editable text element. Return true if the app accepted and committed it.
+Text_Commit_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool
+
+// Text_Undo_Handler handles Ctrl+Z while the editable text element is focused
+// and not composing. Return true if the app applied an undo step.
+Text_Undo_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> bool
+
+// Editable_Text_Config opts one single-line text element into host-managed
+// grapheme movement, selection, and IME composition backed by dagda.Text_Session.
+// The app owns committed text, revision, and undo history.
+Editable_Text_Config :: struct {
+	enabled:   bool,
+	target_id: dagda.Object_Id,
+	on_commit: Text_Commit_Handler,
+	on_undo:   Text_Undo_Handler,
+}
+
+Text_Edit_State :: struct {
+	focused: bool,
+	session: dagda.Text_Session,
+}
+
+Text_Edit_Result :: struct {
+	consumed:         bool,
+	needs_redraw:     bool,
+	needs_rebuild:    bool,
+	has_pending_edit: bool,
+	pending_edit:     dagda.Text_Edit,
+}
+
+// text_edit_layout returns the exact rendered text origin and pixel height
+// shared by painting and font_hit_test_caret for an editable single-line label.
+text_edit_layout :: proc(frame: dagda.Frame, rect: dagda.Rect) -> (text_x: f32, text_y: f32, px: f32) {
+	text_scale: f32 = frame.has_canvas ? clamp(frame.transform.scale, 0.4, 2.0) : 1.0
+	px = max(24 * text_scale, 12)
+	pad_x := max(16 * text_scale, 10)
+	text_x = rect.x + pad_x
+	text_y = rect.y + (rect.height - px) * 0.5
+	return
+}
+
+text_edit_destroy :: proc(te: ^Text_Edit_State) {
+	dagda.text_session_destroy(&te.session)
+	te.focused = false
+}
+
+text_edit_update_ime_area :: proc(window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) {
+	if window == nil || !cfg.enabled {
+		return
+	}
+	el, found := dagda.find(frame, cfg.target_id)
+	if !found {
+		return
+	}
+	area := sdl.Rect{
+		x = c.int(el.bounds.x),
+		y = c.int(el.bounds.y),
+		w = max(c.int(el.bounds.width), 1),
+		h = max(c.int(el.bounds.height), 1),
+	}
+	_ = sdl.SetTextInputArea(window, &area, 0)
+}
+
+text_edit_focus :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) -> bool {
+	if !cfg.enabled {
+		return false
+	}
+	el, found := dagda.find(frame, cfg.target_id)
+	if !found {
+		return false
+	}
+	was_focused := te.focused
+	if !te.focused {
+		dagda.text_session_destroy(&te.session)
+		dagda.text_session_init(&te.session, el.text)
+		te.focused = true
+		if window != nil {
+			_ = sdl.StartTextInput(window)
+			text_edit_update_ime_area(window, frame, cfg)
+		}
+	} else if !dagda.is_composing(&te.session) {
+		dagda.text_session_sync(&te.session, el.text)
+	}
+	return !was_focused
+}
+
+// text_edit_click focuses the editable element and places the caret at the
+// clicked grapheme boundary using font_hit_test_caret with the exact painted
+// text origin and font height.
+text_edit_click :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	click_x: f32,
+) -> bool {
+	if !cfg.enabled {
+		return false
+	}
+	el, found := dagda.find(frame, cfg.target_id)
+	if !found {
+		return false
+	}
+	changed := text_edit_focus(te, window, frame, cfg)
+	if dagda.cancel_composition(&te.session) {
+		changed = true
+	}
+	if font != nil && font.loaded {
+		text_x, _, px := text_edit_layout(frame, el.bounds)
+		offset := font_hit_test_caret(font, el.text, px, click_x - text_x)
+		if te.session.caret != offset || te.session.anchor != offset {
+			te.session.caret = offset
+			te.session.anchor = offset
+			changed = true
+		}
+	}
+	return changed
+}
+
+text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
+	if !te.focused {
+		return false
+	}
+	_ = dagda.cancel_composition(&te.session)
+	te.focused = false
+	if window != nil {
+		_ = sdl.StopTextInput(window)
+	}
+	return true
+}
+
+text_edit_reconcile :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) {
+	if !te.focused {
+		return
+	}
+	if !cfg.enabled {
+		_ = text_edit_blur(te, window)
+		return
+	}
+	el, found := dagda.find(frame, cfg.target_id)
+	if !found {
+		_ = text_edit_blur(te, window)
+		return
+	}
+	if !dagda.is_composing(&te.session) {
+		dagda.text_session_sync(&te.session, el.text)
+	}
+	text_edit_update_ime_area(window, frame, cfg)
+}
+
+text_edit_apply_committed :: proc(te: ^Text_Edit_State, frame: dagda.Frame, cfg: Editable_Text_Config, edit: ^dagda.Text_Edit) {
+	if el, found := dagda.find(frame, cfg.target_id); found {
+		dagda.apply_edit(&te.session, edit^, el.text)
+	}
+	dagda.edit_destroy(&te.session, edit)
+}
+
+rune_offset_to_bytes :: proc(s: string, rune_count: int) -> int {
+	if rune_count <= 0 {
+		return 0
+	}
+	seen := 0
+	for _, byte_idx in s {
+		if seen == rune_count {
+			return byte_idx
+		}
+		seen += 1
+	}
+	return len(s)
+}
+
+text_edit_handle_event :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	user_data: rawptr,
+	ev: ^sdl.Event,
+) -> (res: Text_Edit_Result) {
+	if !cfg.enabled || !te.focused {
+		return {}
+	}
+	el, found := dagda.find(frame, cfg.target_id)
+	if !found {
+		_ = text_edit_blur(te, window)
+		return {needs_redraw = true}
+	}
+
+	commit_proposal :: proc(
+		te: ^Text_Edit_State,
+		cfg: Editable_Text_Config,
+		user_data: rawptr,
+		edit: ^dagda.Text_Edit,
+		clear_composition_on_accept: bool,
+		res: ^Text_Edit_Result,
+	) {
+		if edit.err != .None {
+			dagda.edit_destroy(&te.session, edit)
+			res.needs_redraw = true
+			return
+		}
+		if !edit.changed {
+			if clear_composition_on_accept {
+				_ = dagda.cancel_composition(&te.session)
+			}
+			dagda.edit_destroy(&te.session, edit)
+			res.needs_redraw = true
+			return
+		}
+		if cfg.on_commit != nil && cfg.on_commit(user_data, cfg.target_id, edit.text) {
+			if clear_composition_on_accept {
+				_ = dagda.cancel_composition(&te.session)
+			}
+			res.needs_rebuild = true
+			res.needs_redraw = true
+			res.has_pending_edit = true
+			res.pending_edit = edit^
+			edit^ = {}
+			return
+		}
+		// Proposal rejected: preserve selection and any active composition for retry.
+		dagda.edit_destroy(&te.session, edit)
+		res.needs_redraw = true
+	}
+
+	#partial switch ev.type {
+	case .TEXT_EDITING:
+		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
+		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		res.consumed = true
+		res.needs_redraw = true
+		return res
+
+	case .TEXT_INPUT:
+		text := ev.text.text != nil ? string(ev.text.text) : ""
+		// Propose replacing the selection with the IME's final text without
+		// clearing composition first; clear composition only if accepted so a
+		// rejected proposal preserves selection and active composition for retry.
+		edit := dagda.insert_text(&te.session, el.text, text)
+		commit_proposal(te, cfg, user_data, &edit, true, &res)
+		res.consumed = true
+		return res
+
+	case .KEY_DOWN:
+		key := ev.key.key
+		mod := ev.key.mod
+		shift := (mod & sdl.KMOD_SHIFT) != {}
+		ctrl := (mod & sdl.KMOD_CTRL) != {}
+		alt_or_gui := (mod & (sdl.KMOD_ALT | sdl.KMOD_GUI)) != {}
+
+		if key == sdl.K_ESCAPE {
+			if dagda.is_composing(&te.session) {
+				_ = dagda.cancel_composition(&te.session)
+				res.consumed = true
+				res.needs_redraw = true
+				return res
+			}
+			if text_edit_blur(te, window) {
+				res.consumed = true
+				res.needs_redraw = true
+			}
+			return res
+		}
+
+		// While composing, swallow Enter and editing/navigation keys so the IME
+		// delivers its final committed text once via TEXT_INPUT.
+		if dagda.is_composing(&te.session) {
+			res.consumed = true
+			return res
+		}
+
+		if key == sdl.K_RETURN || key == sdl.K_KP_ENTER {
+			res.consumed = true
+			return res
+		}
+
+		if ctrl && !alt_or_gui && key == sdl.K_A {
+			dagda.select_all(&te.session, el.text)
+			res.consumed = true
+			res.needs_redraw = true
+			return res
+		}
+
+		if ctrl && !alt_or_gui && key == sdl.K_Z {
+			if cfg.on_undo != nil && cfg.on_undo(user_data, cfg.target_id) {
+				res.needs_rebuild = true
+				res.needs_redraw = true
+			}
+			res.consumed = true
+			return res
+		}
+
+		if !ctrl && !alt_or_gui {
+			switch key {
+			case sdl.K_LEFT:
+				dagda.move_left(&te.session, el.text, shift)
+				res.consumed = true
+				res.needs_redraw = true
+				return res
+			case sdl.K_RIGHT:
+				dagda.move_right(&te.session, el.text, shift)
+				res.consumed = true
+				res.needs_redraw = true
+				return res
+			case sdl.K_HOME:
+				dagda.move_home(&te.session, shift)
+				res.consumed = true
+				res.needs_redraw = true
+				return res
+			case sdl.K_END:
+				dagda.move_end(&te.session, el.text, shift)
+				res.consumed = true
+				res.needs_redraw = true
+				return res
+			case sdl.K_BACKSPACE:
+				edit := dagda.backspace(&te.session, el.text)
+				commit_proposal(te, cfg, user_data, &edit, false, &res)
+				res.consumed = true
+				return res
+			case sdl.K_DELETE:
+				edit := dagda.delete_forward(&te.session, el.text)
+				commit_proposal(te, cfg, user_data, &edit, false, &res)
+				res.consumed = true
+				return res
+			}
+		}
+
+	case .WINDOW_FOCUS_LOST:
+		if dagda.cancel_composition(&te.session) {
+			res.needs_redraw = true
+		}
+		return res
+	}
+
+	return {}
+}
+
+// text_edit_draw paints an editable label using text_edit_layout (the same
+// origin and font height used by font_hit_test_caret), with selection highlight,
+// live IME preedit underline, and visible caret bar when focused.
+text_edit_draw :: proc(
+	h: ^Host,
+	bounds: dagda.Rect,
+	committed: string,
+	focused: bool,
+) {
+	r := h.renderer
+	box := sdl.FRect{x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height}
+	tx, ty, px := text_edit_layout(h.frame, bounds)
+
+	if !focused {
+		sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
+		sdl.RenderFillRect(r, &box)
+		sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
+		sdl.RenderRect(r, &box)
+		if len(committed) > 0 {
+			font_draw_text(&h.font, r, committed, tx, ty, px, sdl.Color{240, 244, 250, 255})
+		}
+		return
+	}
+
+	sdl.SetRenderDrawColor(r, 34, 41, 56, 255)
+	sdl.RenderFillRect(r, &box)
+	sdl.SetRenderDrawColor(r, 108, 178, 255, 255)
+	sdl.RenderRect(r, &box)
+	inner := sdl.FRect{x = box.x + 1, y = box.y + 1, w = max(box.w - 2, 0), h = max(box.h - 2, 0)}
+	sdl.RenderRect(r, &inner)
+
+	caret_h := px + 6
+
+	sel_start, sel_end := dagda.selection_bounds(&h.text_edit.session)
+	sel_start = clamp(sel_start, 0, len(committed))
+	sel_end = clamp(sel_end, sel_start, len(committed))
+	prefix := committed[:sel_start]
+	selected := committed[sel_start:sel_end]
+	suffix := committed[sel_end:]
+
+	prefix_w := font_measure_width(&h.font, prefix, px)
+
+	if dagda.is_composing(&h.text_edit.session) {
+		preedit := h.text_edit.session.preedit
+		preedit_w := font_measure_width(&h.font, preedit, px)
+		pre_x := tx + prefix_w
+
+		// Preedit highlight background + underline.
+		pre_bg := sdl.FRect{x = pre_x - 2, y = ty - 3, w = max(preedit_w + 4, 6), h = caret_h}
+		sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
+		sdl.RenderFillRect(r, &pre_bg)
+
+		underline := sdl.FRect{x = pre_x, y = ty + px + 2, w = max(preedit_w, 6), h = 2}
+		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+		sdl.RenderFillRect(r, &underline)
+
+		if len(prefix) > 0 {
+			font_draw_text(&h.font, r, prefix, tx, ty, px, sdl.Color{240, 244, 250, 255})
+		}
+		if len(preedit) > 0 {
+			font_draw_text(&h.font, r, preedit, pre_x, ty, px, sdl.Color{255, 244, 196, 255})
+		}
+		if len(suffix) > 0 {
+			font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255})
+		}
+
+		// Caret at preedit cursor position (end of preedit range).
+		caret_runes := h.text_edit.session.preedit_start + h.text_edit.session.preedit_length
+		if caret_runes <= 0 {
+			caret_runes = utf8.rune_count_in_string(preedit)
+		}
+		caret_bytes := rune_offset_to_bytes(preedit, caret_runes)
+		caret_x := pre_x + font_measure_width(&h.font, preedit[:caret_bytes], px)
+		caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = 2, h = caret_h}
+		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+		sdl.RenderFillRect(r, &caret_rect)
+	} else {
+		if len(selected) > 0 {
+			sel_w := font_measure_width(&h.font, selected, px)
+			sel_rect := sdl.FRect{x = tx + prefix_w, y = ty - 3, w = sel_w, h = caret_h}
+			sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
+			sdl.RenderFillRect(r, &sel_rect)
+		}
+		if len(committed) > 0 {
+			font_draw_text(&h.font, r, committed, tx, ty, px, sdl.Color{240, 244, 250, 255})
+		}
+		caret_off := clamp(h.text_edit.session.caret, 0, len(committed))
+		caret_x := tx + font_measure_width(&h.font, committed[:caret_off], px)
+		caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = 2, h = caret_h}
+		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+		sdl.RenderFillRect(r, &caret_rect)
+	}
+}
+
+// copy_to_cstr_buf copies s into a NUL-terminated fixed buffer for SDL_PushEvent.
+copy_to_cstr_buf :: proc(buf: []u8, s: string) -> (cstring, bool) {
+	if len(s) + 1 > len(buf) {
+		return nil, false
+	}
+	if len(s) > 0 {
+		copy(buf[:len(s)], s)
+	}
+	buf[len(s)] = 0
+	return cstring(raw_data(buf)), true
+}
+
+push_sdl_preedit :: proc(h: ^Host, text: string) -> bool {
+	cstr, ok := copy_to_cstr_buf(h.edit_cstr_buf[:], text)
+	if !ok {
+		return false
+	}
+	ev: sdl.Event
+	ev.type = .TEXT_EDITING
+	ev.edit.windowID = sdl.GetWindowID(h.window)
+	ev.edit.text = cstr
+	ev.edit.start = 0
+	ev.edit.length = c.int(utf8.rune_count_in_string(text))
+	return sdl.PushEvent(&ev)
+}
+
+push_sdl_text_input :: proc(h: ^Host, text: string) -> bool {
+	cstr, ok := copy_to_cstr_buf(h.text_cstr_buf[:], text)
+	if !ok {
+		return false
+	}
+	ev: sdl.Event
+	ev.type = .TEXT_INPUT
+	ev.text.windowID = sdl.GetWindowID(h.window)
+	ev.text.text = cstr
+	return sdl.PushEvent(&ev)
+}

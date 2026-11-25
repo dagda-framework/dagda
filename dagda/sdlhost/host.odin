@@ -33,7 +33,8 @@ App :: struct {
 	edits: driver.Edit_Source,
 	// Optional Ctrl+Z undo hook, called on the host thread. It
 	// returns true when the app actually undid something.
-	on_undo: proc(user_data: rawptr) -> bool,
+	on_undo:    proc(user_data: rawptr) -> bool,
+	text_edit:  Editable_Text_Config,
 }
 
 Run_Options :: struct {
@@ -86,19 +87,22 @@ on_signal :: proc "c" (_: posix.Signal) {
 }
 
 Host :: struct {
-	app:          App,
-	window:       ^sdl.Window,
-	renderer:     ^sdl.Renderer,
-	font:         Font,
-	frame:        dagda.Frame,
-	viewport:     dagda.Size,
-	has_hovered:  bool,
-	hovered_id:   dagda.Object_Id,
-	has_pressed:  bool,
-	pressed_id:   dagda.Object_Id,
-	pointer:      Pointer_State,
-	focus:        Focus_State,
-	needs_redraw: bool,
+	app:           App,
+	window:        ^sdl.Window,
+	renderer:      ^sdl.Renderer,
+	font:          Font,
+	frame:         dagda.Frame,
+	viewport:      dagda.Size,
+	has_hovered:   bool,
+	hovered_id:    dagda.Object_Id,
+	has_pressed:   bool,
+	pressed_id:    dagda.Object_Id,
+	pointer:       Pointer_State,
+	focus:         Focus_State,
+	text_edit:     Text_Edit_State,
+	edit_cstr_buf: [256]u8,
+	text_cstr_buf: [256]u8,
+	needs_redraw:  bool,
 }
 
 host_rebuild_frame :: proc(h: ^Host) -> bool {
@@ -121,6 +125,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	}
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
+	text_edit_reconcile(&h.text_edit, h.window, h.frame, h.app.text_edit)
 	h.needs_redraw = true
 	return true
 }
@@ -189,16 +194,20 @@ host_draw :: proc(h: ^Host) {
 		}
 		switch el.kind {
 		case .Label:
-			sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
-			sdl.RenderFillRect(r, &rect)
-			sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
-			sdl.RenderRect(r, &rect)
+			if h.app.text_edit.enabled && el.info.id == h.app.text_edit.target_id {
+				text_edit_draw(h, el.bounds, el.text, h.text_edit.focused)
+			} else {
+				px := max(24 * text_scale, 12)
+				sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
+				sdl.RenderFillRect(r, &rect)
+				sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
+				sdl.RenderRect(r, &rect)
 
-			px := max(24 * text_scale, 12)
-			tw := font_measure_width(&h.font, el.text, px)
-			tx := rect.x + max((rect.w - tw) * 0.5, 12)
-			ty := rect.y + (rect.h - px) * 0.5
-			font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{240, 244, 250, 255})
+				tw := font_measure_width(&h.font, el.text, px)
+				tx := rect.x + max((rect.w - tw) * 0.5, 12)
+				ty := rect.y + (rect.h - px) * 0.5
+				font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{240, 244, 250, 255})
+			}
 
 		case .Button:
 			is_pressed := (h.has_pressed && h.pressed_id == el.info.id) ||
@@ -313,6 +322,33 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		key = sdl.K_SPACE
 	case "escape":
 		key = sdl.K_ESCAPE
+	case "left":
+		key = sdl.K_LEFT
+	case "right":
+		key = sdl.K_RIGHT
+	case "shift+left":
+		key = sdl.K_LEFT
+		mod = sdl.KMOD_LSHIFT
+	case "shift+right":
+		key = sdl.K_RIGHT
+		mod = sdl.KMOD_LSHIFT
+	case "home":
+		key = sdl.K_HOME
+	case "end":
+		key = sdl.K_END
+	case "shift+home":
+		key = sdl.K_HOME
+		mod = sdl.KMOD_LSHIFT
+	case "shift+end":
+		key = sdl.K_END
+		mod = sdl.KMOD_LSHIFT
+	case "backspace":
+		key = sdl.K_BACKSPACE
+	case "delete":
+		key = sdl.K_DELETE
+	case "ctrl+a":
+		key = sdl.K_A
+		mod = sdl.KMOD_LCTRL
 	case "ctrl+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
@@ -448,6 +484,24 @@ poll_control_stdin :: proc(
 					_ = os.flush(os.stdout)
 				}
 			}
+		} else if strings.has_prefix(line, "preedit ") {
+			text := line[len("preedit "):]
+			if push_sdl_preedit(h, text) {
+				fmt.printf("CONTROL_OK preedit %s\n", text)
+				_ = os.flush(os.stdout)
+			} else {
+				fmt.println("CONTROL_ERR preedit failed")
+				_ = os.flush(os.stdout)
+			}
+		} else if strings.has_prefix(line, "text ") {
+			text := line[len("text "):]
+			if push_sdl_text_input(h, text) {
+				fmt.printf("CONTROL_OK text %s\n", text)
+				_ = os.flush(os.stdout)
+			} else {
+				fmt.println("CONTROL_ERR text failed")
+				_ = os.flush(os.stdout)
+			}
 		} else if strings.has_prefix(line, "key ") {
 			name := line[len("key "):]
 			if push_sdl_key(h.window, name) {
@@ -528,6 +582,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer sdl.DestroyRenderer(h.renderer)
 	// Release cached glyph textures before DestroyRenderer frees the renderer.
 	defer font_destroy_textures(&h.font)
+	defer text_edit_destroy(&h.text_edit)
 	defer dagda.frame_destroy(&h.frame)
 
 	if !host_rebuild_frame(&h) {
@@ -554,18 +609,6 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
-				if ev.type == .KEY_DOWN && !ev.key.repeat && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && (ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {} && h.app.on_undo != nil {
-					if h.app.on_undo(h.app.user_data) {
-						if !host_rebuild_frame(&h) {
-							exit_code = 1
-							running = false
-						}
-					}
-					if !running || !sdl.PollEvent(&ev) {
-						break
-					}
-					continue
-				}
 				#partial switch ev.type {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
 					running = false
@@ -593,6 +636,16 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 				case .MOUSE_BUTTON_DOWN:
 					if ev.button.button == sdl.BUTTON_LEFT {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
+						if h.app.text_edit.enabled {
+							if hit && id == h.app.text_edit.target_id {
+								_ = focus_clear(&h.focus)
+								if text_edit_click(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, ev.button.x) {
+									h.needs_redraw = true
+								}
+							} else if text_edit_blur(&h.text_edit, h.window) {
+								h.needs_redraw = true
+							}
+						}
 						h.has_pressed = hit
 						h.pressed_id = hit ? id : 0
 						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
@@ -652,6 +705,22 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							}
 						}
 					}
+				case .TEXT_EDITING, .TEXT_INPUT:
+					tres := text_edit_handle_event(&h.text_edit, h.window, h.frame, h.app.text_edit, h.app.user_data, &ev)
+					if tres.needs_redraw {
+						h.needs_redraw = true
+					}
+					if tres.needs_rebuild {
+						if !host_rebuild_frame(&h) {
+							if tres.has_pending_edit {
+								dagda.edit_destroy(&h.text_edit.session, &tres.pending_edit)
+							}
+							exit_code = 1
+							running = false
+						} else if tres.has_pending_edit {
+							text_edit_apply_committed(&h.text_edit, h.frame, h.app.text_edit, &tres.pending_edit)
+						}
+					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
 					pres := host_handle_pointer_cancel_event(&h, &ev)
 					if pres.changed {
@@ -660,7 +729,26 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							running = false
 						}
 					}
+					t_consumed := false
 					if running && !pres.consumed {
+						tres := text_edit_handle_event(&h.text_edit, h.window, h.frame, h.app.text_edit, h.app.user_data, &ev)
+						t_consumed = tres.consumed
+						if tres.needs_redraw {
+							h.needs_redraw = true
+						}
+						if tres.needs_rebuild {
+							if !host_rebuild_frame(&h) {
+								if tres.has_pending_edit {
+									dagda.edit_destroy(&h.text_edit.session, &tres.pending_edit)
+								}
+								exit_code = 1
+								running = false
+							} else if tres.has_pending_edit {
+								text_edit_apply_committed(&h.text_edit, h.frame, h.app.text_edit, &tres.pending_edit)
+							}
+						}
+					}
+					if running && !pres.consumed && !t_consumed {
 						applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
 						if redraw {
 							h.needs_redraw = true
