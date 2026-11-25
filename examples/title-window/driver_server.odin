@@ -9,7 +9,7 @@ import "dagda:dagda"
 import driver "dagda:examples/title-driver"
 import title_model "dagda:examples/title-model"
 
-MAX_WATCH_OUT_BUF :: 1024 * 1024
+DEFAULT_MAX_WATCH_OUT_BUF :: 1024 * 1024
 
 Driver_Client :: struct {
 	fd:       posix.FD,
@@ -26,11 +26,50 @@ Driver_Client :: struct {
 // window thread so idle or partially written client requests and slow
 // watchers never stall the SDL3 event loop or editor.
 Window_Driver_Server :: struct {
-	active:    bool,
-	path:      string,
-	listen_fd: posix.FD,
-	identity:  driver.Endpoint_Identity,
-	clients:   [dynamic]Driver_Client,
+	active:            bool,
+	path:              string,
+	listen_fd:         posix.FD,
+	identity:          driver.Endpoint_Identity,
+	clients:           [dynamic]Driver_Client,
+	max_watch_out_buf: int, // <= 0 defaults to DEFAULT_MAX_WATCH_OUT_BUF
+}
+
+server_watch_out_limit :: proc(srv: ^Window_Driver_Server) -> int {
+	if srv.max_watch_out_buf > 0 {
+		return srv.max_watch_out_buf
+	}
+	return DEFAULT_MAX_WATCH_OUT_BUF
+}
+
+client_compact_out_buf :: proc(client: ^Driver_Client) {
+	if client.out_sent <= 0 {
+		return
+	}
+	remaining := len(client.out_buf) - client.out_sent
+	if remaining > 0 {
+		copy(client.out_buf[:remaining], client.out_buf[client.out_sent:])
+		resize(&client.out_buf, remaining)
+	} else {
+		clear(&client.out_buf)
+	}
+	client.out_sent = 0
+}
+
+// watcher_enqueue_line compacts any already-sent prefix and appends line+"\n"
+// only if the resulting unsent buffer stays within limit. If either an initial
+// snapshot or a subsequent change event would exceed limit, nothing is appended
+// and the watcher is marked for disconnection (drop = true) so it is closed
+// cleanly on the next service pass without emitting truncated JSON.
+watcher_enqueue_line :: proc(client: ^Driver_Client, line: string, limit: int) -> bool {
+	client_compact_out_buf(client)
+	needed := len(line) + 1
+	if len(client.out_buf) + needed > limit {
+		client.drop = true
+		return false
+	}
+	append(&client.out_buf, ..transmute([]u8)line)
+	append(&client.out_buf, '\n')
+	return true
 }
 
 set_fd_nonblocking :: proc(fd: posix.FD) -> bool {
@@ -75,17 +114,12 @@ driver_server_on_model_change :: proc(user_data: rawptr, kind: title_model.Chang
 	}
 	line := driver.format_change_event(kind, snap)
 	defer delete(line)
+	limit := server_watch_out_limit(srv)
 	for &client in srv.clients {
 		if !client.watching || client.drop || client.watch_id != snap.object.id {
 			continue
 		}
-		pending := len(client.out_buf) - client.out_sent
-		if pending + len(line) + 1 > MAX_WATCH_OUT_BUF {
-			client.drop = true
-			continue
-		}
-		append(&client.out_buf, ..transmute([]u8)line)
-		append(&client.out_buf, '\n')
+		_ = watcher_enqueue_line(&client, line, limit)
 	}
 }
 
@@ -147,6 +181,18 @@ driver_client_destroy :: proc(client: ^Driver_Client) {
 	delete(client.out_buf)
 }
 
+driver_server_prune_dropped :: proc(srv: ^Window_Driver_Server) {
+	i := 0
+	for i < len(srv.clients) {
+		if srv.clients[i].drop {
+			driver_client_destroy(&srv.clients[i])
+			ordered_remove(&srv.clients, i)
+			continue
+		}
+		i += 1
+	}
+}
+
 driver_server_stop :: proc(srv: ^Window_Driver_Server) {
 	if !srv.active {
 		return
@@ -174,6 +220,10 @@ driver_server_poll :: proc(
 	if !srv.active {
 		return
 	}
+
+	// Remove any clients marked for disconnection (e.g. overflowed watchers)
+	// even if no socket is currently ready in poll.
+	driver_server_prune_dropped(srv)
 
 	// Accept any pending client connections without blocking.
 	for {
@@ -211,17 +261,17 @@ driver_server_poll :: proc(
 	}
 
 	read_buf: [4096]u8
+	limit := server_watch_out_limit(srv)
 	i := 0
 	for i < len(srv.clients) {
 		revents := pfds[i].revents
 		client := &srv.clients[i]
-		drop := client.drop
 
 		if .ERR in revents || .NVAL in revents || (client.watching && .HUP in revents) {
-			drop = true
+			client.drop = true
 		}
 
-		if !drop && (.IN in revents || .HUP in revents) && !client.eof {
+		if !client.drop && (.IN in revents || .HUP in revents) && !client.eof {
 			for {
 				n := posix.recv(client.fd, rawptr(&read_buf), c.size_t(len(read_buf)), {})
 				if n > 0 {
@@ -231,7 +281,7 @@ driver_server_poll :: proc(
 					}
 					append(&client.in_buf, ..read_buf[:int(n)])
 					// Extract and dispatch every complete newline-terminated request.
-					for !client.watching {
+					for !client.watching && !client.drop {
 						nl := -1
 						for j in 0 ..< len(client.in_buf) {
 							if client.in_buf[j] == '\n' {
@@ -255,12 +305,23 @@ driver_server_poll :: proc(
 							if wres.subscribed {
 								client.watching = true
 								client.watch_id = wres.id
+								_ = watcher_enqueue_line(client, wres.reply, limit)
+								delete(wres.reply)
+								clear(&client.in_buf)
+								break
 							}
+							// Rejected watch consumes only its own line and leaves
+							// the connection in request mode.
 							append(&client.out_buf, ..transmute([]u8)wres.reply)
 							append(&client.out_buf, '\n')
 							delete(wres.reply)
-							clear(&client.in_buf)
-							break
+
+							remaining := len(client.in_buf) - (nl + 1)
+							if remaining > 0 {
+								copy(client.in_buf[:remaining], client.in_buf[nl + 1:])
+							}
+							resize(&client.in_buf, remaining)
+							continue
 						}
 
 						reply := dispatch_window_line(model, editor, adapter, line)
@@ -281,14 +342,14 @@ driver_server_poll :: proc(
 				} else {
 					err := posix.errno()
 					if err != .EAGAIN && err != .EWOULDBLOCK {
-						drop = true
+						client.drop = true
 					}
 					break
 				}
 			}
 		}
 
-		if !drop && client.out_sent < len(client.out_buf) {
+		if !client.drop && client.out_sent < len(client.out_buf) {
 			for client.out_sent < len(client.out_buf) {
 				rem := client.out_buf[client.out_sent:]
 				n := posix.send(client.fd, rawptr(raw_data(rem)), c.size_t(len(rem)), {.NOSIGNAL})
@@ -297,21 +358,20 @@ driver_server_poll :: proc(
 				} else if n < 0 {
 					err := posix.errno()
 					if err != .EAGAIN && err != .EWOULDBLOCK {
-						drop = true
+						client.drop = true
 					}
 					break
 				} else {
-					drop = true
+					client.drop = true
 					break
 				}
 			}
-			if client.out_sent >= len(client.out_buf) {
-				clear(&client.out_buf)
-				client.out_sent = 0
-			}
+			// Compact sent bytes immediately so retained output stays bounded
+			// across partial sends.
+			client_compact_out_buf(client)
 		}
 
-		if drop || (!client.watching && client.eof && client.out_sent >= len(client.out_buf)) {
+		if client.drop || (!client.watching && client.eof && client.out_sent >= len(client.out_buf)) {
 			driver_client_destroy(client)
 			ordered_remove(&srv.clients, i)
 			// Keep pfds aligned with remaining clients by shifting revents.

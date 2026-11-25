@@ -791,3 +791,155 @@ test_watch_stream_events_and_no_spurious_notifications :: proc(t: ^testing.T) {
 	testing.expect(t, ok_reconn)
 	testing.expect_value(t, reconn, `{"ok":true,"id":1,"revision":3,"text":"Quarterly results!","role":"slide.title"}`)
 }
+
+@(test)
+test_rejected_watch_consumes_only_its_line_and_keeps_request_mode :: proc(t: ^testing.T) {
+	model := make_test_model(t, "Quarterly results")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	sock_dir := fmt.tprintf("/tmp/dagda-win-rejwatch-test-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	sock_path := fmt.tprintf("%s/title.sock", sock_dir)
+
+	srv: Window_Driver_Server
+	testing.expect(t, driver_server_start(&srv, sock_path), "Expected driver server to start")
+	driver_server_attach_model(&srv, &model)
+	defer title_model.clear_observer(&model)
+	defer driver_server_stop(&srv)
+
+	c1, c1_ok := driver.connect_unix(sock_path)
+	testing.expect(t, c1_ok)
+	defer posix.close(c1)
+
+	// Send a rejected watch and a valid inspect pipelined in one write.
+	pipelined := "{\"op\":\"watch\",\"role\":\"slide.missing\"}\n{\"op\":\"inspect\",\"role\":\"slide.title\"}\n"
+	testing.expect(t, driver.write_all(c1, pipelined))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	r := driver.Line_Reader{fd = c1}
+	rep1, ok1 := driver.read_line(&r)
+	defer delete(rep1)
+	testing.expect(t, ok1)
+	testing.expect_value(t, rep1, `{"ok":false,"error":"Unknown_Role"}`)
+
+	rep2, ok2 := driver.read_line(&r)
+	defer delete(rep2)
+	testing.expect(t, ok2)
+	testing.expect_value(t, rep2, `{"ok":true,"id":1,"revision":0,"text":"Quarterly results","role":"slide.title"}`)
+
+	testing.expect_value(t, len(srv.clients), 1)
+	testing.expect_value(t, srv.clients[0].watching, false)
+}
+
+@(test)
+test_watcher_partial_drain_refill_overflow_cleanup_and_healthy_peer :: proc(t: ^testing.T) {
+	// 1. Deterministic partial drain & refill compacts sent prefix and stays bounded.
+	c := Driver_Client{fd = -1, watching = true, watch_id = 1}
+	defer delete(c.out_buf)
+
+	testing.expect(t, watcher_enqueue_line(&c, "0123456789", 16), "first 11-byte line should fit in 16")
+	testing.expect_value(t, len(c.out_buf), 11)
+	// Simulate partial send of 8 bytes; 3 bytes ("89\n") remain unsent.
+	c.out_sent = 8
+	// Refill with 12-byte line ("abcdefghijk\n"): 3 + 12 = 15 <= 16 after compaction.
+	testing.expect(t, watcher_enqueue_line(&c, "abcdefghijk", 16), "compacted refill should fit in 16")
+	testing.expect_value(t, c.out_sent, 0)
+	testing.expect_value(t, string(c.out_buf[:]), "89\nabcdefghijk\n")
+	testing.expect_value(t, c.drop, false)
+
+	// Overflow marks drop=true without appending partial bytes.
+	testing.expect(t, !watcher_enqueue_line(&c, "too-long", 16), "overflow should fail")
+	testing.expect_value(t, c.drop, true)
+	testing.expect_value(t, string(c.out_buf[:]), "89\nabcdefghijk\n")
+
+	// 2. Live server: initial snapshot overflow, event overflow, no-ready-socket prune, and healthy peer delivery.
+	model := make_test_model(t, "Quarterly results")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	sock_dir := fmt.tprintf("/tmp/dagda-win-overflow-test-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	sock_path := fmt.tprintf("%s/title.sock", sock_dir)
+
+	srv: Window_Driver_Server
+	srv.max_watch_out_buf = 32 // smaller than initial snapshot JSON
+	testing.expect(t, driver_server_start(&srv, sock_path), "Expected driver server to start")
+	driver_server_attach_model(&srv, &model)
+	defer title_model.clear_observer(&model)
+	defer driver_server_stop(&srv)
+
+	// Initial snapshot exceeds limit -> watcher is dropped cleanly with EOF (no truncated JSON).
+	w_tiny, w_tiny_ok := driver.connect_unix(sock_path)
+	testing.expect(t, w_tiny_ok)
+	defer posix.close(w_tiny)
+	testing.expect(t, driver.write_all(w_tiny, "{\"op\":\"watch\",\"role\":\"slide.title\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+	testing.expect_value(t, len(srv.clients), 0)
+	r_tiny := driver.Line_Reader{fd = w_tiny}
+	_, got_tiny := driver.read_line(&r_tiny)
+	testing.expect_value(t, got_tiny, false)
+
+	// Raise limit to 100 bytes: fits initial snapshot (83 bytes) or 1 event (~55 bytes), overflows on 2 buffered events.
+	srv.max_watch_out_buf = 100
+
+	w_slow, w_slow_ok := driver.connect_unix(sock_path)
+	testing.expect(t, w_slow_ok)
+	defer posix.close(w_slow)
+	w_healthy, w_healthy_ok := driver.connect_unix(sock_path)
+	testing.expect(t, w_healthy_ok)
+	defer posix.close(w_healthy)
+
+	testing.expect(t, driver.write_all(w_slow, "{\"op\":\"watch\",\"role\":\"slide.title\"}\n"))
+	testing.expect(t, driver.write_all(w_healthy, "{\"op\":\"watch\",\"role\":\"slide.title\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+	testing.expect_value(t, len(srv.clients), 2)
+
+	r_slow := driver.Line_Reader{fd = w_slow}
+	init_s, ok_s := driver.read_line(&r_slow)
+	defer delete(init_s)
+	testing.expect(t, ok_s)
+	r_healthy := driver.Line_Reader{fd = w_healthy}
+	init_h, ok_h := driver.read_line(&r_healthy)
+	defer delete(init_h)
+	testing.expect(t, ok_h)
+
+	// Simulate w_slow having 60 unsent bytes backed up while w_healthy is drained.
+	for _ in 0 ..< 60 {
+		append(&srv.clients[0].out_buf, 'x')
+	}
+
+	// Model commit overflows w_slow (60 + ~55 > 100) while queuing cleanly onto w_healthy (0 + ~55 <= 100).
+	res := adapter_commit(adapter, {id = 1, base_revision = 0}, "Next title")
+	testing.expect_value(t, res.err, Model_Error.None)
+	testing.expect_value(t, srv.clients[0].drop, true)
+	testing.expect_value(t, srv.clients[1].drop, false)
+
+	// Next poll prunes w_slow immediately and delivers the event to w_healthy.
+	driver_server_poll(&srv, &model, &state, adapter)
+	testing.expect_value(t, len(srv.clients), 1)
+	testing.expect_value(t, srv.clients[0].watching, true)
+
+	ev_h, ok_ev_h := driver.read_line(&r_healthy)
+	defer delete(ev_h)
+	testing.expect(t, ok_ev_h)
+	testing.expect_value(t, ev_h, `{"event":"commit","id":1,"revision":1,"text":"Next title"}`)
+
+	// Mark the remaining watcher dropped with NO socket I/O ready; poll must still prune it immediately.
+	srv.clients[0].drop = true
+	driver_server_poll(&srv, &model, &state, adapter)
+	testing.expect_value(t, len(srv.clients), 0)
+}
