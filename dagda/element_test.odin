@@ -113,3 +113,65 @@ test_resolved_inspection_and_empty :: proc(t: ^testing.T) {
 	defer frame_destroy(&empty)
 	testing.expect_value(t, len(empty.elements), 0)
 }
+
+@(test)
+test_duplicate_ids_rejected :: proc(t: ^testing.T) {
+	// Regression: a label and a button sharing ID 1 must not
+	// resolve (hit-testing would name the button, then dispatch
+	// would find the label and report Unsupported_Action).
+	view := View{elements = {
+		{info = {id = 1, role = "counter.value"}, kind = .Label, text = "0"},
+		{info = {id = 1, role = "counter.increment"}, kind = .Button, text = "Increment"},
+	}}
+	frame, ok := resolve(view, {width = 320, height = 200})
+	testing.expect(t, !ok)
+	testing.expect_value(t, len(frame.elements), 0)
+}
+
+Shared_Recorder :: struct {
+	last_id: Object_Id,
+	calls:   int,
+}
+
+shared_handle :: proc(user_data: rawptr, id: Object_Id, action: Action) -> bool {
+	r := (^Shared_Recorder)(user_data)
+	if action == .Activate {
+		r.last_id = id
+		r.calls += 1
+		return true
+	}
+	return false
+}
+
+@(test)
+test_shared_role_distinct_ids_dispatch :: proc(t: ^testing.T) {
+	// Roles may repeat: two buttons share a role, and dispatch by
+	// ID (agent path) or by point (pointer path) reaches the
+	// intended element.
+	rec: Shared_Recorder
+	view := View{elements = {
+		{info = {id = 10, role = "shared.action"}, kind = .Button, text = "First"},
+		{info = {id = 20, role = "shared.action"}, kind = .Button, text = "Second"},
+	}}
+	frame, ok := resolve(view, {width = 320, height = 200})
+	testing.expect(t, ok)
+	defer frame_destroy(&frame)
+
+	objects: [2]Object_Info
+	for element, i in frame.elements {
+		objects[i] = element.info
+	}
+	ids: [2]Object_Id
+	written, total := find_by_role(objects[:], "shared.action", ids[:])
+	testing.expect_value(t, written, 2)
+	testing.expect_value(t, total, 2)
+
+	testing.expect_value(t, invoke(frame, ids[1], .Activate, shared_handle, &rec), Invoke_Result.Applied)
+	testing.expect_value(t, rec.last_id, Object_Id(20))
+
+	second := frame.elements[1]
+	centre := Point{x = second.bounds.x + 1, y = second.bounds.y + 1}
+	testing.expect_value(t, click(frame, centre, shared_handle, &rec), Invoke_Result.Applied)
+	testing.expect_value(t, rec.last_id, Object_Id(20))
+	testing.expect_value(t, rec.calls, 2)
+}

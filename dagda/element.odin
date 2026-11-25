@@ -65,7 +65,9 @@ Resolved_Element :: struct {
 	actions: Action_Set,
 }
 
-// A resolved frame. The frame owns its resolved-element storage
+// A resolved frame. Element IDs are unique within a frame and
+// stable across rebuilds of the same view; roles may repeat.
+// The frame owns its resolved-element storage
 // (release it with frame_destroy); the text and role strings it
 // points at stay owned by the app's view definitions, so a frame
 // must not outlive them or a rebuild of the view.
@@ -87,10 +89,23 @@ actions_for :: proc(kind: Element_Kind) -> Action_Set {
 // resolve lays the view out for a viewport. This first slice
 // stacks elements vertically with a fixed margin and row height:
 // enough to place a label above a button, nothing more.
+//
+// Element IDs must be unique within a view (roles may repeat):
+// an ID names one element in the frame and is meant to stay
+// stable for that element across rebuilds, so a duplicate is
+// rejected here rather than resolved ambiguously downstream.
 resolve :: proc(view: View, viewport: Size, allocator := context.allocator) -> (Frame, bool) {
 	elements, err := make([]Resolved_Element, len(view.elements), allocator)
 	if err != nil {
 		return {}, false
+	}
+	for element, i in view.elements {
+		for prev in view.elements[:i] {
+			if prev.info.id == element.info.id {
+				delete(elements, allocator)
+				return {}, false
+			}
+		}
 	}
 	margin: f32 = 16
 	row_height: f32 = 40
