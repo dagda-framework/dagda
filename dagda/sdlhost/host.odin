@@ -60,17 +60,25 @@ Host :: struct {
 	needs_redraw: bool,
 }
 
-host_rebuild_frame :: proc(h: ^Host) {
+host_rebuild_frame :: proc(h: ^Host) -> bool {
 	w, height: c.int
 	sdl.GetWindowSize(h.window, &w, &height)
 	h.viewport = {width = f32(w), height = f32(height)}
+	// Release the previous frame before rebuilding the app view so no frame
+	// outlives borrowed label/role storage.
 	dagda.frame_destroy(&h.frame)
-	h.frame, _ = dagda.resolve(h.app.view(h.app.user_data), h.viewport)
+	frame, ok := dagda.resolve(h.app.view(h.app.user_data), h.viewport)
+	if !ok {
+		fmt.eprintln("dagda.resolve failed")
+		return false
+	}
+	h.frame = frame
 	h.needs_redraw = true
+	return true
 }
 
 host_rebuild_cb :: proc(ctx: rawptr) {
-	host_rebuild_frame((^Host)(ctx))
+	_ = host_rebuild_frame((^Host)(ctx))
 }
 
 host_draw :: proc(h: ^Host) {
@@ -283,7 +291,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer sdl.DestroyRenderer(h.renderer)
 	defer dagda.frame_destroy(&h.frame)
 
-	host_rebuild_frame(&h)
+	if !host_rebuild_frame(&h) {
+		return 1
+	}
 	_ = host_render(&h)
 
 	srv: driver.Server
