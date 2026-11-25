@@ -36,6 +36,8 @@ SHEET_RGB = (26, 31, 42)
 IDLE_CARD_RGB = (52, 108, 194)
 HOVER_CARD_RGB = (64, 124, 214)
 CARET_AMBER_RGB = (255, 206, 84)
+PREEDIT_BG_RGB = (62, 78, 118)
+SEL_BG_RGB = (58, 108, 190)
 
 
 class DeadlineLineReader:
@@ -225,20 +227,95 @@ def wait_for_role_text(client_bin: Path, sock: Path, role: str, expected: str, t
     raise AssertionError(f"timed out waiting for {role} == {expected!r}; last={last}")
 
 
-def count_rgb_in_rect(png_path: Path, bounds: dict, target_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+def inspect_headline_visual_state(png_path: Path, bounds: dict) -> tuple[int, int, int, int, int]:
+    """Inspect composition-specific and selection-specific visual cues inside headline bounds.
+    Returns (png_w, png_h, preedit_bg_hits, sel_bg_hits, max_amber_row_width).
+    - Composing paints PREEDIT_BG_RGB and an amber underline wider than the 2px caret bar,
+      and hides SEL_BG_RGB while composing over the selection.
+    - Ordinary selection paints SEL_BG_RGB, zero PREEDIT_BG_RGB, and only the 2px caret bar.
+    """
     w, h, rgb = decode_png_rgb(png_path)
     x0 = max(0, int(math.floor(bounds["x"])))
     y0 = max(0, int(math.floor(bounds["y"])))
     x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])))
     y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])))
-    hits = 0
+    preedit_bg_hits = 0
+    sel_bg_hits = 0
+    max_amber_row_width = 0
     for y in range(y0, y1):
         row_off = y * w * 3
+        row_amber = 0
         for x in range(x0, x1):
             px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
-            if rgb_close(px, target_rgb):
-                hits += 1
-    return w, h, hits
+            if rgb_close(px, PREEDIT_BG_RGB):
+                preedit_bg_hits += 1
+            elif rgb_close(px, SEL_BG_RGB):
+                sel_bg_hits += 1
+            elif rgb_close(px, CARET_AMBER_RGB):
+                row_amber += 1
+        if row_amber > max_amber_row_width:
+            max_amber_row_width = row_amber
+    return w, h, preedit_bg_hits, sel_bg_hits, max_amber_row_width
+
+
+def wait_for_headline_composing(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    client_bin: Path,
+    sock: Path,
+    png_path: Path,
+    expected_text: str,
+    expected_status: str,
+    timeout: float = 2.0,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout
+    last = (0, 0, 0, 0, 0)
+    while True:
+        send_control(proc, reader, f"screenshot {png_path}")
+        code, hl_now = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and hl_now["elements"][0]["text"] == expected_text, hl_now
+        hb = hl_now["elements"][0]["bounds"]
+        png_w, png_h, pre_bg, sel_bg, max_amber_w = inspect_headline_visual_state(png_path, hb)
+        last = (png_w, png_h, pre_bg, sel_bg, max_amber_w)
+        if pre_bg >= 50 and max_amber_w >= 6 and sel_bg == 0:
+            wait_for_role_text(client_bin, sock, "slide.status", expected_status)
+            return png_w, png_h, pre_bg, max_amber_w
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"headline not visibly composing in {png_path}: "
+                f"preedit_bg={pre_bg} (need >=50), max_amber_row_width={max_amber_w} (need >=6), "
+                f"sel_bg={sel_bg} (need ==0)"
+            )
+        time.sleep(0.02)
+
+
+def wait_for_headline_ordinary_selection(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    client_bin: Path,
+    sock: Path,
+    png_path: Path,
+    expected_text: str,
+    expected_status: str,
+    timeout: float = 2.0,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        send_control(proc, reader, f"screenshot {png_path}")
+        code, hl_now = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and hl_now["elements"][0]["text"] == expected_text, hl_now
+        hb = hl_now["elements"][0]["bounds"]
+        png_w, png_h, pre_bg, sel_bg, max_amber_w = inspect_headline_visual_state(png_path, hb)
+        if pre_bg == 0 and max_amber_w <= 2 and sel_bg >= 200:
+            wait_for_role_text(client_bin, sock, "slide.status", expected_status)
+            return png_w, png_h, sel_bg, max_amber_w
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"ordinary selection not restored in {png_path}: "
+                f"preedit_bg={pre_bg} (need ==0), max_amber_row_width={max_amber_w} (need <=2), "
+                f"sel_bg={sel_bg} (need >=200)"
+            )
+        time.sleep(0.02)
 
 
 def assert_bbox_matches(bounds: dict, px0: int, py0: int, px1: int, py1: int) -> None:
@@ -602,12 +679,14 @@ def verify_headline_text_editing(
     size_arg: str = "800x540",
     tag: str = "text1",
     save_preedit_name: str = "headline-preedit.png",
+    omit_preedit: bool = False,
 ) -> None:
     """Verify editable single-line headline on canvas:
-    click-to-caret placement (start + interior + end) -> select -> live preedit 'e'
-    (captured with underline+caret) -> Escape cancel (text+rev intact)
-    -> TEXT_EDITING 'e' + Enter + TEXT_INPUT 'é' commits once (1 rev, 1 undo)
-    -> Ctrl+Z undo to exact original bytes
+    click-to-caret placement (start + interior + end) -> Tab to button -> select 'Canvas'
+    -> live preedit 'e' (visually verified: preedit highlight + underline > caret, no selection bg)
+    -> Escape cancel (visually verified: ordinary selection restored at same revision)
+    -> live preedit 'e' again (visually verified before Enter + TEXT_INPUT 'é')
+    -> commits once (1 rev, 1 undo) -> Ctrl+Z undo to exact original bytes
     -> Backspace removes decomposed é (e + U+0301) as one grapheme.
     """
     sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-canvas-{tag}."))
@@ -683,36 +762,47 @@ def verify_headline_text_editing(
         send_control(proc, reader, f"click {hb['x'] + hb['width'] - 10.0:.2f} {hy:.2f}")
         for _ in range(6):
             send_control(proc, reader, "key shift+left")
-        send_control(proc, reader, "preedit e")
+        if not omit_preedit:
+            send_control(proc, reader, "preedit e")
 
-        # Wait for preedit + caret (amber underline + caret pixels) to render inside headline bounds.
+        # Prove "e" is visibly composing over selected "Canvas" before Escape:
+        # preedit highlight + underline wider than 2px caret bar + no ordinary selection highlight.
         preedit_png = capture_dir / save_preedit_name
-        deadline = time.monotonic() + 2.0
-        amber_hits = 0
-        while True:
-            send_control(proc, reader, f"screenshot {preedit_png}")
-            code, hl_now = run_client(client_bin, sock, "inspect", "slide.headline")
-            assert code == 0 and hl_now["elements"][0]["text"] == "Slide Canvas", hl_now
-            hb = hl_now["elements"][0]["bounds"]
-            png_w, png_h, amber_hits = count_rgb_in_rect(preedit_png, hb, CARET_AMBER_RGB)
-            if amber_hits >= 30:
-                break
-            if time.monotonic() >= deadline:
-                raise AssertionError(f"preedit underline/caret pixels not visible in {preedit_png} (hits={amber_hits})")
-            time.sleep(0.02)
+        png_w, png_h, pre_bg1, uline_w1 = wait_for_headline_composing(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            preedit_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
 
-        # Verify committed text and revision are untouched during live preedit.
-        wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
-        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=4, undo=0")
-
-        # 3. Cancel preedit with Escape -> original text and revision stay intact.
+        # 3. Cancel preedit with Escape -> restores ordinary selection over "Canvas" at rev=4.
         send_control(proc, reader, "key escape")
-        wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
-        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=4, undo=0")
+        cancel_png = capture_dir / f"{tag}-{size_arg}-after-escape.png"
+        _, _, sel_bg_after_esc, caret_w_after_esc = wait_for_headline_ordinary_selection(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            cancel_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
 
-        # 4. IME sequence: TEXT_EDITING 'e' -> Enter -> TEXT_INPUT 'é'.
-        # Selected "Canvas" is replaced by "é" exactly once (1 revision, 1 undo entry).
+        # 4. Compose "e" again and prove it is visibly composing BEFORE Enter and final TEXT_INPUT "é".
         send_control(proc, reader, "preedit e")
+        preedit2_png = capture_dir / f"{tag}-{size_arg}-preedit2.png"
+        _, _, pre_bg2, uline_w2 = wait_for_headline_composing(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            preedit2_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
         send_control(proc, reader, "key enter")
         send_control(proc, reader, "text é")
         wait_for_role_text(client_bin, sock, "slide.headline", "Slide é")
@@ -740,8 +830,9 @@ def verify_headline_text_editing(
 
         print(
             f"[{tag}] requested={size_arg} captured={png_w}x{png_h} click_caret={interior_text!r} "
-            f"preedit_png={preedit_png} (amber_px={amber_hits}): "
-            f"cancel(rev=4) -> ime(e+Enter+é -> 'Slide é',rev=5,undo=1) -> undo('Slide Canvas',rev=6) -> "
+            f"preedit1=(bg={pre_bg1},uline_w={uline_w1}) esc_sel=(bg={sel_bg_after_esc},caret_w={caret_w_after_esc}) "
+            f"preedit2=(bg={pre_bg2},uline_w={uline_w2}) "
+            f"ime(e+Enter+é -> 'Slide é',rev=5,undo=1) -> undo('Slide Canvas',rev=6) -> "
             f"decomposed_e+backspace('Slide Canvas',rev=8)"
         )
 
@@ -755,7 +846,13 @@ def verify_headline_text_editing(
 
 
 def main() -> int:
-    capture_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build" / "canvas-capture"
+    args = sys.argv[1:]
+    negative_control = False
+    if "--omit-preedit-negative-control" in args:
+        negative_control = True
+        args = [a for a in args if a != "--omit-preedit-negative-control"]
+
+    capture_dir = Path(args[0]) if len(args) > 0 else ROOT / "build" / "canvas-capture"
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     build_dir = ROOT / "build"
@@ -765,6 +862,18 @@ def main() -> int:
 
     subprocess.check_call([str(ODIN), "build", "examples/canvas-slide", "-collection:dagda=.", f"-out:{canvas_bin}"], cwd=ROOT)
     subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
+
+    if negative_control:
+        verify_headline_text_editing(
+            canvas_bin,
+            client_bin,
+            capture_dir,
+            "800x540",
+            "neg",
+            "headline-neg.png",
+            omit_preedit=True,
+        )
+        return 0
 
     verify_viewport(canvas_bin, client_bin, capture_dir, "800x540", "vp1")
     verify_viewport(canvas_bin, client_bin, capture_dir, "640x480", "vp2", start_over_card=True)

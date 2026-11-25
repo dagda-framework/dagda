@@ -89,6 +89,7 @@ on_signal :: proc "c" (_: posix.Signal) {
 Host :: struct {
 	app:           App,
 	window:        ^sdl.Window,
+	ime_window:    ^sdl.Window, // nil under --control-stdin to isolate injected IME tests from native IME
 	renderer:      ^sdl.Renderer,
 	font:          Font,
 	frame:         dagda.Frame,
@@ -125,7 +126,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	}
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
-	text_edit_reconcile(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit)
+	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit)
 	h.needs_redraw = true
 	return true
 }
@@ -578,6 +579,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		fmt.eprintf("SDL_CreateWindowAndRenderer failed: %s\n", sdl.GetError())
 		return 1
 	}
+	h.ime_window = opts.control_stdin ? nil : h.window
 	defer sdl.DestroyWindow(h.window)
 	defer sdl.DestroyRenderer(h.renderer)
 	// Release cached glyph textures before DestroyRenderer frees the renderer.
@@ -639,10 +641,10 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						if h.app.text_edit.enabled {
 							if hit && id == h.app.text_edit.target_id {
 								_ = focus_clear(&h.focus)
-								if text_edit_click(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, ev.button.x) {
+								if text_edit_click(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.button.x) {
 									h.needs_redraw = true
 								}
-							} else if text_edit_blur(&h.text_edit, h.window) {
+							} else if text_edit_blur(&h.text_edit, h.ime_window) {
 								h.needs_redraw = true
 							}
 						}
@@ -706,7 +708,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						}
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
-					tres := text_edit_handle_event(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
+					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
 					if tres.needs_redraw {
 						h.needs_redraw = true
 					}
@@ -718,7 +720,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							exit_code = 1
 							running = false
 						} else if tres.has_pending_edit {
-							text_edit_apply_committed(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
 						}
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
@@ -731,7 +733,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					}
 					t_consumed := false
 					if running && !pres.consumed {
-						tres := text_edit_handle_event(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
+						tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
 						t_consumed = tres.consumed
 						if tres.needs_redraw {
 							h.needs_redraw = true
@@ -744,7 +746,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 								exit_code = 1
 								running = false
 							} else if tres.has_pending_edit {
-								text_edit_apply_committed(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+								text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
 							}
 						}
 					}
@@ -753,7 +755,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						if h.focus.has_focus && h.text_edit.focused {
 							// Keyboard focus belongs to one element at a time:
 							// end the text-input session when Tab/Shift+Tab focuses a button.
-							_ = text_edit_blur(&h.text_edit, h.window)
+							_ = text_edit_blur(&h.text_edit, h.ime_window)
 							h.needs_redraw = true
 						}
 						if redraw {
