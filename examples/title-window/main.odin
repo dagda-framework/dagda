@@ -598,7 +598,9 @@ run_main :: proc() -> int {
 		if !driver_server_start(&server, socket_path) {
 			return 1
 		}
+		driver_server_attach_model(&server, &model)
 	}
+	defer title_model.clear_observer(&model)
 	defer driver_server_stop(&server)
 
 	control_buf: [dynamic]u8

@@ -9,6 +9,7 @@ import driver "dagda:examples/title-driver"
 
 usage :: proc() {
 	fmt.eprintln("usage: title-client <socket-path> inspect <role>")
+	fmt.eprintln("       title-client <socket-path> watch   <role>")
 	fmt.eprintln("       title-client <socket-path> preview <id> <base_revision> <text>")
 	fmt.eprintln("       title-client <socket-path> commit  <id> <base_revision> <text>")
 	fmt.eprintln("       title-client <socket-path> undo    <id> <base_revision>")
@@ -35,6 +36,7 @@ main :: proc() {
 	b: strings.Builder
 	strings.builder_init(&b)
 
+	is_watch := false
 	switch cmd {
 	case "inspect":
 		if len(os.args) != 4 {
@@ -42,6 +44,15 @@ main :: proc() {
 			os.exit(2)
 		}
 		strings.write_string(&b, "{\"op\":\"inspect\",\"role\":")
+		driver.write_json_string(&b, os.args[3])
+		strings.write_byte(&b, '}')
+	case "watch":
+		if len(os.args) != 4 {
+			usage()
+			os.exit(2)
+		}
+		is_watch = true
+		strings.write_string(&b, "{\"op\":\"watch\",\"role\":")
 		driver.write_json_string(&b, os.args[3])
 		strings.write_byte(&b, '}')
 	case "preview", "commit":
@@ -91,8 +102,23 @@ main :: proc() {
 		os.exit(1)
 	}
 	fmt.println(reply)
+	_ = os.flush(os.stdout)
 	code := strings.contains(reply, "\"ok\":true") ? 0 : 1
 	delete(reply)
+	if !is_watch || code != 0 {
+		posix.close(fd)
+		os.exit(code)
+	}
+
+	for {
+		ev, has_ev := driver.read_line(&reader)
+		if !has_ev {
+			break
+		}
+		fmt.println(ev)
+		_ = os.flush(os.stdout)
+		delete(ev)
+	}
 	posix.close(fd)
-	os.exit(code)
+	os.exit(0)
 }

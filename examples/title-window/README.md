@@ -34,12 +34,13 @@ mkdir -p build
 SOCK_DIR=$(mktemp -d /tmp/dagda-title.XXXXXX)
 SOCK=$SOCK_DIR/title.sock
 ./build/title-window --socket "$SOCK" &
+./build/title-client "$SOCK" watch slide.title &   # prints initial inspect snapshot, then one JSON line per commit/undo
 ./build/title-client "$SOCK" inspect slide.title
 ./build/title-client "$SOCK" preview 1 0 "Revenue grew 12%"
 ./build/title-client "$SOCK" commit 1 0 "Revenue grew 12%"
 ```
 
-When `--socket <path>` is passed, the window reuses `examples/title-driver`'s private-directory socket lifecycle (refuses an existing path, records endpoint device/inode identity at bind time, and unlinks only its own endpoint on shutdown) and serves newline-delimited JSON requests non-blockingly on the window thread against the window's single `title_model.Model`. `inspect` and `preview` run during active IME composition; valid external `commit` or `undo` requests during composition return `{"ok":false,"error":"Busy_Composing"}` while preserving the document, preedit, and focus.
+When `--socket <path>` is passed, the window reuses `examples/title-driver`'s private-directory socket lifecycle (refuses an existing path, records endpoint device/inode identity at bind time, and unlinks only its own endpoint on shutdown) and serves newline-delimited JSON requests non-blockingly on the window thread against the window's single `title_model.Model`. `inspect` and `preview` run during active IME composition; valid external `commit` or `undo` requests during composition return `{"ok":false,"error":"Busy_Composing"}` while preserving the document, preedit, and focus. A dedicated `watch` connection receives the current `inspect` snapshot first and then one JSON event line per committed change in revision order (`{"event":"commit"|"undo","id":1,"revision":N,"text":"..."}`); previews, no-ops, and rejected edits emit no events.
 
 ### Real-client E2E verification (injected window events + real `title-client`)
 

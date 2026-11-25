@@ -680,3 +680,114 @@ test_busy_status_uses_guard_outcome_not_reply_text :: proc(t: ^testing.T) {
 	testing.expect_value(t, state.last_status, "Driver blocked: Busy_Composing (retry after preedit)")
 	testing.expect_value(t, state.needs_redraw, true)
 }
+
+@(test)
+test_watch_stream_events_and_no_spurious_notifications :: proc(t: ^testing.T) {
+	model := make_test_model(t, "Quarterly results")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	sock_dir := fmt.tprintf("/tmp/dagda-win-watch-test-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	sock_path := fmt.tprintf("%s/title.sock", sock_dir)
+
+	srv: Window_Driver_Server
+	testing.expect(t, driver_server_start(&srv, sock_path), "Expected driver server to start")
+	driver_server_attach_model(&srv, &model)
+	defer title_model.clear_observer(&model)
+	defer driver_server_stop(&srv)
+
+	// Watcher connects and subscribes to slide.title.
+	w1, w1_ok := driver.connect_unix(sock_path)
+	testing.expect(t, w1_ok)
+	defer posix.close(w1)
+	testing.expect(t, driver.write_all(w1, "{\"op\":\"watch\",\"role\":\"slide.title\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	r1 := driver.Line_Reader{fd = w1}
+	init_line, ok_init := driver.read_line(&r1)
+	defer delete(init_line)
+	testing.expect(t, ok_init)
+	testing.expect_value(t, init_line, `{"ok":true,"id":1,"revision":0,"text":"Quarterly results","role":"slide.title"}`)
+
+	// Preview, no-op commit, stale commit, and busy commit during preedit must emit NO events.
+	prev := dispatch_window_line(&model, &state, adapter, `{"op":"preview","id":1,"base_revision":0,"text":"Preview only"}`)
+	delete(prev)
+	noop := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":0,"text":"Quarterly results"}`)
+	delete(noop)
+	stale := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":9,"text":"Stale"}`)
+	delete(stale)
+
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 2
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	busy := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":0,"text":"Blocked"}`)
+	delete(busy)
+	esc_ev: sdl.Event
+	esc_ev.type = .KEY_DOWN
+	esc_ev.key.key = sdl.K_ESCAPE
+	editor_handle_sdl_event(&state, adapter, &esc_ev, TEST_TITLE_BOX)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	// Confirm watcher socket has no pending bytes after non-mutating/rejected operations.
+	pfd := posix.pollfd{fd = w1, events = {.IN}}
+	testing.expect_value(t, posix.poll(&pfd, 1, 0), c.int(0))
+
+	// Human typing emits commit at rev 1.
+	type_ev: sdl.Event
+	type_ev.type = .TEXT_INPUT
+	type_ev.text.text = "!"
+	editor_handle_sdl_event(&state, adapter, &type_ev, TEST_TITLE_BOX)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	ev1, ok1 := driver.read_line(&r1)
+	defer delete(ev1)
+	testing.expect(t, ok1)
+	testing.expect_value(t, ev1, `{"event":"commit","id":1,"revision":1,"text":"Quarterly results!"}`)
+
+	// External commit emits commit at rev 2.
+	ext := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":1,"text":"Revenue grew 12%"}`)
+	delete(ext)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	ev2, ok2 := driver.read_line(&r1)
+	defer delete(ev2)
+	testing.expect(t, ok2)
+	testing.expect_value(t, ev2, `{"event":"commit","id":1,"revision":2,"text":"Revenue grew 12%"}`)
+
+	// Keyboard undo emits undo at rev 3.
+	undo_ev: sdl.Event
+	undo_ev.type = .KEY_DOWN
+	undo_ev.key.key = sdl.K_Z
+	undo_ev.key.mod = sdl.KMOD_LCTRL
+	editor_handle_sdl_event(&state, adapter, &undo_ev, TEST_TITLE_BOX)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	ev3, ok3 := driver.read_line(&r1)
+	defer delete(ev3)
+	testing.expect(t, ok3)
+	testing.expect_value(t, ev3, `{"event":"undo","id":1,"revision":3,"text":"Quarterly results!"}`)
+
+	// Reconnect a second watcher: receives latest snapshot at rev 3 immediately.
+	w2, w2_ok := driver.connect_unix(sock_path)
+	testing.expect(t, w2_ok)
+	defer posix.close(w2)
+	testing.expect(t, driver.write_all(w2, "{\"op\":\"watch\",\"role\":\"slide.title\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	r2 := driver.Line_Reader{fd = w2}
+	reconn, ok_reconn := driver.read_line(&r2)
+	defer delete(reconn)
+	testing.expect(t, ok_reconn)
+	testing.expect_value(t, reconn, `{"ok":true,"id":1,"revision":3,"text":"Quarterly results!","role":"slide.title"}`)
+}
