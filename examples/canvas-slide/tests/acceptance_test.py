@@ -649,9 +649,16 @@ def verify_headline_text_editing(
         send_control(proc, reader, "text A")
         wait_for_role_text(client_bin, sock, "slide.headline", "ASlide Canvas")
         wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=1, undo=1")
-        send_control(proc, reader, "key ctrl+z")
+
+        # Tab transfers keyboard focus to the first button (slide.undo), ending the headline's
+        # text-input session so Enter activates Undo and subsequent typing does not edit the headline.
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "key enter")
         wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
         wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=2, undo=0")
+        send_control(proc, reader, "text Q")
+        code_q, hl_q = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code_q == 0 and hl_q["elements"][0]["text"] == "Slide Canvas", hl_q
 
         # Click inside the interior of "Slide Canvas" (around the end of "Slide") -> lands at an interior grapheme boundary.
         interior_x = text_x + 2.6 * px

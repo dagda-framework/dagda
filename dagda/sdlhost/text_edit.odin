@@ -1,6 +1,7 @@
 package sdlhost
 
 import "core:c"
+import "core:math"
 import "core:unicode/utf8"
 import "dagda:dagda"
 import sdl "vendor:sdl3"
@@ -47,13 +48,57 @@ text_edit_layout :: proc(frame: dagda.Frame, rect: dagda.Rect) -> (text_x: f32, 
 	return
 }
 
+// text_edit_preedit_caret_bytes returns the byte offset of the caret within
+// session.preedit. An explicit non-negative preedit_start (including 0 with
+// length 0) is honored; a negative preedit_start falls back to the end of the
+// preedit string.
+text_edit_preedit_caret_bytes :: proc(session: ^dagda.Text_Session) -> int {
+	preedit := session.preedit
+	if session.preedit_start < 0 {
+		return len(preedit)
+	}
+	caret_runes := session.preedit_start + max(session.preedit_length, 0)
+	return rune_offset_to_bytes(preedit, caret_runes)
+}
+
+// text_edit_caret_x computes the exact window-space X coordinate of the caret
+// using the same text origin and font metrics used by text_edit_draw and
+// SDL_SetTextInputArea.
+text_edit_caret_x :: proc(
+	te: ^Text_Edit_State,
+	font: ^Font,
+	frame: dagda.Frame,
+	bounds: dagda.Rect,
+	committed: string,
+) -> f32 {
+	tx, _, px := text_edit_layout(frame, bounds)
+	if font == nil || !font.loaded {
+		return tx
+	}
+	if dagda.is_composing(&te.session) {
+		sel_start, _ := dagda.selection_bounds(&te.session)
+		sel_start = clamp(sel_start, 0, len(committed))
+		prefix_w := font_measure_width(font, committed[:sel_start], px)
+		caret_bytes := text_edit_preedit_caret_bytes(&te.session)
+		return tx + prefix_w + font_measure_width(font, te.session.preedit[:caret_bytes], px)
+	}
+	caret_off := clamp(te.session.caret, 0, len(committed))
+	return tx + font_measure_width(font, committed[:caret_off], px)
+}
+
 text_edit_destroy :: proc(te: ^Text_Edit_State) {
 	dagda.text_session_destroy(&te.session)
 	te.focused = false
 }
 
-text_edit_update_ime_area :: proc(window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) {
-	if window == nil || !cfg.enabled {
+text_edit_update_ime_area :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+) {
+	if window == nil || !cfg.enabled || !te.focused {
 		return
 	}
 	el, found := dagda.find(frame, cfg.target_id)
@@ -61,15 +106,23 @@ text_edit_update_ime_area :: proc(window: ^sdl.Window, frame: dagda.Frame, cfg: 
 		return
 	}
 	area := sdl.Rect{
-		x = c.int(el.bounds.x),
-		y = c.int(el.bounds.y),
-		w = max(c.int(el.bounds.width), 1),
-		h = max(c.int(el.bounds.height), 1),
+		x = c.int(math.floor(el.bounds.x)),
+		y = c.int(math.floor(el.bounds.y)),
+		w = max(c.int(math.ceil(el.bounds.width)), 1),
+		h = max(c.int(math.ceil(el.bounds.height)), 1),
 	}
-	_ = sdl.SetTextInputArea(window, &area, 0)
+	caret_x := text_edit_caret_x(te, font, frame, el.bounds, el.text)
+	cursor := c.int(math.round(caret_x)) - area.x
+	_ = sdl.SetTextInputArea(window, &area, cursor)
 }
 
-text_edit_focus :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) -> bool {
+text_edit_focus :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+) -> bool {
 	if !cfg.enabled {
 		return false
 	}
@@ -84,10 +137,11 @@ text_edit_focus :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: dagda.
 		te.focused = true
 		if window != nil {
 			_ = sdl.StartTextInput(window)
-			text_edit_update_ime_area(window, frame, cfg)
+			text_edit_update_ime_area(te, window, font, frame, cfg)
 		}
 	} else if !dagda.is_composing(&te.session) {
 		dagda.text_session_sync(&te.session, el.text)
+		text_edit_update_ime_area(te, window, font, frame, cfg)
 	}
 	return !was_focused
 }
@@ -110,7 +164,7 @@ text_edit_click :: proc(
 	if !found {
 		return false
 	}
-	changed := text_edit_focus(te, window, frame, cfg)
+	changed := text_edit_focus(te, window, font, frame, cfg)
 	if dagda.cancel_composition(&te.session) {
 		changed = true
 	}
@@ -123,6 +177,7 @@ text_edit_click :: proc(
 			changed = true
 		}
 	}
+	text_edit_update_ime_area(te, window, font, frame, cfg)
 	return changed
 }
 
@@ -138,7 +193,13 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	return true
 }
 
-text_edit_reconcile :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: dagda.Frame, cfg: Editable_Text_Config) {
+text_edit_reconcile :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+) {
 	if !te.focused {
 		return
 	}
@@ -154,12 +215,20 @@ text_edit_reconcile :: proc(te: ^Text_Edit_State, window: ^sdl.Window, frame: da
 	if !dagda.is_composing(&te.session) {
 		dagda.text_session_sync(&te.session, el.text)
 	}
-	text_edit_update_ime_area(window, frame, cfg)
+	text_edit_update_ime_area(te, window, font, frame, cfg)
 }
 
-text_edit_apply_committed :: proc(te: ^Text_Edit_State, frame: dagda.Frame, cfg: Editable_Text_Config, edit: ^dagda.Text_Edit) {
+text_edit_apply_committed :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	edit: ^dagda.Text_Edit,
+) {
 	if el, found := dagda.find(frame, cfg.target_id); found {
 		dagda.apply_edit(&te.session, edit^, el.text)
+		text_edit_update_ime_area(te, window, font, frame, cfg)
 	}
 	dagda.edit_destroy(&te.session, edit)
 }
@@ -181,6 +250,7 @@ rune_offset_to_bytes :: proc(s: string, rune_count: int) -> int {
 text_edit_handle_event :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
+	font: ^Font,
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	user_data: rawptr,
@@ -236,6 +306,7 @@ text_edit_handle_event :: proc(
 	case .TEXT_EDITING:
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
 		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		text_edit_update_ime_area(te, window, font, frame, cfg)
 		res.consumed = true
 		res.needs_redraw = true
 		return res
@@ -247,6 +318,9 @@ text_edit_handle_event :: proc(
 		// rejected proposal preserves selection and active composition for retry.
 		edit := dagda.insert_text(&te.session, el.text, text)
 		commit_proposal(te, cfg, user_data, &edit, true, &res)
+		if !res.needs_rebuild {
+			text_edit_update_ime_area(te, window, font, frame, cfg)
+		}
 		res.consumed = true
 		return res
 
@@ -260,14 +334,10 @@ text_edit_handle_event :: proc(
 		if key == sdl.K_ESCAPE {
 			if dagda.is_composing(&te.session) {
 				_ = dagda.cancel_composition(&te.session)
-				res.consumed = true
-				res.needs_redraw = true
-				return res
-			}
-			if text_edit_blur(te, window) {
-				res.consumed = true
+				text_edit_update_ime_area(te, window, font, frame, cfg)
 				res.needs_redraw = true
 			}
+			res.consumed = true
 			return res
 		}
 
@@ -283,14 +353,15 @@ text_edit_handle_event :: proc(
 			return res
 		}
 
-		if ctrl && !alt_or_gui && key == sdl.K_A {
+		if ctrl && !shift && !alt_or_gui && key == sdl.K_A {
 			dagda.select_all(&te.session, el.text)
+			text_edit_update_ime_area(te, window, font, frame, cfg)
 			res.consumed = true
 			res.needs_redraw = true
 			return res
 		}
 
-		if ctrl && !alt_or_gui && key == sdl.K_Z {
+		if ctrl && !shift && !alt_or_gui && !ev.key.repeat && key == sdl.K_Z {
 			if cfg.on_undo != nil && cfg.on_undo(user_data, cfg.target_id) {
 				res.needs_rebuild = true
 				res.needs_redraw = true
@@ -303,21 +374,25 @@ text_edit_handle_event :: proc(
 			switch key {
 			case sdl.K_LEFT:
 				dagda.move_left(&te.session, el.text, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
 			case sdl.K_RIGHT:
 				dagda.move_right(&te.session, el.text, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
 			case sdl.K_HOME:
 				dagda.move_home(&te.session, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
 			case sdl.K_END:
 				dagda.move_end(&te.session, el.text, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
@@ -336,6 +411,7 @@ text_edit_handle_event :: proc(
 
 	case .WINDOW_FOCUS_LOST:
 		if dagda.cancel_composition(&te.session) {
+			text_edit_update_ime_area(te, window, font, frame, cfg)
 			res.needs_redraw = true
 		}
 		return res
@@ -409,17 +485,6 @@ text_edit_draw :: proc(
 		if len(suffix) > 0 {
 			font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255})
 		}
-
-		// Caret at preedit cursor position (end of preedit range).
-		caret_runes := h.text_edit.session.preedit_start + h.text_edit.session.preedit_length
-		if caret_runes <= 0 {
-			caret_runes = utf8.rune_count_in_string(preedit)
-		}
-		caret_bytes := rune_offset_to_bytes(preedit, caret_runes)
-		caret_x := pre_x + font_measure_width(&h.font, preedit[:caret_bytes], px)
-		caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = 2, h = caret_h}
-		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-		sdl.RenderFillRect(r, &caret_rect)
 	} else {
 		if len(selected) > 0 {
 			sel_w := font_measure_width(&h.font, selected, px)
@@ -430,12 +495,12 @@ text_edit_draw :: proc(
 		if len(committed) > 0 {
 			font_draw_text(&h.font, r, committed, tx, ty, px, sdl.Color{240, 244, 250, 255})
 		}
-		caret_off := clamp(h.text_edit.session.caret, 0, len(committed))
-		caret_x := tx + font_measure_width(&h.font, committed[:caret_off], px)
-		caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = 2, h = caret_h}
-		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-		sdl.RenderFillRect(r, &caret_rect)
 	}
+
+	caret_x := text_edit_caret_x(&h.text_edit, &h.font, h.frame, bounds, committed)
+	caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = 2, h = caret_h}
+	sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+	sdl.RenderFillRect(r, &caret_rect)
 }
 
 // copy_to_cstr_buf copies s into a NUL-terminated fixed buffer for SDL_PushEvent.

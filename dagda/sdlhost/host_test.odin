@@ -1,6 +1,8 @@
 package sdlhost
 
+import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
@@ -643,28 +645,29 @@ test_canvas_editable_text_preedit_cancel_commit_undo_and_grapheme_backspace :: p
 	defer text_edit_destroy(&te)
 
 	dispatch_ev :: proc(te: ^Text_Edit_State, frame: ^dagda.Frame, s: ^Text_App, cfg: Editable_Text_Config, ev: ^sdl.Event) {
-		res := text_edit_handle_event(te, nil, frame^, cfg, s, ev)
+		res := text_edit_handle_event(te, nil, nil, frame^, cfg, s, ev)
 		if res.needs_rebuild {
 			dagda.frame_destroy(frame)
 			frame^ = make_frame(s)
 			if res.has_pending_edit {
-				text_edit_apply_committed(te, frame^, cfg, &res.pending_edit)
+				text_edit_apply_committed(te, nil, nil, frame^, cfg, &res.pending_edit)
 			} else {
-				text_edit_reconcile(te, nil, frame^, cfg)
+				text_edit_reconcile(te, nil, nil, frame^, cfg)
 			}
 		}
 	}
 
-	key_ev :: proc(key: sdl.Keycode, mod: sdl.Keymod = {}) -> sdl.Event {
+	key_ev :: proc(key: sdl.Keycode, mod: sdl.Keymod = {}, repeat := false) -> sdl.Event {
 		ev: sdl.Event
 		ev.type = .KEY_DOWN
 		ev.key.key = key
 		ev.key.mod = mod
+		ev.key.repeat = repeat
 		return ev
 	}
 
 	// Focus headline and select "Canvas" (6 graphemes from end).
-	testing.expect(t, text_edit_focus(&te, nil, frame, cfg))
+	testing.expect(t, text_edit_focus(&te, nil, nil, frame, cfg))
 	for _ in 0 ..< 6 {
 		ev := key_ev(sdl.K_LEFT, sdl.KMOD_LSHIFT)
 		dispatch_ev(&te, &frame, &s, cfg, &ev)
@@ -715,7 +718,20 @@ test_canvas_editable_text_preedit_cancel_commit_undo_and_grapheme_backspace :: p
 	testing.expect_value(t, s.rev, u64(1))
 	testing.expect_value(t, len(s.undo), 1)
 
-	// Undo via Ctrl+Z -> exact original bytes "Slide Canvas".
+	// Ctrl+Shift+Z and repeated Ctrl+Z must NOT fire undo.
+	shift_undo := key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	dispatch_ev(&te, &frame, &s, cfg, &shift_undo)
+	testing.expect_value(t, s.text, "Slide é")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, len(s.undo), 1)
+
+	repeat_undo := key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	dispatch_ev(&te, &frame, &s, cfg, &repeat_undo)
+	testing.expect_value(t, s.text, "Slide é")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, len(s.undo), 1)
+
+	// Initial Ctrl+Z undoes once -> exact original bytes "Slide Canvas".
 	undo_ev := key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
 	dispatch_ev(&te, &frame, &s, cfg, &undo_ev)
 	testing.expect_value(t, s.text, "Slide Canvas")
@@ -781,7 +797,7 @@ test_canvas_editable_text_rejected_proposal_preserves_selection_and_composition 
 	te: Text_Edit_State
 	defer text_edit_destroy(&te)
 
-	testing.expect(t, text_edit_focus(&te, nil, frame, cfg))
+	testing.expect(t, text_edit_focus(&te, nil, nil, frame, cfg))
 	// Select "Canvas" (bytes 6..12) and start preedit "e".
 	te.session.anchor = 6
 	te.session.caret = 12
@@ -791,14 +807,14 @@ test_canvas_editable_text_rejected_proposal_preserves_selection_and_composition 
 	pre_ev.edit.text = "e"
 	pre_ev.edit.start = 0
 	pre_ev.edit.length = 1
-	_ = text_edit_handle_event(&te, nil, frame, cfg, &s, &pre_ev)
+	_ = text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &pre_ev)
 	testing.expect_value(t, dagda.is_composing(&te.session), true)
 
 	// App rejects TEXT_INPUT "é": selection (6, 12) and active preedit "e" must survive for retry.
 	ti: sdl.Event
 	ti.type = .TEXT_INPUT
 	ti.text.text = "é"
-	res := text_edit_handle_event(&te, nil, frame, cfg, &s, &ti)
+	res := text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &ti)
 	testing.expect_value(t, res.needs_rebuild, false)
 	testing.expect_value(t, s.text, "Slide Canvas")
 	testing.expect_value(t, s.rev, u64(0))
@@ -810,14 +826,109 @@ test_canvas_editable_text_rejected_proposal_preserves_selection_and_composition 
 
 	// Retry once app accepts: replaces "Canvas" with "é" and clears composition.
 	s.reject = false
-	res = text_edit_handle_event(&te, nil, frame, cfg, &s, &ti)
+	res = text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &ti)
 	testing.expect_value(t, res.needs_rebuild, true)
 	dagda.frame_destroy(&frame)
 	frame = make_frame(&s)
-	text_edit_apply_committed(&te, frame, cfg, &res.pending_edit)
+	text_edit_apply_committed(&te, nil, nil, frame, cfg, &res.pending_edit)
 	testing.expect_value(t, s.text, "Slide é")
 	testing.expect_value(t, s.rev, u64(1))
 	testing.expect_value(t, dagda.is_composing(&te.session), false)
+}
+
+@(test)
+test_preedit_caret_pixel_and_sdl_text_input_area_at_two_scales :: proc(t: ^testing.T) {
+	if !sdl.Init({.VIDEO}) {
+		return
+	}
+	defer sdl.Quit()
+
+	font: Font
+	if !font_init(&font) {
+		return
+	}
+	defer font_destroy(&font)
+
+	els := [1]dagda.Canvas_Element{
+		{info = {id = 1, role = "slide.headline"}, kind = .Label, text = "Slide ", bounds = {x = 80, y = 60, width = 640, height = 80}},
+	}
+	cfg := Editable_Text_Config{enabled = true, target_id = 1}
+
+	viewports := [2]dagda.Size{{width = 800, height = 540}, {width = 640, height = 480}}
+	for vp in viewports {
+		window: ^sdl.Window
+		renderer: ^sdl.Renderer
+		testing.expect(t, sdl.CreateWindowAndRenderer("Caret Test", c.int(vp.width), c.int(vp.height), {}, &window, &renderer))
+		defer sdl.DestroyWindow(window)
+		defer sdl.DestroyRenderer(renderer)
+		defer font_destroy_textures(&font)
+
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, vp)
+		testing.expect(t, ok)
+		defer dagda.frame_destroy(&frame)
+
+		h: Host
+		h.window = window
+		h.renderer = renderer
+		h.font = font
+		h.frame = frame
+		h.app.text_edit = cfg
+		defer {
+			font = h.font
+			text_edit_destroy(&h.text_edit)
+		}
+
+		testing.expect(t, text_edit_focus(&h.text_edit, h.window, &h.font, h.frame, cfg))
+
+		el, found := dagda.find(h.frame, 1)
+		testing.expect(t, found)
+		tx, ty, px := text_edit_layout(h.frame, el.bounds)
+		start_x := tx + font_measure_width(&h.font, "Slide ", px)
+		end_x := start_x + font_measure_width(&h.font, "café", px)
+
+		// 1. Explicit cursor start=0, length=0: caret and SDL candidate anchor must sit at start of "café".
+		pre_zero: sdl.Event
+		pre_zero.type = .TEXT_EDITING
+		pre_zero.edit.text = "café"
+		pre_zero.edit.start = 0
+		pre_zero.edit.length = 0
+		_ = text_edit_handle_event(&h.text_edit, h.window, &h.font, h.frame, cfg, nil, &pre_zero)
+
+		got_area: sdl.Rect
+		got_cursor: c.int
+		testing.expect(t, sdl.GetTextInputArea(h.window, &got_area, &got_cursor))
+		testing.expect_value(t, got_area.x + got_cursor, c.int(math.round(start_x)))
+
+		// Render and verify the painted amber caret pixel at the top of the caret bar (above the underline).
+		host_draw(&h)
+		surface := sdl.RenderReadPixels(h.renderer, nil)
+		testing.expect(t, surface != nil)
+		if surface != nil {
+			defer sdl.DestroySurface(surface)
+			caret_y := c.int(math.floor(ty - 1))
+			r0, g0, b0, a0: u8
+			testing.expect(t, sdl.ReadSurfacePixel(surface, c.int(math.floor(start_x)), caret_y, &r0, &g0, &b0, &a0))
+			testing.expect_value(t, r0, u8(255))
+			testing.expect_value(t, g0, u8(206))
+			testing.expect_value(t, b0, u8(84))
+
+			// End of "café" must NOT have the caret bar when start=0, length=0.
+			r1, g1, b1, a1: u8
+			testing.expect(t, sdl.ReadSurfacePixel(surface, c.int(math.floor(end_x)), caret_y, &r1, &g1, &b1, &a1))
+			testing.expect(t, !(r1 == 255 && g1 == 206 && b1 == 84))
+		}
+
+		// 2. Unspecified cursor (start=-1, length=0): preserves fallback to end of "café".
+		pre_unspec: sdl.Event
+		pre_unspec.type = .TEXT_EDITING
+		pre_unspec.edit.text = "café"
+		pre_unspec.edit.start = -1
+		pre_unspec.edit.length = 0
+		_ = text_edit_handle_event(&h.text_edit, h.window, &h.font, h.frame, cfg, nil, &pre_unspec)
+
+		testing.expect(t, sdl.GetTextInputArea(h.window, &got_area, &got_cursor))
+		testing.expect_value(t, got_area.x + got_cursor, c.int(math.round(end_x)))
+	}
 }
 
 @(test)
