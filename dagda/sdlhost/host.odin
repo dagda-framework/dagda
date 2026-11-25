@@ -300,6 +300,7 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	win_id := sdl.GetWindowID(window)
 	key: sdl.Keycode
 	mod: sdl.Keymod
+	repeat_key := false
 	switch name {
 	case "tab":
 		key = sdl.K_TAB
@@ -315,6 +316,13 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	case "ctrl+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
+	case "ctrl+shift+z":
+		key = sdl.K_Z
+		mod = sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT
+	case "ctrl+z+repeat":
+		key = sdl.K_Z
+		mod = sdl.KMOD_LCTRL
+		repeat_key = true
 	case:
 		return false
 	}
@@ -325,6 +333,7 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	down.key.key = key
 	down.key.mod = mod
 	down.key.down = true
+	down.key.repeat = repeat_key
 	if !sdl.PushEvent(&down) {
 		return false
 	}
@@ -542,7 +551,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
-				if ev.type == .KEY_DOWN && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && h.app.on_undo != nil {
+				if ev.type == .KEY_DOWN && !ev.key.repeat && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && (ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT)) == {} && h.app.on_undo != nil {
 					if h.app.on_undo(h.app.user_data) {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1

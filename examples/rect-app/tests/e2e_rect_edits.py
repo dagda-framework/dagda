@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 ODIN = ROOT / "scripts" / "odin.sh"
-FILL = (52, 108, 194)
+FILLS = {(52, 108, 194), (64, 124, 214)}  # idle and hovered button fill
 
 
 def read_png_bbox(path):
@@ -65,11 +65,11 @@ def read_png_bbox(path):
         px[y * stride:(y + 1) * stride] = line
         prev = line
     pts = [(i % w, i // w) for i in range(w * h)
-           if tuple(px[i * bpp:i * bpp + 3]) == FILL]
+           if tuple(px[i * bpp:i * bpp + 3]) in FILLS]
     assert pts, f"no button-fill pixels in {path}"
     xs = [q[0] for q in pts]
     ys = [q[1] for q in pts]
-    return min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+    return (min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1), (w, h)
 
 
 class Reader:
@@ -109,9 +109,22 @@ def inspect_rect(client_bin, sock):
     return el
 
 
-def assert_bbox(path, expected, tol=3):
-    got = read_png_bbox(path)
-    assert all(abs(g - e) <= tol for g, e in zip(got, expected)), f"{path}: painted {got} != inspected {expected}"
+def assert_bbox(path, el, tol=3):
+    # Expected painted pixels come from the inspected window
+    # bounds, scaled from logical window size to screenshot
+    # pixels (the compositor may grant a different size or
+    # scale than requested). canvas_bounds are asserted
+    # separately in logical canvas coordinates by the caller.
+    got, (pw, ph) = read_png_bbox(path)
+    b, cb = el["bounds"], el["canvas_bounds"]
+    scale = b["width"] / cb["width"]
+    offset_x = b["x"] - cb["x"] * scale
+    offset_y = b["y"] - cb["y"] * scale
+    logical_w = 960 * scale + 2 * offset_x
+    logical_h = 540 * scale + 2 * offset_y
+    px = pw / logical_w
+    expected = (b["x"] * px, b["y"] * px, b["width"] * px, b["height"] * px)
+    assert all(abs(g - e) <= tol for g, e in zip(got, expected)), f"{path}: painted {got} (png {pw}x{ph}) != inspected window bounds {expected}"
 
 
 def main():
@@ -146,7 +159,7 @@ def main():
         before = inspect_rect(client_bin, sock)
         assert before["canvas_bounds"] == {"x": 72, "y": 240, "width": 360, "height": 180}, before
         control(f"screenshot {shots}/01-before.png")
-        assert_bbox(shots / "01-before.png", (192, 240, 360, 180))
+        assert_bbox(shots / "01-before.png", before)
 
         # Preview fractional bounds: inspection and rendering stay.
         frac = ("120.5", "180.25", "300.75", "150.5")
@@ -154,7 +167,7 @@ def main():
         assert prev["argument"]["rect"] == {"x": 120.5, "y": 180.25, "width": 300.75, "height": 150.5}, prev
         assert inspect_rect(client_bin, sock)["canvas_bounds"] == before["canvas_bounds"]
         control(f"screenshot {shots}/02-after-preview.png")
-        assert_bbox(shots / "02-after-preview.png", (192, 240, 360, 180))
+        assert_bbox(shots / "02-after-preview.png", before)
 
         # Commit at the discovered revision: the next frame paints
         # exactly the geometry inspection reports.
@@ -163,12 +176,23 @@ def main():
         after = inspect_rect(client_bin, sock)
         assert after["canvas_bounds"] == {"x": 120.5, "y": 180.25, "width": 300.75, "height": 150.5}, after
         control(f"screenshot {shots}/03-after-commit.png")
-        assert_bbox(shots / "03-after-commit.png", (241, 180, 301, 151))
+        assert_bbox(shots / "03-after-commit.png", after)
 
         # Retrying the old revision is stale and changes nothing.
         code, stale = client(client_bin, sock, "commit", "7", "set_rect", "0", "rect", "0", "0", "10", "10", expect_ok=False)
         assert code == 1 and stale == {"ok": False, "error": "Stale_Revision", "revision": 1}, stale
         assert inspect_rect(client_bin, sock)["canvas_bounds"] == after["canvas_bounds"]
+
+        # Ctrl+Shift+Z and a repeat-only Ctrl+Z must not undo:
+        # geometry, revision, and undo history all survive.
+        control("key ctrl+shift+z")
+        control("key ctrl+z+repeat")
+        kept = inspect_rect(client_bin, sock)
+        assert kept["canvas_bounds"] == after["canvas_bounds"], kept
+        _, edits_kept = client(client_bin, sock, "edits", "7")
+        assert edits_kept["revision"] == 1, edits_kept
+        control(f"screenshot {shots}/03b-after-bogus-undo.png")
+        assert_bbox(shots / "03b-after-bogus-undo.png", kept)
 
         # Existing activate behavior still answers through invoke.
         code, inv = client(client_bin, sock, "invoke", "7", "activate", expect_ok=False)
@@ -181,7 +205,7 @@ def main():
         _, edits_after = client(client_bin, sock, "edits", "7")
         assert edits_after["revision"] == 2, edits_after
         control(f"screenshot {shots}/04-after-undo.png")
-        assert_bbox(shots / "04-after-undo.png", (192, 240, 360, 180))
+        assert_bbox(shots / "04-after-undo.png", restored)
 
         control("quit")
         win.wait(timeout=10)
