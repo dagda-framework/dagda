@@ -57,12 +57,17 @@ contains :: proc(r: Rect, p: Point) -> bool {
 
 // One element after layout: everything an inspector, hit-tester,
 // or agent needs without touching the app's definitions again.
+// bounds is in logical window coordinates. canvas_bounds is the
+// element's original rectangle in canvas coordinates when the
+// frame was resolved from a Canvas (see canvas.odin); for a flow
+// layout it equals bounds.
 Resolved_Element :: struct {
-	info:    Object_Info,
-	kind:    Element_Kind,
-	text:    string, // borrowed from the view definition
-	bounds:  Rect,
-	actions: Action_Set,
+	info:          Object_Info,
+	kind:          Element_Kind,
+	text:          string, // borrowed from the view definition
+	bounds:        Rect,
+	canvas_bounds: Rect,
+	actions:       Action_Set,
 }
 
 // A resolved frame. Element IDs are unique within a frame and
@@ -74,6 +79,8 @@ Resolved_Element :: struct {
 Frame :: struct {
 	elements:  []Resolved_Element,
 	allocator: mem.Allocator,
+	transform: Canvas_Transform, // valid when has_canvas is set
+	has_canvas: bool,
 }
 
 actions_for :: proc(kind: Element_Kind) -> Action_Set {
@@ -115,11 +122,13 @@ resolve :: proc(view: View, viewport: Size, allocator := context.allocator) -> (
 		width = 0
 	}
 	for element, i in view.elements {
+		bounds := Rect{x = margin, y = margin + f32(i) * (row_height + gap), width = width, height = row_height}
 		elements[i] = {
 			info = element.info,
 			kind = element.kind,
 			text = element.text,
-			bounds = {x = margin, y = margin + f32(i) * (row_height + gap), width = width, height = row_height},
+			bounds = bounds,
+			canvas_bounds = bounds,
 			actions = actions_for(element.kind),
 		}
 	}
