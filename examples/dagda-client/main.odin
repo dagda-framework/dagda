@@ -40,8 +40,8 @@ run_client :: proc() -> int {
 			usage()
 			return 2
 		}
-		id, ok_id := strconv.parse_i64(os.args[3])
-		if !ok_id || id < 0 {
+		id, ok_id := strconv.parse_u64(os.args[3])
+		if !ok_id {
 			usage()
 			return 2
 		}

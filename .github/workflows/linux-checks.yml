@@ -28,6 +28,7 @@ jobs:
         run: |
           ./scripts/odin.sh test dagda -collection:dagda=.
           ./scripts/odin.sh test dagda/driver -collection:dagda=.
+          ./scripts/odin.sh test dagda/sdlhost -collection:dagda=.
           ./scripts/odin.sh test examples/title-model -collection:dagda=.
           ./scripts/odin.sh test examples/title-driver -collection:dagda=.
           ./scripts/odin.sh test examples/title-window -collection:dagda=.
@@ -47,6 +48,12 @@ jobs:
 
       - name: Run the title driver end-to-end test
         run: python3 examples/title-driver/tests/e2e_test.py
+
+      - name: Run the native counter acceptance test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/counter/tests/acceptance_test.py build/counter-capture
 
       - name: Run the title edit conflict test
         env:

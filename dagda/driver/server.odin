@@ -102,18 +102,20 @@ server_stop :: proc(srv: ^Server) {
 
 // server_poll accepts connections, reads complete newline-delimited requests,
 // dispatches them against the current frame, and flushes replies. When an
-// invoke applies, rebuild_frame is called immediately so any subsequent
-// pipelined request in the same poll sees the updated state.
+// invoke applies, rebuild_frame is called immediately before queueing the reply
+// so pipelined requests see the updated state. If rebuild_frame returns false,
+// Frame_Invalid is returned, further request processing stops immediately, and
+// rebuild_failed is reported so the host can exit cleanly.
 server_poll :: proc(
 	srv: ^Server,
 	frame: ^dagda.Frame,
 	handler: dagda.Action_Handler,
 	user_data: rawptr,
 	rebuild_ctx: rawptr,
-	rebuild_frame: proc(ctx: rawptr),
-) -> (any_applied: bool) {
+	rebuild_frame: proc(ctx: rawptr) -> bool,
+) -> (any_applied: bool, rebuild_failed: bool) {
 	if !srv.active {
-		return false
+		return false, false
 	}
 
 	for {
@@ -129,7 +131,7 @@ server_poll :: proc(
 	}
 
 	if len(srv.clients) == 0 {
-		return false
+		return false, false
 	}
 
 	pfds := make([]posix.pollfd, len(srv.clients))
@@ -147,7 +149,7 @@ server_poll :: proc(
 
 	ready := posix.poll(raw_data(pfds), posix.nfds_t(len(pfds)), 0)
 	if ready <= 0 {
-		return false
+		return false, false
 	}
 
 	read_buf: [4096]u8
@@ -160,12 +162,12 @@ server_poll :: proc(
 			client.drop = true
 		}
 
-		if !client.drop && (.IN in revents || .HUP in revents) && !client.eof {
+		if !client.drop && !rebuild_failed && (.IN in revents || .HUP in revents) && !client.eof {
 			for {
 				n := posix.recv(client.fd, rawptr(&read_buf), c.size_t(len(read_buf)), {})
 				if n > 0 {
 					append(&client.in_buf, ..read_buf[:int(n)])
-					for {
+					for !rebuild_failed {
 						nl := -1
 						for j in 0 ..< len(client.in_buf) {
 							if client.in_buf[j] == '\n' {
@@ -182,22 +184,33 @@ server_poll :: proc(
 						}
 						line := string(client.in_buf[:line_end])
 						reply, applied := dispatch(frame^, handler, user_data, line)
-						append(&client.out_buf, ..transmute([]u8)reply)
-						append(&client.out_buf, '\n')
-						delete(reply)
-
-						if applied {
-							any_applied = true
-							if rebuild_frame != nil {
-								rebuild_frame(rebuild_ctx)
-							}
-						}
 
 						remaining := len(client.in_buf) - (nl + 1)
 						if remaining > 0 {
 							copy(client.in_buf[:remaining], client.in_buf[nl + 1:])
 						}
 						resize(&client.in_buf, remaining)
+
+						if applied {
+							any_applied = true
+							if rebuild_frame != nil && !rebuild_frame(rebuild_ctx) {
+								delete(reply)
+								err_reply := reply_error("Frame_Invalid")
+								append(&client.out_buf, ..transmute([]u8)err_reply)
+								append(&client.out_buf, '\n')
+								delete(err_reply)
+								clear(&client.in_buf)
+								rebuild_failed = true
+								break
+							}
+						}
+
+						append(&client.out_buf, ..transmute([]u8)reply)
+						append(&client.out_buf, '\n')
+						delete(reply)
+					}
+					if rebuild_failed {
+						break
 					}
 				} else if n == 0 {
 					client.eof = true
@@ -241,8 +254,11 @@ server_poll :: proc(
 			}
 			continue
 		}
+		if rebuild_failed {
+			break
+		}
 		i += 1
 	}
 
-	return any_applied
+	return any_applied, rebuild_failed
 }

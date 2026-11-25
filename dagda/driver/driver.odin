@@ -2,6 +2,7 @@ package driver
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
 import "dagda:dagda"
@@ -145,16 +146,74 @@ get_string :: proc(obj: json.Object, key: string) -> (string, bool) {
 	return string(s), is_str
 }
 
-get_id :: proc(obj: json.Object, key: string) -> (dagda.Object_Id, bool) {
-	v, ok := obj[key]
-	if !ok {
+parse_exact_u64_token :: proc(kind: json.Token_Kind, text: string) -> (u64, bool) {
+	if kind != .Integer || len(text) == 0 {
 		return 0, false
 	}
-	n, is_int := v.(json.Integer)
-	if !is_int || n < 0 {
-		return 0, false
+	for i in 0 ..< len(text) {
+		if text[i] < '0' || text[i] > '9' {
+			return 0, false
+		}
 	}
-	return dagda.Object_Id(n), true
+	val, ok := strconv.parse_u64(text)
+	return val, ok
+}
+
+is_key_name :: proc(token_text: string, target_key: string) -> bool {
+	value, err := json.parse_string(token_text, .JSON, true)
+	if err != .None {
+		return false
+	}
+	defer json.destroy_value(value)
+	s, ok := value.(json.String)
+	return ok && string(s) == target_key
+}
+
+// extract_top_level_u64 parses a top-level unsigned 64-bit integer field directly
+// from the original JSON token text so the full u64 range [0, max(u64)] round-trips
+// without signed i64 overflow or float rounding, and any out-of-range or non-integer
+// value is rejected before reaching the application handler.
+extract_top_level_u64 :: proc(line: string, target_key: string) -> (val: u64, found: bool, ok: bool) {
+	t := json.make_tokenizer(line, .JSON, true)
+	depth := 0
+	key_matches := false
+	pending := false
+	for {
+		token, err := json.get_token(&t)
+		if token.kind == .EOF {
+			return val, found, found
+		}
+		if err != .None {
+			return 0, false, false
+		}
+		if pending {
+			if depth == 1 {
+				parsed, valid := parse_exact_u64_token(token.kind, token.text)
+				if !valid {
+					return 0, true, false
+				}
+				val = parsed
+				found = true
+			}
+			pending = false
+		}
+		switch token.kind {
+		case .Open_Brace, .Open_Bracket:
+			depth += 1
+		case .Close_Brace, .Close_Bracket:
+			depth -= 1
+		case .String:
+			if depth == 1 {
+				key_matches = is_key_name(token.text, target_key)
+			}
+		case .Colon:
+			if depth == 1 && key_matches {
+				pending = true
+			}
+			key_matches = false
+		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .Ident, .Comma, .EOF, .Invalid:
+		}
+	}
 }
 
 // dispatch handles one newline-delimited JSON request against a resolved
@@ -239,11 +298,12 @@ dispatch :: proc(
 		return strings.to_string(b), false
 
 	case "invoke":
-		id, ok_id := get_id(obj, "id")
+		raw_id, _, ok_id := extract_top_level_u64(line, "id")
 		act_str, ok_act := get_string(obj, "action")
 		if !ok_id || !ok_act {
 			return reply_error("Malformed_Request"), false
 		}
+		id := dagda.Object_Id(raw_id)
 		act, valid_act := parse_action(act_str)
 		if !valid_act {
 			return reply_error("Unknown_Action"), false

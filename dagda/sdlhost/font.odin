@@ -172,12 +172,21 @@ font_load_face :: proc(font: ^Font, path: string) -> bool {
 	return true
 }
 
-font_destroy :: proc(font: ^Font) {
+// font_destroy_textures releases all cached SDL textures while their owning
+// SDL_Renderer is still alive.
+font_destroy_textures :: proc(font: ^Font) {
 	for _, &g in font.glyphs {
 		if g.texture != nil {
 			sdl.DestroyTexture(g.texture)
 			g.texture = nil
+			g.tex_renderer = nil
 		}
+	}
+}
+
+font_destroy :: proc(font: ^Font) {
+	font_destroy_textures(font)
+	for _, &g in font.glyphs {
 		delete(g.alpha)
 	}
 	delete(font.glyphs)

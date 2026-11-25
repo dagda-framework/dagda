@@ -77,8 +77,8 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	return true
 }
 
-host_rebuild_cb :: proc(ctx: rawptr) {
-	_ = host_rebuild_frame((^Host)(ctx))
+host_rebuild_cb :: proc(ctx: rawptr) -> bool {
+	return host_rebuild_frame((^Host)(ctx))
 }
 
 host_draw :: proc(h: ^Host) {
@@ -289,6 +289,8 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	}
 	defer sdl.DestroyWindow(h.window)
 	defer sdl.DestroyRenderer(h.renderer)
+	// Release cached glyph textures before DestroyRenderer frees the renderer.
+	defer font_destroy_textures(&h.font)
 	defer dagda.frame_destroy(&h.frame)
 
 	if !host_rebuild_frame(&h) {
@@ -319,7 +321,10 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
 					running = false
 				case .WINDOW_EXPOSED, .WINDOW_RESIZED, .WINDOW_PIXEL_SIZE_CHANGED:
-					host_rebuild_frame(&h)
+					if !host_rebuild_frame(&h) {
+						exit_code = 1
+						running = false
+					}
 				case .MOUSE_MOTION:
 					id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
 					next_hover := hit ? id : 0
@@ -332,7 +337,10 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
 						h.pressed_id = hit ? id : 0
 						if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
-							host_rebuild_frame(&h)
+							if !host_rebuild_frame(&h) {
+								exit_code = 1
+								running = false
+							}
 						} else {
 							h.needs_redraw = true
 						}
@@ -349,16 +357,20 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 			}
 		}
 
-		if srv.active {
-			if driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb) {
+		if running && srv.active {
+			applied, rebuild_failed := driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb)
+			if rebuild_failed {
+				exit_code = 1
+				running = false
+			} else if applied {
 				h.needs_redraw = true
 			}
 		}
-		if opts.control_stdin {
+		if running && opts.control_stdin {
 			poll_control_stdin(&h, &control_buf, &running, &exit_code)
 		}
 
-		if h.needs_redraw {
+		if running && h.needs_redraw {
 			_ = host_render(&h)
 		}
 	}

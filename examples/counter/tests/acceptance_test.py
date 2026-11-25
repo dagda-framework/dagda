@@ -42,6 +42,18 @@ def send_control(win_proc: subprocess.Popen, cmd: str) -> str:
     return resp
 
 
+def wait_for_counter_value(client_bin: Path, sock: Path, expected: str, timeout: float = 3.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        code, resp = run_client(client_bin, sock, "inspect", "counter.value")
+        last = (code, resp)
+        if code == 0 and resp.get("ok") is True and resp["elements"][0]["text"] == expected:
+            return resp
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for counter.value == {expected!r}; last={last}")
+
+
 def main() -> int:
     capture_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build" / "counter-capture"
     capture_dir.mkdir(parents=True, exist_ok=True)
@@ -94,30 +106,23 @@ def main() -> int:
         cx = bounds["x"] + bounds["width"] / 2.0
         cy = bounds["y"] + bounds["height"] / 2.0
         print("[4] Inject SDL mouse click:", send_control(win_proc, f"click {cx:.2f} {cy:.2f}"))
-        # Allow the window loop one tick to process the pushed SDL click event.
-        time.sleep(0.05)
+        val1 = wait_for_counter_value(client_bin, sock, "1")
         send_control(win_proc, f"screenshot {capture_dir / '01-after-sdl-click.png'}")
-
-        code, val1 = run_client(client_bin, sock, "inspect", "counter.value")
-        assert code == 0 and val1["elements"][0]["text"] == "1", (code, val1)
         print("[5] After SDL click, client inspect counter.value:", val1["elements"][0]["text"])
 
         # Invoke activate through dagda-client using the discovered button ID.
         code, inv = run_client(client_bin, sock, "invoke", str(btn_id), "activate")
         assert code == 0 and inv == {"ok": True, "id": btn_id, "action": "activate"}, (code, inv)
+        val2 = wait_for_counter_value(client_bin, sock, "2")
         send_control(win_proc, f"screenshot {capture_dir / '02-after-client-invoke.png'}")
-
-        code, val2 = run_client(client_bin, sock, "inspect", "counter.value")
-        assert code == 0 and val2["elements"][0]["text"] == "2", (code, val2)
         print("[6] After client invoke, client inspect counter.value:", val2["elements"][0]["text"])
 
         # Out-of-bounds click and unsupported action on label leave count at 2.
         send_control(win_proc, "click 2.00 2.00")
-        time.sleep(0.05)
         code, bad_act = run_client(client_bin, sock, "invoke", str(label["id"]), "activate")
         assert code == 1 and bad_act == {"ok": False, "error": "Unsupported_Action"}, (code, bad_act)
-        code, val_still2 = run_client(client_bin, sock, "inspect", "counter.value")
-        assert code == 0 and val_still2["elements"][0]["text"] == "2", (code, val_still2)
+        val_still2 = wait_for_counter_value(client_bin, sock, "2")
+        assert val_still2["elements"][0]["text"] == "2", val_still2
         print("[7] Out-of-bounds click & unsupported label action left count at 2.")
 
         send_control(win_proc, "quit")

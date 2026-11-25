@@ -83,10 +83,15 @@ test_server_socket_roundtrip_and_rebuild :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	defer dagda.frame_destroy(&hs.frame)
 
-	rebuild :: proc(ctx: rawptr) {
+	rebuild :: proc(ctx: rawptr) -> bool {
 		s := (^Host_State)(ctx)
 		dagda.frame_destroy(&s.frame)
-		s.frame, _ = dagda.resolve(test_counter_view(&s.counter), {width = 360, height = 180})
+		frame, ok := dagda.resolve(test_counter_view(&s.counter), {width = 360, height = 180})
+		if !ok {
+			return false
+		}
+		s.frame = frame
+		return true
 	}
 
 	sock_dir := fmt.tprintf("/tmp/dagda-drv-unit-%d", posix.getpid())
@@ -104,9 +109,10 @@ test_server_socket_roundtrip_and_rebuild :: proc(t: ^testing.T) {
 
 	// Pipelined invoke + inspect in one write: inspect must see count=1 after rebuild!
 	testing.expect(t, write_all(fd, "{\"op\":\"invoke\",\"id\":2,\"action\":\"activate\"}\n{\"op\":\"inspect\",\"role\":\"counter.value\"}\n"))
-	applied := server_poll(&srv, &hs.frame, test_counter_handle, &hs.counter, &hs, rebuild)
-	applied = server_poll(&srv, &hs.frame, test_counter_handle, &hs.counter, &hs, rebuild) || applied
-	testing.expect_value(t, applied, true)
+	applied, failed := server_poll(&srv, &hs.frame, test_counter_handle, &hs.counter, &hs, rebuild)
+	applied2, failed2 := server_poll(&srv, &hs.frame, test_counter_handle, &hs.counter, &hs, rebuild)
+	testing.expect_value(t, applied || applied2, true)
+	testing.expect_value(t, failed || failed2, false)
 
 	r := Line_Reader{fd = fd}
 	r1, ok1 := read_line(&r)
@@ -118,4 +124,137 @@ test_server_socket_roundtrip_and_rebuild :: proc(t: ^testing.T) {
 	defer delete(r2)
 	testing.expect(t, ok2)
 	testing.expect_value(t, r2, `{"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"1","bounds":{"x":16.00,"y":16.00,"width":328.00,"height":40.00},"actions":[]}]}`)
+}
+
+@(test)
+test_u64_max_id_roundtrip_and_out_of_range_rejected :: proc(t: ^testing.T) {
+	MAX_ID :: dagda.Object_Id(max(u64))
+
+	State :: struct {
+		calls:    int,
+		last_id:  dagda.Object_Id,
+		elements: [1]dagda.Element,
+	}
+	st := State{
+		elements = {
+			{info = {id = MAX_ID, role = "btn.max"}, kind = .Button, text = "Max"},
+		},
+	}
+	handler :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^State)(user_data)
+		s.calls += 1
+		s.last_id = id
+		return id == MAX_ID && action == .Activate
+	}
+
+	frame, ok := dagda.resolve({elements = st.elements[:]}, {width = 200, height = 100})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	insp, _ := dispatch(frame, handler, &st, `{"op":"inspect","role":"btn.max"}`)
+	defer delete(insp)
+	testing.expect_value(t, insp, `{"ok":true,"elements":[{"id":18446744073709551615,"role":"btn.max","kind":"button","text":"Max","bounds":{"x":16.00,"y":16.00,"width":168.00,"height":40.00},"actions":["activate"]}]}`)
+
+	// Exact max(u64) round-trips through invoke.
+	inv_ok, applied := dispatch(frame, handler, &st, `{"op":"invoke","id":18446744073709551615,"action":"activate"}`)
+	defer delete(inv_ok)
+	testing.expect_value(t, applied, true)
+	testing.expect_value(t, inv_ok, `{"ok":true,"id":18446744073709551615,"action":"activate"}`)
+	testing.expect_value(t, st.calls, 1)
+	testing.expect_value(t, st.last_id, MAX_ID)
+
+	// Out-of-range and non-integer IDs are rejected before calling the handler.
+	bad_cases := []string{
+		`{"op":"invoke","id":18446744073709551616,"action":"activate"}`,
+		`{"op":"invoke","id":-1,"action":"activate"}`,
+		`{"op":"invoke","id":1.5,"action":"activate"}`,
+		`{"op":"invoke","id":"18446744073709551615","action":"activate"}`,
+	}
+	for req in bad_cases {
+		rep, app := dispatch(frame, handler, &st, req)
+		testing.expect_value(t, app, false)
+		testing.expect_value(t, rep, `{"ok":false,"error":"Malformed_Request"}`)
+		delete(rep)
+	}
+	testing.expect_value(t, st.calls, 1)
+}
+
+@(test)
+test_failed_rebuild_stops_pipelined_requests_and_surfaces_error :: proc(t: ^testing.T) {
+	Dup_App :: struct {
+		triggered: bool,
+		elements:  [2]dagda.Element,
+		frame:     dagda.Frame,
+	}
+	view :: proc(a: ^Dup_App) -> dagda.View {
+		if !a.triggered {
+			a.elements = {
+				{info = {id = 1, role = "a"}, kind = .Label, text = "ok"},
+				{info = {id = 2, role = "b"}, kind = .Button, text = "Break"},
+			}
+		} else {
+			// Duplicate IDs on second frame: dagda.resolve must reject this.
+			a.elements = {
+				{info = {id = 1, role = "a"}, kind = .Label, text = "dup"},
+				{info = {id = 1, role = "b"}, kind = .Button, text = "dup"},
+			}
+		}
+		return {elements = a.elements[:]}
+	}
+	handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		a := (^Dup_App)(user_data)
+		if id == 2 && action == .Activate {
+			a.triggered = true
+			return true
+		}
+		return false
+	}
+	rebuild :: proc(ctx: rawptr) -> bool {
+		a := (^Dup_App)(ctx)
+		dagda.frame_destroy(&a.frame)
+		frame, ok := dagda.resolve(view(a), {width = 300, height = 160})
+		if !ok {
+			return false
+		}
+		a.frame = frame
+		return true
+	}
+
+	app: Dup_App
+	ok: bool
+	app.frame, ok = dagda.resolve(view(&app), {width = 300, height = 160})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&app.frame)
+
+	sock_dir := fmt.tprintf("/tmp/dagda-drv-dup-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	sock_path := fmt.tprintf("%s/app.sock", sock_dir)
+
+	srv: Server
+	testing.expect(t, server_start(&srv, sock_path))
+	defer server_stop(&srv)
+
+	fd, conn_ok := connect_unix(sock_path)
+	testing.expect(t, conn_ok)
+	defer posix.close(fd)
+
+	// Pipelined invoke (triggers duplicate-ID rebuild) + inspect:
+	// server must report Frame_Invalid and NOT process inspect against an empty frame.
+	testing.expect(t, write_all(fd, "{\"op\":\"invoke\",\"id\":2,\"action\":\"activate\"}\n{\"op\":\"inspect\"}\n"))
+	_, failed1 := server_poll(&srv, &app.frame, handle, &app, &app, rebuild)
+	_, failed2 := server_poll(&srv, &app.frame, handle, &app, &app, rebuild)
+	testing.expect_value(t, failed1 || failed2, true)
+	server_stop(&srv)
+
+	r := Line_Reader{fd = fd}
+	rep1, ok1 := read_line(&r)
+	defer delete(rep1)
+	testing.expect(t, ok1)
+	testing.expect_value(t, rep1, `{"ok":false,"error":"Frame_Invalid"}`)
+
+	// Second pipelined inspect must NOT produce a successful empty frame.
+	_, ok2 := read_line(&r)
+	testing.expect_value(t, ok2, false)
+	testing.expect_value(t, os.exists(sock_path), false)
 }
