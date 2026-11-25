@@ -57,12 +57,17 @@ contains :: proc(r: Rect, p: Point) -> bool {
 
 // One element after layout: everything an inspector, hit-tester,
 // or agent needs without touching the app's definitions again.
+// bounds is in logical window coordinates. canvas_bounds is the
+// element's original rectangle in canvas coordinates when the
+// frame was resolved from a Canvas (see canvas.odin); for a flow
+// layout it equals bounds.
 Resolved_Element :: struct {
-	info:    Object_Info,
-	kind:    Element_Kind,
-	text:    string, // borrowed from the view definition
-	bounds:  Rect,
-	actions: Action_Set,
+	info:          Object_Info,
+	kind:          Element_Kind,
+	text:          string, // borrowed from the view definition
+	bounds:        Rect,
+	canvas_bounds: Rect,
+	actions:       Action_Set,
 }
 
 // A resolved frame. Element IDs are unique within a frame and
@@ -74,6 +79,8 @@ Resolved_Element :: struct {
 Frame :: struct {
 	elements:  []Resolved_Element,
 	allocator: mem.Allocator,
+	transform: Canvas_Transform, // valid when has_canvas is set
+	has_canvas: bool,
 }
 
 actions_for :: proc(kind: Element_Kind) -> Action_Set {
@@ -115,11 +122,13 @@ resolve :: proc(view: View, viewport: Size, allocator := context.allocator) -> (
 		width = 0
 	}
 	for element, i in view.elements {
+		bounds := Rect{x = margin, y = margin + f32(i) * (row_height + gap), width = width, height = row_height}
 		elements[i] = {
 			info = element.info,
 			kind = element.kind,
 			text = element.text,
-			bounds = {x = margin, y = margin + f32(i) * (row_height + gap), width = width, height = row_height},
+			bounds = bounds,
+			canvas_bounds = bounds,
 			actions = actions_for(element.kind),
 		}
 	}
@@ -176,9 +185,25 @@ find :: proc(frame: Frame, id: Object_Id) -> (Resolved_Element, bool) {
 	return {}, false
 }
 
-// hit_test returns the topmost (last-drawn) element whose
-// resolved bounds contain p.
+// hit_test is the one hit-testing path for every frame. For a
+// canvas frame the window point is first clipped to the fitted
+// canvas rectangle in window coordinates (so a letterbox click,
+// or one beyond the canvas edge on an element that extends past
+// it, misses), then resolved window rectangles are tested in
+// reverse draw order so the last-drawn element wins. Edges are
+// inclusive on the left/top and exclusive on the right/bottom.
 hit_test :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
+	if frame.has_canvas {
+		fitted := Rect{
+			x = frame.transform.offset.x,
+			y = frame.transform.offset.y,
+			width = frame.transform.canvas.width * frame.transform.scale,
+			height = frame.transform.canvas.height * frame.transform.scale,
+		}
+		if !contains(fitted, p) {
+			return 0, false
+		}
+	}
 	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
 		if contains(frame.elements[i].bounds, p) {
 			return frame.elements[i].info.id, true
