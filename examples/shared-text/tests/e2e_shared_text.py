@@ -146,6 +146,31 @@ def rect_crop_bytes(w: int, h: int, rgb: bytearray, bounds: dict) -> bytes:
     return bytes(out)
 
 
+def glyph_mask(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[frozenset[tuple[int, int]], int]:
+    """Extract relative (dx, dy) coordinates of rendered white/light text glyph pixels
+    inside bounds (inset by 4px to exclude focus borders and excluding amber caret pixels).
+    Returns (mask_set, max_dx).
+    """
+    x0 = max(0, int(math.floor(bounds["x"])) + 4)
+    y0 = max(0, int(math.floor(bounds["y"])) + 4)
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])) - 4)
+    y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])) - 4)
+    pts: set[tuple[int, int]] = set()
+    max_dx = -1
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        dy = y - y0
+        for x in range(x0, x1):
+            r, g, b = rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2]
+            # Text glyphs are near-white RGB(240,244,250) (high r,g,b; b >= 160 excludes amber caret RGB(255,206,84)).
+            if r >= 160 and g >= 160 and b >= 160:
+                dx = x - x0
+                pts.add((dx, dy))
+                if dx > max_dx:
+                    max_dx = dx
+    return frozenset(pts), max_dx
+
+
 def inspect_visual_state(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[int, int, int]:
     """Return (preedit_bg_hits, sel_bg_hits, max_amber_row_width) inside bounds."""
     x0 = max(0, int(math.floor(bounds["x"])))
@@ -257,15 +282,24 @@ def main() -> int:
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1")
 
-        # Verify BOTH elements redrew visually with the edit.
+        # Verify BOTH elements redrew visually with the edit ("ASlide Title") and record glyph masks.
         after_first_png = capture_dir / "01-after-first-edit.png"
         send_control(proc, reader, f"screenshot {after_first_png}")
         w1, h1, rgb1 = decode_png_rgb(after_first_png)
         assert (w1, h1) == (png_w, png_h)
         assert rect_crop_bytes(w1, h1, rgb1, b1) != el1_before, "outline.title did not redraw"
         assert rect_crop_bytes(w1, h1, rgb1, b2) != el2_before, "canvas.title did not redraw"
+        g1_v1, g1_v1_max = glyph_mask(w1, h1, rgb1, b1)
+        g2_v1, g2_v1_max = glyph_mask(w1, h1, rgb1, b2)
+        assert len(g1_v1) > 100 and len(g2_v1) > 100, (len(g1_v1), len(g2_v1))
+        assert abs(g1_v1_max - g2_v1_max) <= 2, (g1_v1_max, g2_v1_max)
 
-        # 2. Click at a different position in the second element (near end), select "Title", start preedit "e".
+        # 2. Re-inspect settled bounds, click at a different position in element 2 (near end),
+        # select "Title", start preedit "e".
+        code1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        code2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        assert code1 == 0 and code2 == 0
+        b1, b2 = el1_resp["elements"][0]["bounds"], el2_resp["elements"][0]["bounds"]
         y2 = b2["y"] + b2["height"] * 0.5
         send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
         for _ in range(5):
@@ -310,17 +344,66 @@ def main() -> int:
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide é")
         wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2")
 
+        # Verify BOTH fields actually painted the shorter "ASlide é" glyphs (not stale "ASlide Title").
+        after_commit_png = capture_dir / "03-after-commit.png"
+        deadline = time.monotonic() + 2.0
+        g1_v2_max = g2_v2_max = 0
+        while True:
+            send_control(proc, reader, f"screenshot {after_commit_png}")
+            wc, hc, rgbc = decode_png_rgb(after_commit_png)
+            g1_v2, g1_v2_max = glyph_mask(wc, hc, rgbc, b1)
+            g2_v2, g2_v2_max = glyph_mask(wc, hc, rgbc, b2)
+            if (
+                g1_v2 != g1_v1
+                and g2_v2 != g2_v1
+                and g1_v2_max < g1_v1_max - 15
+                and g2_v2_max < g2_v1_max - 15
+                and abs(g1_v2_max - g2_v2_max) <= 2
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"painted title glyphs did not update to 'ASlide é' in {after_commit_png}: "
+                    f"el1_max=({g1_v1_max}->{g1_v2_max}), el2_max=({g2_v1_max}->{g2_v2_max})"
+                )
+            time.sleep(0.02)
+
         # 4. Undo once (Ctrl+Z) -> both elements restore "ASlide Title", rev=3, undo=1, last_id=2.
         send_control(proc, reader, "key ctrl+z")
         wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2")
 
+        # Verify BOTH fields repainted the restored "ASlide Title" glyphs matching 01-after-first-edit.
+        after_undo_png = capture_dir / "04-after-undo.png"
+        deadline = time.monotonic() + 2.0
+        g1_u_max = g2_u_max = 0
+        while True:
+            send_control(proc, reader, f"screenshot {after_undo_png}")
+            wu, hu, rgbu = decode_png_rgb(after_undo_png)
+            g1_u, g1_u_max = glyph_mask(wu, hu, rgbu, b1)
+            g2_u, g2_u_max = glyph_mask(wu, hu, rgbu, b2)
+            if (
+                abs(g1_u_max - g1_v1_max) <= 2
+                and abs(g2_u_max - g2_v1_max) <= 2
+                and g1_u_max > g1_v2_max + 15
+                and g2_u_max > g2_v2_max + 15
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"painted title glyphs did not restore 'ASlide Title' after undo in {after_undo_png}: "
+                    f"el1_max=({g1_v2_max}->{g1_u_max}, want ~{g1_v1_max}), "
+                    f"el2_max=({g2_v2_max}->{g2_u_max}, want ~{g2_v1_max})"
+                )
+            time.sleep(0.02)
+
         print(
             f"[shared-text] requested=800x540 captured={png_w}x{png_h}: "
-            f"el1_insert('ASlide Title',rev=1,id=1) -> "
+            f"el1_insert('ASlide Title',rev=1,id=1,glyph_x={g1_v1_max}/{g2_v1_max}) -> "
             f"el2_preedit(bg={pre2_bg},uline_w={uline2_w},el1_isolated=true) -> "
-            f"commit('ASlide é',rev=2,id=2) -> undo('ASlide Title',rev=3,undo=1,id=2)"
+            f"commit('ASlide é',rev=2,id=2,glyph_x={g1_v2_max}/{g2_v2_max}) -> "
+            f"undo('ASlide Title',rev=3,undo=1,id=2,glyph_x={g1_u_max}/{g2_u_max})"
         )
 
         send_control(proc, reader, "quit")

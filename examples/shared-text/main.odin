@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "dagda:dagda"
@@ -18,16 +19,32 @@ Shared_Text_App :: struct {
 	last_editor_id: dagda.Object_Id,
 	undo_stack:     [dynamic]string,
 	editable_ids:   [2]dagda.Object_Id,
+	allocator:      mem.Allocator,
 	status_buf:     [96]u8,
 	elements:       [3]dagda.Canvas_Element,
 }
 
+shared_init :: proc(s: ^Shared_Text_App, initial: string, allocator := context.allocator) -> bool {
+	cloned, err := strings.clone(initial, allocator)
+	if err != nil {
+		return false
+	}
+	s^ = {
+		title        = cloned,
+		editable_ids = {OUTLINE_TITLE_ID, CANVAS_TITLE_ID},
+		allocator    = allocator,
+	}
+	s.undo_stack.allocator = allocator
+	return true
+}
+
 shared_destroy :: proc(s: ^Shared_Text_App) {
-	delete(s.title)
+	delete(s.title, s.allocator)
 	for prev in s.undo_stack {
-		delete(prev)
+		delete(prev, s.allocator)
 	}
 	delete(s.undo_stack)
+	s^ = {}
 }
 
 shared_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
@@ -70,11 +87,16 @@ shared_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) 
 	if (id != OUTLINE_TITLE_ID && id != CANVAS_TITLE_ID) || new_text == s.title {
 		return false
 	}
-	cloned, err := strings.clone(new_text)
-	if err != nil {
+	alloc := s.allocator.procedure != nil ? s.allocator : context.allocator
+	cloned, clone_err := strings.clone(new_text, alloc)
+	if clone_err != nil {
 		return false
 	}
-	append(&s.undo_stack, s.title)
+	_, push_err := append(&s.undo_stack, s.title)
+	if push_err != nil {
+		delete(cloned, alloc)
+		return false
+	}
 	s.title = cloned
 	s.rev += 1
 	s.last_editor_id = id
@@ -86,7 +108,8 @@ shared_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
 	if (id != OUTLINE_TITLE_ID && id != CANVAS_TITLE_ID) || len(s.undo_stack) == 0 {
 		return false
 	}
-	delete(s.title)
+	alloc := s.allocator.procedure != nil ? s.allocator : context.allocator
+	delete(s.title, alloc)
 	s.title = pop(&s.undo_stack)
 	s.rev += 1
 	s.last_editor_id = id
@@ -94,9 +117,9 @@ shared_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
 }
 
 main :: proc() {
-	state := Shared_Text_App{
-		title        = strings.clone("Slide Title"),
-		editable_ids = {OUTLINE_TITLE_ID, CANVAS_TITLE_ID},
+	state: Shared_Text_App
+	if !shared_init(&state, "Slide Title") {
+		os.exit(1)
 	}
 	defer shared_destroy(&state)
 
@@ -107,17 +130,17 @@ main :: proc() {
 	}
 
 	app := sdlhost.App{
-		title     = "Dagda — Shared Text Fixture",
-		width     = 800,
-		height    = 540,
-		user_data = &state,
-		canvas    = shared_canvas,
-		text_edit = {
-			enabled    = true,
-			target_ids = state.editable_ids[:],
-			on_commit  = shared_commit,
-			on_undo    = shared_undo,
+		title                 = "Dagda — Shared Text Fixture",
+		width                 = 800,
+		height                = 540,
+		user_data             = &state,
+		canvas                = shared_canvas,
+		text_edit             = {
+			enabled   = true,
+			on_commit = shared_commit,
+			on_undo   = shared_undo,
 		},
+		editable_text_targets = state.editable_ids[:],
 	}
 	if code := sdlhost.run(app, opts); code != 0 {
 		os.exit(code)

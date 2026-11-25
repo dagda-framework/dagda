@@ -14,31 +14,30 @@ Text_Commit_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id, new_te
 // and not composing. Return true if the app applied an undo step.
 Text_Undo_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> bool
 
-// Editable_Text_Config opts one or more single-line text elements into
-// host-managed grapheme movement, selection, and IME composition backed by
-// dagda.Text_Session. Supply target_id for a single editable element, or
-// target_ids when multiple distinct elements edit app-owned text (such as two
-// views of the same string). The app owns committed text, revision, and undo.
+// Editable_Text_Config opts a single-line text element into host-managed
+// grapheme movement, selection, and IME composition backed by dagda.Text_Session.
+// The app owns committed text, revision, and undo history.
+// For multiple editable elements in one window, set App.editable_text_targets.
 Editable_Text_Config :: struct {
-	enabled:    bool,
-	target_id:  dagda.Object_Id,
-	target_ids: []dagda.Object_Id,
-	on_commit:  Text_Commit_Handler,
-	on_undo:    Text_Undo_Handler,
+	enabled:   bool,
+	target_id: dagda.Object_Id,
+	on_commit: Text_Commit_Handler,
+	on_undo:   Text_Undo_Handler,
 }
 
 Text_Edit_State :: struct {
-	focused:   bool,
-	active_id: dagda.Object_Id,
-	session:   dagda.Text_Session,
+	focused:                 bool,
+	active_id:               dagda.Object_Id,
+	discard_next_text_input: bool,
+	session:                 dagda.Text_Session,
 }
 
-text_edit_is_target :: proc(cfg: Editable_Text_Config, id: dagda.Object_Id) -> bool {
+text_edit_is_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_Id, id: dagda.Object_Id) -> bool {
 	if !cfg.enabled {
 		return false
 	}
-	if len(cfg.target_ids) > 0 {
-		for tid in cfg.target_ids {
+	if len(targets) > 0 {
+		for tid in targets {
 			if tid == id {
 				return true
 			}
@@ -48,9 +47,9 @@ text_edit_is_target :: proc(cfg: Editable_Text_Config, id: dagda.Object_Id) -> b
 	return id == cfg.target_id
 }
 
-text_edit_default_target :: proc(cfg: Editable_Text_Config) -> dagda.Object_Id {
-	if len(cfg.target_ids) > 0 {
-		return cfg.target_ids[0]
+text_edit_default_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_Id = nil) -> dagda.Object_Id {
+	if len(targets) > 0 {
+		return targets[0]
 	}
 	return cfg.target_id
 }
@@ -116,6 +115,7 @@ text_edit_destroy :: proc(te: ^Text_Edit_State) {
 	dagda.text_session_destroy(&te.session)
 	te.focused = false
 	te.active_id = 0
+	te.discard_next_text_input = false
 }
 
 text_edit_update_ime_area :: proc(
@@ -150,8 +150,9 @@ text_edit_focus_id :: proc(
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	target_id: dagda.Object_Id,
+	targets: []dagda.Object_Id = nil,
 ) -> bool {
-	if !text_edit_is_target(cfg, target_id) {
+	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
 	}
 	el, found := dagda.find(frame, target_id)
@@ -159,21 +160,36 @@ text_edit_focus_id :: proc(
 		return false
 	}
 	was_focused := te.focused
+	was_composing := te.focused && dagda.is_composing(&te.session)
 	switched := !te.focused || te.active_id != target_id
 	if switched {
+		// If transferring focus away from an actively composing field, cancel
+		// native composition and discard one trailing TEXT_INPUT from the
+		// originating field so it cannot edit the newly focused field.
+		if was_composing && te.active_id != target_id {
+			if window != nil {
+				_ = sdl.StopTextInput(window)
+			}
+			te.discard_next_text_input = true
+		} else {
+			te.discard_next_text_input = false
+		}
 		dagda.text_session_destroy(&te.session)
 		dagda.text_session_init(&te.session, el.text)
 		te.focused = true
 		te.active_id = target_id
 		if window != nil {
-			if !was_focused {
+			if !was_focused || was_composing {
 				_ = sdl.StartTextInput(window)
 			}
 			text_edit_update_ime_area(te, window, font, frame, cfg)
 		}
-	} else if !dagda.is_composing(&te.session) {
-		dagda.text_session_sync(&te.session, el.text)
-		text_edit_update_ime_area(te, window, font, frame, cfg)
+	} else {
+		te.discard_next_text_input = false
+		if !dagda.is_composing(&te.session) {
+			dagda.text_session_sync(&te.session, el.text)
+			text_edit_update_ime_area(te, window, font, frame, cfg)
+		}
 	}
 	return switched
 }
@@ -184,8 +200,9 @@ text_edit_focus :: proc(
 	font: ^Font,
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id = nil,
 ) -> bool {
-	return text_edit_focus_id(te, window, font, frame, cfg, text_edit_default_target(cfg))
+	return text_edit_focus_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), targets)
 }
 
 // text_edit_click_id focuses target_id and places the caret at the clicked
@@ -199,15 +216,16 @@ text_edit_click_id :: proc(
 	cfg: Editable_Text_Config,
 	target_id: dagda.Object_Id,
 	click_x: f32,
+	targets: []dagda.Object_Id = nil,
 ) -> bool {
-	if !text_edit_is_target(cfg, target_id) {
+	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
 	}
 	el, found := dagda.find(frame, target_id)
 	if !found {
 		return false
 	}
-	changed := text_edit_focus_id(te, window, font, frame, cfg, target_id)
+	changed := text_edit_focus_id(te, window, font, frame, cfg, target_id, targets)
 	if dagda.cancel_composition(&te.session) {
 		changed = true
 	}
@@ -231,8 +249,9 @@ text_edit_click :: proc(
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	click_x: f32,
+	targets: []dagda.Object_Id = nil,
 ) -> bool {
-	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg), click_x)
+	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), click_x, targets)
 }
 
 text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
@@ -242,6 +261,7 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	_ = dagda.cancel_composition(&te.session)
 	te.focused = false
 	te.active_id = 0
+	te.discard_next_text_input = false
 	if window != nil {
 		_ = sdl.StopTextInput(window)
 	}
@@ -254,11 +274,12 @@ text_edit_reconcile :: proc(
 	font: ^Font,
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id = nil,
 ) {
 	if !te.focused {
 		return
 	}
-	if !text_edit_is_target(cfg, te.active_id) {
+	if !text_edit_is_target(cfg, targets, te.active_id) {
 		_ = text_edit_blur(te, window)
 		return
 	}
@@ -310,11 +331,12 @@ text_edit_handle_event :: proc(
 	cfg: Editable_Text_Config,
 	user_data: rawptr,
 	ev: ^sdl.Event,
+	targets: []dagda.Object_Id = nil,
 ) -> (res: Text_Edit_Result) {
 	if !cfg.enabled || !te.focused {
 		return {}
 	}
-	if !text_edit_is_target(cfg, te.active_id) {
+	if !text_edit_is_target(cfg, targets, te.active_id) {
 		_ = text_edit_blur(te, window)
 		return {needs_redraw = true}
 	}
@@ -363,6 +385,7 @@ text_edit_handle_event :: proc(
 
 	#partial switch ev.type {
 	case .TEXT_EDITING:
+		te.discard_next_text_input = false
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
 		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
 		text_edit_update_ime_area(te, window, font, frame, cfg)
@@ -371,6 +394,13 @@ text_edit_handle_event :: proc(
 		return res
 
 	case .TEXT_INPUT:
+		if te.discard_next_text_input {
+			// Drop one stale final TEXT_INPUT from the previous field's
+			// cancelled composition so it cannot edit the newly focused field.
+			te.discard_next_text_input = false
+			res.consumed = true
+			return res
+		}
 		text := ev.text.text != nil ? string(ev.text.text) : ""
 		// Propose replacing the selection with the IME's final text without
 		// clearing composition first; clear composition only if accepted so a
@@ -384,6 +414,7 @@ text_edit_handle_event :: proc(
 		return res
 
 	case .KEY_DOWN:
+		te.discard_next_text_input = false
 		key := ev.key.key
 		mod := ev.key.mod
 		shift := (mod & sdl.KMOD_SHIFT) != {}

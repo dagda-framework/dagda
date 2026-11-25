@@ -33,8 +33,11 @@ App :: struct {
 	edits: driver.Edit_Source,
 	// Optional Ctrl+Z undo hook, called on the host thread. It
 	// returns true when the app actually undid something.
-	on_undo:    proc(user_data: rawptr) -> bool,
-	text_edit:  Editable_Text_Config,
+	on_undo:               proc(user_data: rawptr) -> bool,
+	text_edit:             Editable_Text_Config,
+	// Optional list of editable element IDs when multiple distinct single-line
+	// elements share text_edit; when empty, text_edit.target_id is used.
+	editable_text_targets: []dagda.Object_Id,
 }
 
 Run_Options :: struct {
@@ -126,7 +129,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	}
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
-	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit)
+	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets)
 	h.needs_redraw = true
 	return true
 }
@@ -195,7 +198,7 @@ host_draw :: proc(h: ^Host) {
 		}
 		switch el.kind {
 		case .Label:
-			if text_edit_is_target(h.app.text_edit, el.info.id) {
+			if text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, el.info.id) {
 				text_edit_draw(h, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id)
 			} else {
 				px := max(24 * text_scale, 12)
@@ -569,7 +572,7 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
-	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev)
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets)
 	if tres.needs_redraw {
 		h.needs_redraw = true
 	}
@@ -698,9 +701,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					if ev.button.button == sdl.BUTTON_LEFT {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
 						if h.app.text_edit.enabled {
-							if hit && text_edit_is_target(h.app.text_edit, id) {
+							if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
 								_ = focus_clear(&h.focus)
-								if text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x) {
+								if text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets) {
 									h.needs_redraw = true
 								}
 							} else if text_edit_blur(&h.text_edit, h.ime_window) {
@@ -767,7 +770,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						}
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
-					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
+					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets)
 					if tres.needs_redraw {
 						h.needs_redraw = true
 					}
