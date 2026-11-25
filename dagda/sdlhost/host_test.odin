@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:sys/posix"
 import "core:testing"
 import "core:thread"
@@ -13,8 +14,13 @@ import "dagda:dagda"
 import "dagda:dagda/driver"
 import sdl "vendor:sdl3"
 
+// SDL_Init / SDL_Quit are process-global and not thread-safe; serialize tests
+// that initialize SDL3 when Odin runs package tests across multiple threads.
+sdl_test_mu: sync.Mutex
+
 @(test)
 test_host_exits_nonzero_and_removes_socket_on_duplicate_id_rebuild :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
 	Dup_State :: struct {
 		triggered: bool,
 		elements:  [2]dagda.Element,
@@ -838,6 +844,7 @@ test_canvas_editable_text_rejected_proposal_preserves_selection_and_composition 
 
 @(test)
 test_preedit_caret_pixel_and_sdl_text_input_area_at_two_scales :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
 	if !sdl.Init({.VIDEO}) {
 		return
 	}
