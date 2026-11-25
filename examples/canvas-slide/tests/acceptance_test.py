@@ -141,19 +141,30 @@ def pixel_at(w: int, rgb: bytes, x: int, y: int) -> tuple[int, int, int]:
 
 
 def find_card_pixel_bbox(
-    png_path: Path, expected_state: str = "any"
+    png_path: Path,
+    expected_state: str = "any",
+    exclude_rect: dict | None = None,
 ) -> tuple[int, int, int, int, int, int, str]:
     """Find bounding box of card fill pixels in idle or hovered state.
     Returns (png_w, png_h, min_x, min_y, max_x_excl, max_y_excl, detected_state).
     """
     w, h, rgb = decode_png_rgb(png_path)
+    ex0 = ex1 = ey0 = ey1 = -1
+    if exclude_rect is not None:
+        ex0 = int(math.floor(exclude_rect["x"])) - 4
+        ey0 = int(math.floor(exclude_rect["y"])) - 4
+        ex1 = int(math.ceil(exclude_rect["x"] + exclude_rect["width"])) + 4
+        ey1 = int(math.ceil(exclude_rect["y"] + exclude_rect["height"])) + 4
     min_x, min_y = w, h
     max_x, max_y = -1, -1
     idle_hits = 0
     hover_hits = 0
     for y in range(h):
         row_off = y * w * 3
+        in_ey = exclude_rect is not None and ey0 <= y < ey1
         for x in range(w):
+            if in_ey and ex0 <= x < ex1:
+                continue
             px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
             is_idle = rgb_close(px, IDLE_CARD_RGB)
             is_hover = rgb_close(px, HOVER_CARD_RGB)
@@ -228,17 +239,47 @@ def capture_card_state(
     reader: DeadlineLineReader,
     png_path: Path,
     expected_state: str,
+    exclude_rect: dict | None = None,
     timeout: float = 2.0,
 ) -> tuple[int, int, int, int, int, int, str]:
     deadline = time.monotonic() + timeout
     while True:
         send_control(proc, reader, f"screenshot {png_path}")
         try:
-            return find_card_pixel_bbox(png_path, expected_state=expected_state)
+            return find_card_pixel_bbox(png_path, expected_state=expected_state, exclude_rect=exclude_rect)
         except AssertionError:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.02)
+
+
+def canvas_bounds_close(actual: dict, expected: dict, tol: float = 1.5) -> bool:
+    return (
+        abs(actual["x"] - expected["x"]) <= tol
+        and abs(actual["y"] - expected["y"]) <= tol
+        and abs(actual["width"] - expected["width"]) <= tol
+        and abs(actual["height"] - expected["height"]) <= tol
+    )
+
+
+def wait_for_card_canvas_bounds(
+    client_bin: Path,
+    sock: Path,
+    expected: dict,
+    tol: float = 1.5,
+    timeout: float = 3.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        code, resp = run_client(client_bin, sock, "inspect", "slide.card")
+        last = (code, resp)
+        if code == 0 and resp.get("ok") is True and len(resp["elements"]) == 1:
+            el = resp["elements"][0]
+            if canvas_bounds_close(el["canvas_bounds"], expected, tol=tol):
+                return el
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for slide.card canvas_bounds≈{expected}; last={last}")
 
 
 def verify_viewport(
@@ -276,25 +317,46 @@ def verify_viewport(
         cx = bounds["x"] + bounds["width"] / 2.0
         cy = bounds["y"] + bounds["height"] / 2.0
 
+        code, undo_resp = run_client(client_bin, sock, "inspect", "slide.undo")
+        assert code == 0 and undo_resp["ok"] is True and len(undo_resp["elements"]) == 1, (code, undo_resp)
+        undo_btn = undo_resp["elements"][0]
+        undo_bounds = undo_btn["bounds"]
+
         # Optionally pre-position the pointer over the card to prove the sequence
         # recovers cleanly when the pointer starts inside the card.
         if start_over_card:
             send_control(proc, reader, f"hover {cx:.2f} {cy:.2f}")
             pre_png = capture_dir / f"{tag}-{size_arg}-pre-hover.png"
-            _, _, ppx0, ppy0, ppx1, ppy1, st_pre = capture_card_state(proc, reader, pre_png, "hovered")
+            _, _, ppx0, ppy0, ppx1, ppy1, st_pre = capture_card_state(
+                proc, reader, pre_png, "hovered", exclude_rect=undo_bounds
+            )
             assert st_pre == "hovered"
             assert_bbox_matches(bounds, ppx0, ppy0, ppx1, ppy1)
 
         # 1. Explicitly move pointer outside the card and wait with a deadline for idle capture.
         send_control(proc, reader, "hover 2.00 2.00")
         idle_png = capture_dir / f"{tag}-{size_arg}-idle.png"
-        png_w, png_h, px0, py0, px1, py1, st_idle = capture_card_state(proc, reader, idle_png, "idle")
+        png_w, png_h, px0, py0, px1, py1, st_idle = capture_card_state(
+            proc, reader, idle_png, "idle", exclude_rect=undo_bounds
+        )
+        # Re-inspect after capture so tiled Wayland compositors that resize on map
+        # are compared against the settled viewport's bounds.
+        code, card_resp = run_client(client_bin, sock, "inspect", "slide.card")
+        assert code == 0 and card_resp["ok"] is True and len(card_resp["elements"]) == 1, (code, card_resp)
+        bounds = card_resp["elements"][0]["bounds"]
+        cx = bounds["x"] + bounds["width"] / 2.0
+        cy = bounds["y"] + bounds["height"] / 2.0
+        code, undo_resp = run_client(client_bin, sock, "inspect", "slide.undo")
+        assert code == 0 and undo_resp["ok"] is True and len(undo_resp["elements"]) == 1, (code, undo_resp)
+        undo_bounds = undo_resp["elements"][0]["bounds"]
         assert_bbox_matches(bounds, px0, py0, px1, py1)
 
         # 2. Move pointer inside the card and wait with a deadline for hovered capture.
         send_control(proc, reader, f"hover {cx:.2f} {cy:.2f}")
         hover_png = capture_dir / f"{tag}-{size_arg}-hover.png"
-        hw, hh, hpx0, hpy0, hpx1, hpy1, st_hover = capture_card_state(proc, reader, hover_png, "hovered")
+        hw, hh, hpx0, hpy0, hpx1, hpy1, st_hover = capture_card_state(
+            proc, reader, hover_png, "hovered", exclude_rect=undo_bounds
+        )
         assert (hw, hh) == (png_w, png_h)
         assert_bbox_matches(bounds, hpx0, hpy0, hpx1, hpy1)
 
@@ -309,12 +371,86 @@ def verify_viewport(
         # 3. Letterbox click leaves state unchanged.
         send_control(proc, reader, "click 2.00 2.00")
         code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
-        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0)", (code, h0)
+        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0, undo=0)", (code, h0)
 
-        # 4. Card click triggers handler.
+        # 4. Card click preserves button activation.
         send_control(proc, reader, f"click {cx:.2f} {cy:.2f}")
-        h1 = wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1)")
+        h1 = wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
         print(f"[{tag}] letterbox click no-op; card click ({cx:.1f},{cy:.1f}) -> {h1['elements'][0]['text']}")
+
+        # 5. Drag card with 3 separate motion events -> updates document bounds, produces 1 undo step.
+        scale = min(png_w / 960.0, png_h / 540.0)
+        send_control(proc, reader, f"down {cx:.2f} {cy:.2f}")
+        send_control(proc, reader, f"move {cx + 20.0 * scale:.2f} {cy - 10.0 * scale:.2f}")
+        send_control(proc, reader, f"move {cx + 40.0 * scale:.2f} {cy - 20.0 * scale:.2f}")
+        send_control(proc, reader, f"move {cx + 60.0 * scale:.2f} {cy - 30.0 * scale:.2f}")
+        send_control(proc, reader, f"up {cx + 60.0 * scale:.2f} {cy - 30.0 * scale:.2f}")
+
+        expected_drag = {"x": 280.0, "y": 170.0, "width": 520.0, "height": 220.0}
+        dragged = wait_for_card_canvas_bounds(client_bin, sock, expected_drag)
+        dragged_cb = dragged["canvas_bounds"]
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=1)")
+
+        # 6. Resize card from bottom-right corner -> updates document width/height, produces 1 undo step.
+        db = dragged["bounds"]
+        rx = db["x"] + db["width"] - 8.0 * scale
+        ry = db["y"] + db["height"] - 8.0 * scale
+        send_control(proc, reader, f"down {rx:.2f} {ry:.2f}")
+        send_control(proc, reader, f"move {rx + 20.0 * scale:.2f} {ry + 12.5 * scale:.2f}")
+        send_control(proc, reader, f"move {rx + 40.0 * scale:.2f} {ry + 25.0 * scale:.2f}")
+        send_control(proc, reader, f"up {rx + 40.0 * scale:.2f} {ry + 25.0 * scale:.2f}")
+
+        expected_resize = {
+            "x": dragged_cb["x"],
+            "y": dragged_cb["y"],
+            "width": 560.0,
+            "height": 245.0,
+        }
+        resized = wait_for_card_canvas_bounds(client_bin, sock, expected_resize)
+        resized_cb = resized["canvas_bounds"]
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+
+        # 7. Cancelled drag (Escape) restores geometry and consumes no undo step.
+        rb = resized["bounds"]
+        rcx = rb["x"] + rb["width"] / 2.0
+        rcy = rb["y"] + rb["height"] / 2.0
+        send_control(proc, reader, f"down {rcx:.2f} {rcy:.2f}")
+        send_control(proc, reader, f"move {rcx - 25.0 * scale:.2f} {rcy + 20.0 * scale:.2f}")
+        send_control(proc, reader, f"move {rcx - 50.0 * scale:.2f} {rcy + 40.0 * scale:.2f}")
+        wait_for_card_canvas_bounds(
+            client_bin,
+            sock,
+            {
+                "x": resized_cb["x"] - 50.0,
+                "y": resized_cb["y"] + 40.0,
+                "width": resized_cb["width"],
+                "height": resized_cb["height"],
+            },
+        )
+        send_control(proc, reader, "key escape")
+        restored = wait_for_card_canvas_bounds(client_bin, sock, resized_cb, tol=0.001)
+        assert restored["canvas_bounds"] == resized_cb, (restored["canvas_bounds"], resized_cb)
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+
+        # 8. Undo twice via slide.undo button: resize -> dragged -> original (proves 1 undo step per gesture).
+        code, u1 = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
+        assert code == 0 and u1["ok"] is True, (code, u1)
+        after_u1 = wait_for_card_canvas_bounds(client_bin, sock, dragged_cb, tol=0.001)
+        assert after_u1["canvas_bounds"] == dragged_cb
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=1)")
+
+        code, u2 = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
+        assert code == 0 and u2["ok"] is True, (code, u2)
+        orig = {"x": 220, "y": 200, "width": 520, "height": 220}
+        after_u2 = wait_for_card_canvas_bounds(client_bin, sock, orig, tol=0.001)
+        assert after_u2["canvas_bounds"] == orig
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
+
+        print(
+            f"[{tag}] gestures: drag=({dragged_cb['x']:.1f},{dragged_cb['y']:.1f},{dragged_cb['width']:.1f}x{dragged_cb['height']:.1f}) "
+            f"resize=({resized_cb['x']:.1f},{resized_cb['y']:.1f},{resized_cb['width']:.1f}x{resized_cb['height']:.1f}) "
+            f"cancel->restored(undo=2) undo->dragged->orig(undo=0)"
+        )
 
         send_control(proc, reader, "quit")
         proc.wait(timeout=5)
@@ -408,13 +544,13 @@ def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, cap
         send_control(proc, reader, f"click {click_x:.2f} {out_top + 0.5:.2f}")
         send_control(proc, reader, f"click {click_x:.2f} {out_bot + 0.5:.2f}")
         code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
-        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0)", (code, h0)
+        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0, undo=0)", (code, h0)
 
         send_control(proc, reader, f"click {click_x:.2f} {in_top + 0.5:.2f}")
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1)")
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
 
         send_control(proc, reader, f"click {click_x:.2f} {in_bot + 0.5:.2f}")
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=2)")
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=2, undo=0)")
 
         print(
             f"[edge] requested=801x542 captured={png_w}x{png_h} fitted_y=[{y_top:.5f},{y_bot:.5f}): "
