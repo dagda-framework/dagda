@@ -171,10 +171,7 @@ slide_edit_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: 
 	if target.base_revision != dagda.Revision(s.headline_rev) {
 		return .Stale_Revision
 	}
-	if !slide_commit_headline(s, arg.text) {
-		return .Not_Handled
-	}
-	return .Applied
+	return slide_commit_headline(s, arg.text)
 }
 
 slide_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
@@ -189,18 +186,23 @@ slide_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revisio
 // the headline: keyboard composition commits and driver edits
 // both land here, so the single-line rule, undo entry, and
 // revision advance can never diverge between them.
-slide_commit_headline :: proc(s: ^Slide_Canvas, new_text: string) -> bool {
+slide_commit_headline :: proc(s: ^Slide_Canvas, new_text: string) -> dagda.Edit_Result {
 	if !dagda.valid_single_line(new_text) || new_text == s.headline {
-		return false
+		return .Not_Handled
 	}
 	cloned, err := strings.clone(new_text)
-	if err != nil {
-		return false
+	if err != nil || len(cloned) != len(new_text) {
+		return .Alloc_Failed
+	}
+	s.undo_stack.allocator = context.allocator
+	if reserve(&s.undo_stack, len(s.undo_stack) + 1) != nil {
+		delete(cloned)
+		return .Alloc_Failed
 	}
 	append(&s.undo_stack, Undo_Entry{kind = .Headline_Text, text = s.headline})
 	s.headline = cloned
 	s.headline_rev += 1
-	return true
+	return .Applied
 }
 
 slide_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
@@ -208,7 +210,7 @@ slide_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: stri
 	if id != HEADLINE_ID {
 		return false
 	}
-	return slide_commit_headline(s, new_text)
+	return slide_commit_headline(s, new_text) == .Applied
 }
 
 slide_text_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {

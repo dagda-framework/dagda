@@ -66,6 +66,23 @@ def composing_geometry(png_path, bounds):
     return bbox, max(tall)
 
 
+def capture_current(proc, reader, client_bin, sock, png_path):
+    """Screenshot paired with current headline bounds.
+
+    Retries when a compositor resize lands between the inspect
+    and the capture, so the bounds and pixels always describe
+    the same frame geometry.
+    """
+    for _ in range(3):
+        before = headline(client_bin, sock)
+        base.send_control(proc, reader, f"screenshot {png_path}")
+        after = headline(client_bin, sock)
+        if before["bounds"] == after["bounds"]:
+            return before
+        time.sleep(0.05)
+    return headline(client_bin, sock)
+
+
 def headline_ink(png_path, bounds):
     """(ink bbox, cropped headline pixels) for painted-text checks."""
     w, h, rgb = base.decode_png_rgb(png_path)
@@ -82,7 +99,11 @@ def headline_ink(png_path, bounds):
                 ink.append((x, y))
     assert ink, f"no painted headline ink in {png_path}"
     bbox = (min(q[0] for q in ink), min(q[1] for q in ink), max(q[0] for q in ink), max(q[1] for q in ink))
-    return bbox, bytes(crop)
+    # Top of the final glyph only (rightmost quarter of the ink),
+    # where é carries an accent and plain e does not.
+    cut = bbox[0] + (bbox[2] - bbox[0]) * 3 // 4
+    final_top = min(q[1] for q in ink if q[0] >= cut)
+    return bbox, bytes(crop), final_top
 
 
 def verify_single_line_regression(canvas_bin, client_bin, tmp):
@@ -165,7 +186,7 @@ def main():
         base.wait_for_headline_composing(proc, reader, client_bin, sock, tmp / "composing-before.png",
                                          "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
         geo_before = composing_geometry(tmp / "composing-before.png", hb)
-        orig_ink, orig_crop = headline_ink(tmp / "init.png", hb)
+        orig_ink, orig_crop, _ = headline_ink(tmp / "init.png", hb)
         print(f"[2] visible preedit over selected 'Canvas': highlight={geo_before[0]} caret_x={geo_before[1]} ink={orig_ink}")
 
         # The agent previews its replacement at R.
@@ -191,9 +212,11 @@ def main():
         _, edits_now = client(client_bin, sock, "edits", str(headline_id))
         assert edits_now["revision"] == R + 1, edits_now
         # The window must actually paint the new headline: its
-        # glyph ink is much narrower than the original's.
-        base.send_control(proc, reader, f"screenshot {tmp}/committed.png")
-        committed_ink, _ = headline_ink(tmp / "committed.png", hb)
+        # glyph ink is much narrower than the original's. The
+        # screenshot is paired with the headline bounds current
+        # at capture time, retrying across a compositor resize.
+        committed_el = capture_current(proc, reader, client_bin, sock, tmp / "committed.png")
+        committed_ink, committed_mask, committed_top = headline_ink(tmp / "committed.png", committed_el["bounds"])
         assert committed_ink[2] - committed_ink[0] < (orig_ink[2] - orig_ink[0]) * 0.75, (orig_ink, committed_ink)
         print(f"[4] composition finished: 'Slide é' at R+1={R + 1}, one undo entry; painted ink {orig_ink} -> {committed_ink}")
 
@@ -211,11 +234,26 @@ def main():
         base.wait_for_role_text(client_bin, sock, "slide.status", f"selected=false, clicks=0, rev={R + 2}, undo=0")
         # And it paints the original headline again, pixel for
         # pixel in the cropped headline region.
-        base.send_control(proc, reader, f"screenshot {tmp}/undone.png")
-        undone_ink, undone_crop = headline_ink(tmp / "undone.png", hb)
+        undone_el = capture_current(proc, reader, client_bin, sock, tmp / "undone.png")
+        undone_ink, undone_crop, _ = headline_ink(tmp / "undone.png", undone_el["bounds"])
         mask_diff = sum(1 for a, b in zip(orig_crop, undone_crop) if a != b) / max(1, len(orig_crop))
         assert undone_ink == orig_ink and mask_diff < 0.01, (orig_ink, undone_ink, mask_diff)
         print(f"[6] Ctrl+Z: exact 'Slide Canvas' bytes and painted pixels in both views at R+2={R + 2}, undo consumed")
+
+        # Glyph reference: paint ASCII "Slide e" through the same
+        # app and compare. The committed é must differ from the
+        # ASCII reference in the final-glyph region (its accent
+        # extends the ink bbox upward), not merely in width.
+        _, ref_commit = client(client_bin, sock, "commit", str(headline_id), "replace_text", str(R + 2), "text", "Slide e")
+        assert ref_commit["revision"] == R + 3, ref_commit
+        base.wait_for_role_text(client_bin, sock, "slide.headline", "Slide e")
+        ref_el = capture_current(proc, reader, client_bin, sock, tmp / "reference-e.png")
+        ref_ink, _, ref_top = headline_ink(tmp / "reference-e.png", ref_el["bounds"])
+        assert committed_top < ref_top, (committed_ink, committed_top, ref_ink, ref_top)
+        print(f"[7] glyph reference: é final-glyph top {committed_top} above ASCII e {ref_top}; reference undone")
+        base.send_control(proc, reader, "key ctrl+z")
+        base.wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
+        base.wait_for_role_text(client_bin, sock, "slide.status", f"selected=false, clicks=0, rev={R + 4}, undo=0")
 
         base.send_control(proc, reader, "quit")
         proc.wait(timeout=5)
