@@ -42,6 +42,133 @@ fail_alloc_proc :: proc(
 }
 
 @(test)
+test_snapshot_adoption_reconciles_caret_to_grapheme :: proc(t: ^testing.T) {
+	model := make_test_model(t, "ax")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Press Left: caret sits between "a" and "x" at byte 1.
+	left_ev: sdl.Event
+	left_ev.type = .KEY_DOWN
+	left_ev.key.key = sdl.K_LEFT
+	editor_handle_sdl_event(&state, adapter, &left_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, state.caret, 1)
+	testing.expect_value(t, state.anchor, 1)
+
+	// Externally commit "e" + U+0301 + "x": byte 1 now falls
+	// inside the first grapheme, so adopting the snapshot must
+	// reconcile the displayed caret and anchor to byte 0 before
+	// any further key event.
+	snap := title_model.snapshot(&model)
+	target := dagda.Action_Target{id = snap.object.id, base_revision = snap.revision}
+	testing.expect_value(t, title_model.commit(&model, target, "e\xcc\x81x"), title_model.Error.None)
+	testing.expect(t, editor_sync_from_model(&state, adapter))
+	testing.expect_value(t, state.committed_text, "e\xcc\x81x")
+	testing.expect_value(t, state.caret, 0)
+	testing.expect_value(t, state.anchor, 0)
+	testing.expect_value(t, state.session.caret, 0)
+	testing.expect_value(t, state.session.anchor, 0)
+
+	// Typing Q inserts at the reconciled caret: revision 2.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "Q"
+	editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, title_model.snapshot(&model).text, "Qe\xcc\x81x")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(2))
+}
+
+@(test)
+test_failed_preedit_and_text_proposals_preserve_state :: proc(t: ^testing.T) {
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Select "results" and start composing successfully.
+	state.anchor = len("Quarterly ")
+	state.caret = len("Quarterly results")
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 0
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Busy_Composing)
+
+	fail_state := Fail_Alloc_State{backing = context.allocator, fail_allocs = true}
+	state.session.allocator = mem.Allocator{procedure = fail_alloc_proc, data = &fail_state}
+
+	// A failing preedit update keeps the old preedit, the
+	// selection, and the Busy gate; no revision is consumed.
+	edit_ev.edit.text = "nouveau"
+	handled := editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect(t, !handled)
+	testing.expect_value(t, state.preedit_text, "café")
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Busy_Composing)
+	testing.expect_value(t, state.anchor, len("Quarterly "))
+	testing.expect_value(t, state.caret, len("Quarterly results"))
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(0))
+
+	// A failing final text proposal behaves the same way.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "café"
+	handled = editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect(t, !handled)
+	testing.expect_value(t, state.preedit_text, "café")
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(0))
+
+	// Retrying with a working allocator succeeds exactly once.
+	fail_state.fail_allocs = false
+	handled = editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect(t, handled)
+	testing.expect_value(t, state.committed_text, "Quarterly café")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect(t, !editor_is_composing(&state))
+}
+
+@(test)
+test_rejected_typing_preserves_selection_after_external_commit :: proc(t: ^testing.T) {
+	model := make_test_model(t, "abc")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Select all of "abc", then an external commit replaces it.
+	state.anchor = 0
+	state.caret = len("abc")
+	snap := title_model.snapshot(&model)
+	target := dagda.Action_Target{id = snap.object.id, base_revision = snap.revision}
+	testing.expect_value(t, title_model.commit(&model, target, "ABC"), title_model.Error.None)
+	// The editor is not synced: its snapshot revision is now stale.
+
+	// Typing against the editor's stale revision is rejected:
+	// the document still reads ABC and the full selection stays.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "q"
+	editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, state.committed_text, "ABC")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect_value(t, state.anchor, 0)
+	testing.expect_value(t, state.caret, len("ABC"))
+}
+
+@(test)
 test_composition_does_not_commit_and_blocks_external_commits :: proc(t: ^testing.T) {
 	model := make_test_model(t)
 	defer title_model.destroy(&model)

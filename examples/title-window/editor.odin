@@ -25,6 +25,24 @@ Editor_State :: struct {
 	needs_clear_composition: bool,
 	commit_count:            int,
 	last_status:             string,
+	session:                 dagda.Text_Session,
+}
+
+// The editor's caret/selection/composition fields mirror the
+// headless dagda.Text_Session that owns them; these helpers keep
+// the two in step around host-side rendering and status text.
+editor_sync_session :: proc(state: ^Editor_State) {
+	state.session.caret = dagda.clamp_grapheme_boundary(state.committed_text, state.caret)
+	state.session.anchor = dagda.clamp_grapheme_boundary(state.committed_text, state.anchor)
+}
+
+editor_sync_from_session :: proc(state: ^Editor_State) {
+	state.caret = state.session.caret
+	state.anchor = state.session.anchor
+	state.preedit_text = state.session.preedit
+	state.preedit_start = state.session.preedit_start
+	state.preedit_length = state.session.preedit_length
+	state.composing = state.session.composing
 }
 
 editor_init :: proc(state: ^Editor_State, adapter: Model_Adapter) {
@@ -43,13 +61,14 @@ editor_init :: proc(state: ^Editor_State, adapter: Model_Adapter) {
 	state.needs_redraw = true
 	state.needs_clear_composition = false
 	state.commit_count = 0
+	dagda.text_session_init(&state.session, state.committed_text)
 	editor_set_status(state, "Ready")
 }
 
 editor_destroy :: proc(state: ^Editor_State) {
 	delete(state.committed_text)
 	state.committed_text = ""
-	delete(state.preedit_text)
+	dagda.text_session_destroy(&state.session)
 	state.preedit_text = ""
 	delete(state.last_status)
 	state.last_status = ""
@@ -58,7 +77,7 @@ editor_destroy :: proc(state: ^Editor_State) {
 // editor_is_composing reports whether the window currently has an active,
 // uncommitted IME composition preedit.
 editor_is_composing :: proc(state: ^Editor_State) -> bool {
-	return state.composing
+	return dagda.is_composing(&state.session)
 }
 
 // editor_external_commit_gate exposes the composition check for the integration
@@ -86,8 +105,7 @@ editor_sync_from_model :: proc(state: ^Editor_State, adapter: Model_Adapter) -> 
 	state.committed_text = strings.clone(snap.text)
 	state.snapshot_id = snap.id
 	state.snapshot_revision = snap.revision
-	state.caret = clamp_utf8_boundary(state.committed_text, state.caret)
-	state.anchor = clamp_utf8_boundary(state.committed_text, state.anchor)
+	editor_reconcile_caret(state)
 	state.needs_redraw = true
 	return true
 }
@@ -98,20 +116,16 @@ editor_set_status :: proc(state: ^Editor_State, msg: string) {
 }
 
 editor_clear_preedit :: proc(state: ^Editor_State) {
-	if len(state.preedit_text) > 0 {
-		delete(state.preedit_text)
-		state.preedit_text = ""
-	}
-	state.preedit_start = 0
-	state.preedit_length = 0
-	state.composing = false
+	editor_sync_session(state)
+	dagda.begin_composition(&state.session, "", 0, 0)
+	editor_sync_from_session(state)
 }
 
 editor_cancel_composition :: proc(state: ^Editor_State) -> bool {
-	if !state.composing {
+	if !dagda.cancel_composition(&state.session) {
 		return false
 	}
-	editor_clear_preedit(state)
+	editor_sync_from_session(state)
 	state.needs_clear_composition = true
 	state.needs_redraw = true
 	editor_set_status(state, "Composition cancelled")
@@ -165,11 +179,22 @@ next_rune_boundary :: proc(s: string, offset: int) -> int {
 	return min(offset + width, len(s))
 }
 
+// editor_reconcile_caret brings the displayed caret and selection
+// anchor onto Dagda grapheme boundaries of the committed text, and
+// mirrors them into the editing session, so the window paints the
+// same offsets the next edit will use.
+editor_reconcile_caret :: proc(state: ^Editor_State) {
+	state.caret = dagda.clamp_grapheme_boundary(state.committed_text, state.caret)
+	state.anchor = dagda.clamp_grapheme_boundary(state.committed_text, state.anchor)
+	editor_sync_session(state)
+}
+
 editor_apply_snapshot :: proc(state: ^Editor_State, snap: Title_Snapshot) {
 	delete(state.committed_text)
 	state.committed_text = strings.clone(snap.text)
 	state.snapshot_id = snap.id
 	state.snapshot_revision = snap.revision
+	editor_reconcile_caret(state)
 }
 
 editor_commit_replacement :: proc(
@@ -185,13 +210,14 @@ editor_commit_replacement :: proc(
 	res := adapter_commit(adapter, target, replacement)
 	editor_apply_snapshot(state, res.snapshot)
 	if res.err == .None {
-		state.caret = clamp_utf8_boundary(state.committed_text, new_caret)
+		state.caret = dagda.clamp_grapheme_boundary(state.committed_text, new_caret)
 		state.anchor = state.caret
+		editor_sync_session(state)
 		state.commit_count += 1
 		editor_set_status(state, fmt.tprintf("Committed rev %d", state.snapshot_revision))
 	} else {
-		state.caret = clamp_utf8_boundary(state.committed_text, state.caret)
-		state.anchor = clamp_utf8_boundary(state.committed_text, state.anchor)
+		// A stale rejection adopts the latest snapshot too:
+		// editor_apply_snapshot already reconciled both offsets.
 		editor_set_status(state, fmt.tprintf("Commit rejected: %v (synced rev %d)", res.err, state.snapshot_revision))
 	}
 	state.needs_redraw = true
@@ -202,12 +228,17 @@ editor_handle_text_editing :: proc(state: ^Editor_State, text: string, start: in
 	if !state.focused {
 		return false
 	}
-	editor_clear_preedit(state)
-	if len(text) > 0 {
-		state.preedit_text = strings.clone(text)
-		state.preedit_start = start
-		state.preedit_length = length
-		state.composing = true
+	// A failed preedit update keeps the current preedit, selection,
+	// and Busy_Composing gate exactly as they were.
+	editor_sync_session(state)
+	if err := dagda.begin_composition(&state.session, text, start, length); err != .None {
+		editor_sync_from_session(state)
+		editor_set_status(state, "Composition update failed")
+		state.needs_redraw = true
+		return false
+	}
+	editor_sync_from_session(state)
+	if state.composing {
 		editor_set_status(state, "Composing (uncommitted preedit)")
 	} else {
 		editor_set_status(state, "Composition ended")
@@ -319,22 +350,32 @@ editor_handle_text_input :: proc(state: ^Editor_State, adapter: Model_Adapter, t
 	if !state.focused {
 		return false
 	}
-	editor_clear_preedit(state)
 	if len(text) == 0 {
 		state.needs_redraw = true
 		return false
 	}
-
-	sel_start, sel_end := selection_bounds(state)
-	b: strings.Builder
-	strings.builder_init(&b)
-	defer strings.builder_destroy(&b)
-	strings.write_string(&b, state.committed_text[:sel_start])
-	strings.write_string(&b, text)
-	strings.write_string(&b, state.committed_text[sel_end:])
-
-	new_caret := sel_start + len(text)
-	editor_commit_replacement(state, adapter, strings.to_string(b), new_caret)
+	// Propose first: on failure nothing is committed and any
+	// active preedit (and its Busy gate) stays in place.
+	editor_sync_session(state)
+	edit := dagda.insert_text(&state.session, state.committed_text, text)
+	if edit.err != .None {
+		editor_sync_from_session(state)
+		dagda.edit_destroy(&state.session, &edit)
+		editor_set_status(state, "Text proposal failed")
+		state.needs_redraw = true
+		return false
+	}
+	editor_sync_from_session(state)
+	committed := true // a no-op proposal needs no document commit
+	if edit.changed {
+		committed = editor_commit_replacement(state, adapter, edit.text, edit.caret) == .None
+	}
+	dagda.edit_destroy(&state.session, &edit)
+	// The preedit ends only once the replacement has succeeded.
+	if committed {
+		editor_clear_preedit(state)
+		editor_sync_session(state)
+	}
 	return true
 }
 
@@ -385,90 +426,78 @@ editor_handle_key_down :: proc(state: ^Editor_State, adapter: Model_Adapter, key
 	}
 
 	if ctrl && !alt && key == sdl.K_A {
-		state.anchor = 0
-		state.caret = len(state.committed_text)
+		editor_sync_session(state)
+		dagda.select_all(&state.session, state.committed_text)
+		editor_sync_from_session(state)
 		state.needs_redraw = true
 		return true
 	}
 
 	switch key {
 	case sdl.K_LEFT:
-		if !shift && has_selection(state) {
-			sel_start, _ := selection_bounds(state)
-			state.caret = sel_start
-			state.anchor = sel_start
-		} else {
-			state.caret = prev_rune_boundary(state.committed_text, state.caret)
-			if !shift {
-				state.anchor = state.caret
-			}
-		}
+		editor_sync_session(state)
+		dagda.move_left(&state.session, state.committed_text, shift)
+		editor_sync_from_session(state)
 		state.needs_redraw = true
 		return true
 
 	case sdl.K_RIGHT:
-		if !shift && has_selection(state) {
-			_, sel_end := selection_bounds(state)
-			state.caret = sel_end
-			state.anchor = sel_end
-		} else {
-			state.caret = next_rune_boundary(state.committed_text, state.caret)
-			if !shift {
-				state.anchor = state.caret
-			}
-		}
+		editor_sync_session(state)
+		dagda.move_right(&state.session, state.committed_text, shift)
+		editor_sync_from_session(state)
 		state.needs_redraw = true
 		return true
 
 	case sdl.K_HOME:
-		state.caret = 0
-		if !shift {
-			state.anchor = 0
-		}
+		editor_sync_session(state)
+		dagda.move_home(&state.session, shift)
+		editor_sync_from_session(state)
 		state.needs_redraw = true
 		return true
 
 	case sdl.K_END:
-		state.caret = len(state.committed_text)
-		if !shift {
-			state.anchor = state.caret
-		}
+		editor_sync_session(state)
+		dagda.move_end(&state.session, state.committed_text, shift)
+		editor_sync_from_session(state)
 		state.needs_redraw = true
 		return true
 
 	case sdl.K_BACKSPACE:
-		del_start, del_end := selection_bounds(state)
-		if del_start == del_end {
-			if state.caret == 0 {
-				return false
-			}
-			del_start = prev_rune_boundary(state.committed_text, state.caret)
-			del_end = state.caret
+		editor_sync_session(state)
+		edit := dagda.backspace(&state.session, state.committed_text)
+		editor_sync_from_session(state)
+		if edit.err != .None {
+			dagda.edit_destroy(&state.session, &edit)
+			state.needs_redraw = true
+			return false
 		}
-		b: strings.Builder
-		strings.builder_init(&b)
-		defer strings.builder_destroy(&b)
-		strings.write_string(&b, state.committed_text[:del_start])
-		strings.write_string(&b, state.committed_text[del_end:])
-		editor_commit_replacement(state, adapter, strings.to_string(b), del_start)
+		if !edit.changed {
+			dagda.edit_destroy(&state.session, &edit)
+			return state.caret != 0 || has_selection(state)
+		}
+		editor_commit_replacement(state, adapter, edit.text, edit.caret)
+		dagda.edit_destroy(&state.session, &edit)
+		editor_sync_session(state)
 		return true
 
 	case sdl.K_DELETE:
-		del_start, del_end := selection_bounds(state)
-		if del_start == del_end {
-			if state.caret >= len(state.committed_text) {
-				return false
-			}
-			del_start = state.caret
-			del_end = next_rune_boundary(state.committed_text, state.caret)
+		editor_sync_session(state)
+		edit := dagda.delete_forward(&state.session, state.committed_text)
+		editor_sync_from_session(state)
+		if edit.err != .None {
+			dagda.edit_destroy(&state.session, &edit)
+			state.needs_redraw = true
+			return false
 		}
-		b: strings.Builder
-		strings.builder_init(&b)
-		defer strings.builder_destroy(&b)
-		strings.write_string(&b, state.committed_text[:del_start])
-		strings.write_string(&b, state.committed_text[del_end:])
-		editor_commit_replacement(state, adapter, strings.to_string(b), del_start)
+		if !edit.changed {
+			dagda.edit_destroy(&state.session, &edit)
+			return false
+		}
+		editor_commit_replacement(state, adapter, edit.text, edit.caret)
+		dagda.edit_destroy(&state.session, &edit)
+		editor_sync_session(state)
 		return true
+
 	}
 
 	return false
