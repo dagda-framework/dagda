@@ -80,7 +80,18 @@ parse_action :: proc(name: string) -> (dagda.Action, bool) {
 	return .Activate, false
 }
 
-write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element) {
+write_f32_exact :: proc(b: ^strings.Builder, v: f32) {
+	if v == 0 {
+		strings.write_byte(b, '0')
+		return
+	}
+	buf: [64]u8
+	s := strconv.write_float(buf[:], f64(v), 'g', -1, 32)
+	s = strings.trim_prefix(s, "+")
+	strings.write_string(b, s)
+}
+
+write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, has_canvas := false) {
 	strings.write_string(b, "{\"id\":")
 	strings.write_u64(b, u64(el.info.id))
 	strings.write_string(b, ",\"role\":")
@@ -89,8 +100,20 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element) 
 	write_json_string(b, kind_name(el.kind))
 	strings.write_string(b, ",\"text\":")
 	write_json_string(b, el.text)
-	fmt.sbprintf(b, ",\"bounds\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}},\"actions\":[",
+	fmt.sbprintf(b, ",\"bounds\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}}",
 		el.bounds.x, el.bounds.y, el.bounds.width, el.bounds.height)
+	if has_canvas {
+		strings.write_string(b, ",\"canvas_bounds\":{\"x\":")
+		write_f32_exact(b, el.canvas_bounds.x)
+		strings.write_string(b, ",\"y\":")
+		write_f32_exact(b, el.canvas_bounds.y)
+		strings.write_string(b, ",\"width\":")
+		write_f32_exact(b, el.canvas_bounds.width)
+		strings.write_string(b, ",\"height\":")
+		write_f32_exact(b, el.canvas_bounds.height)
+		strings.write_byte(b, '}')
+	}
+	strings.write_string(b, ",\"actions\":[")
 	first := true
 	if .Activate in el.actions {
 		if !first {
@@ -256,7 +279,7 @@ dispatch :: proc(
 				if i > 0 {
 					strings.write_byte(&b, ',')
 				}
-				write_resolved_element(&b, el)
+				write_resolved_element(&b, el, frame.has_canvas)
 			}
 			strings.write_string(&b, "]}")
 			return strings.to_string(b), false
@@ -281,7 +304,7 @@ dispatch :: proc(
 			if emitted > 0 {
 				strings.write_byte(&b, ',')
 			}
-			write_resolved_element(&b, el)
+			write_resolved_element(&b, el, frame.has_canvas)
 			emitted += 1
 		}
 		if emitted == 0 {

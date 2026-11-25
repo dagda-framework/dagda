@@ -38,6 +38,7 @@ jobs:
           mkdir -p build
           ./scripts/odin.sh build examples/title-window -collection:dagda=. -out:build/title-window
           ./scripts/odin.sh build examples/counter -collection:dagda=. -out:build/counter
+          ./scripts/odin.sh build examples/canvas-slide -collection:dagda=. -out:build/canvas-slide
           ./scripts/odin.sh build examples/dagda-client -collection:dagda=. -out:build/dagda-client
 
       - name: Check the shared-title example output
@@ -54,6 +55,12 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
         run: python3 examples/counter/tests/acceptance_test.py build/counter-capture
+
+      - name: Run the native canvas acceptance test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/canvas-slide/tests/acceptance_test.py build/canvas-capture
 
       - name: Run the title edit conflict test
         env:
