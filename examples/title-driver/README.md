@@ -36,13 +36,16 @@ bash scripts/setup-odin.sh   # once, if the pinned compiler is missing
 ./scripts/odin.sh build examples/title-driver-host -collection:dagda=. -out:/tmp/title-host
 ./scripts/odin.sh build examples/title-driver-client -collection:dagda=. -out:/tmp/title-client
 
-/tmp/title-host /tmp/dagda-title.sock &   # prints: Listening /tmp/dagda-title.sock
-/tmp/title-client /tmp/dagda-title.sock inspect slide.title
-/tmp/title-client /tmp/dagda-title.sock preview 1 0 "Revenue grew 12%"
-/tmp/title-client /tmp/dagda-title.sock commit 1 0 "Revenue grew 12%"
-/tmp/title-client /tmp/dagda-title.sock undo 1 1
-/tmp/title-client /tmp/dagda-title.sock inspect slide.title
+SOCK_DIR=$(mktemp -d /tmp/dagda-title.XXXXXX)   # fresh private directory
+SOCK=$SOCK_DIR/title.sock
+/tmp/title-host $SOCK &   # prints: Listening /tmp/dagda-title.XXXXXX/title.sock
+/tmp/title-client $SOCK inspect slide.title
+/tmp/title-client $SOCK preview 1 0 "Revenue grew 12%"
+/tmp/title-client $SOCK commit 1 0 "Revenue grew 12%"
+/tmp/title-client $SOCK undo 1 1
+/tmp/title-client $SOCK inspect slide.title
 kill %1   # the host removes its own socket file on SIGINT/SIGTERM
+rmdir $SOCK_DIR
 ```
 
 The client prints the single JSON reply and exits `0` when

@@ -178,13 +178,27 @@ numeric_token_in_range :: proc(kind: json.Token_Kind, text: string) -> bool {
 	return trimmed <= MAX_WIRE_INT
 }
 
+// is_id_key decodes a raw JSON string token with the JSON library
+// and reports whether the decoded field name is id or
+// base_revision, so escaped spellings (e.g. "\u0069d") are
+// recognised exactly like the literal spelling.
+is_id_key :: proc(token_text: string) -> bool {
+	value, err := json.parse_string(token_text, .JSON, true)
+	if err != .None {
+		return false
+	}
+	defer json.destroy_value(value)
+	s, ok := value.(json.String)
+	return ok && (string(s) == "id" || string(s) == "base_revision")
+}
+
 // id_fields_in_range validates every top-level id / base_revision
 // value from its original numeric token, consistent with the
 // client's signed-range parsing.
 id_fields_in_range :: proc(line: string) -> bool {
 	t := json.make_tokenizer(line, .JSON, true)
 	depth := 0
-	last_key := ""
+	key_is_id_field := false
 	pending := false
 	for {
 		token, err := json.get_token(&t)
@@ -207,12 +221,13 @@ id_fields_in_range :: proc(line: string) -> bool {
 			depth -= 1
 		case .String:
 			if depth == 1 {
-				last_key = token.text
+				key_is_id_field = is_id_key(token.text)
 			}
 		case .Colon:
-			if depth == 1 && (last_key == "\"id\"" || last_key == "\"base_revision\"") {
+			if depth == 1 && key_is_id_field {
 				pending = true
 			}
+			key_is_id_field = false
 		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .Ident, .Comma, .EOF, .Invalid:
 		}
 	}

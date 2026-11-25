@@ -99,3 +99,26 @@ test_id_fields_signed_range_from_raw_tokens :: proc(t: ^testing.T) {
 	}
 	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
 }
+
+@(test)
+test_escaped_field_names_match_literal :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	// \x5c is a backslash, so the escaped lines carry the field
+	// names as \uXXXX spellings, decoded by the JSON library.
+	literal_preview := "{\"op\":\"preview\",\"id\":1,\"base_revision\":0,\"text\":\"Draft\"}"
+	escaped_preview := "{\"op\":\"preview\",\"\x5cu0069d\":1,\"base_\x5cu0072evision\":0,\"text\":\"Draft\"}"
+	preview_reply := "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Draft\"}"
+	expect_reply(t, &model, literal_preview, preview_reply)
+	expect_reply(t, &model, escaped_preview, preview_reply)
+
+	literal_bad := "{\"op\":\"commit\",\"id\":9223372036854775808,\"base_revision\":0,\"text\":\"X\"}"
+	escaped_bad_id := "{\"op\":\"commit\",\"\x5cu0069d\":9223372036854775808,\"base_revision\":0,\"text\":\"X\"}"
+	escaped_bad_rev := "{\"op\":\"commit\",\"id\":1,\"base_\x5cu0072evision\":9223372036854775808,\"text\":\"X\"}"
+	bad := []string{literal_bad, escaped_bad_id, escaped_bad_rev}
+	for line in bad {
+		expect_reply(t, &model, line, "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+	}
+	// Rejected requests preserved title and revision.
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
+}

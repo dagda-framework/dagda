@@ -160,6 +160,13 @@ def main():
             assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
         out, _ = client(client_bin, sock, "inspect", "slide.title")
         assert json.loads(out)["revision"] == 2, out
+        # Escaped field names behave identically to literal ones.
+        lines = raw_exchange(sock, [b'{"op":"preview","\\u0069d":1,"base_\\u0072evision":2,"text":"Draft"}\n'], replies=1)
+        assert json.loads(lines[0]) == {"ok": True, "id": 1, "revision": 2, "text": "Draft"}, lines
+        lines = raw_exchange(sock, [b'{"op":"commit","\\u0069d":9223372036854775808,"base_revision":2,"text":"X"}\n'], replies=1)
+        assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
+        out, _ = client(client_bin, sock, "inspect", "slide.title")
+        assert json.loads(out)["revision"] == 2, out
         # CLI rejects out-of-range numbers the wire would reject.
         r = run([client_bin, sock, "commit", "9223372036854775808", "2", "X"])
         assert r.returncode == 2, r
