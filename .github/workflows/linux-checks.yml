@@ -13,13 +13,18 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      - name: Install SDL3, FreeType, and a font
+      - name: Install SDL3, FreeType, a font, and the WebAssembly linker
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsdl3-dev libfreetype-dev fonts-liberation
+          sudo apt-get install -y --no-install-recommends libsdl3-dev libfreetype-dev fonts-liberation lld
 
       - name: Install the pinned Odin compiler
         run: bash scripts/setup-odin.sh
+
+      - name: Link a js_wasm32 consumer of Dagda core
+        run: |
+          ./scripts/odin.sh build tests/js-wasm32-consumer -collection:dagda=. -target:js_wasm32 -out:"$RUNNER_TEMP/dagda-consumer.wasm"
+          test -s "$RUNNER_TEMP/dagda-consumer.wasm"
 
       - name: Run the Odin test suites
         env:
