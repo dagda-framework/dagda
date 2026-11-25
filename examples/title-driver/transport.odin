@@ -16,8 +16,56 @@ make_addr :: proc(path: string) -> (posix.sockaddr_un, bool) {
 	return addr, true
 }
 
+path_cstring :: proc(path: string, buf: ^[128]u8) -> cstring {
+	buf^ = {}
+	if len(path) >= len(buf) {
+		return nil
+	}
+	copy(buf[:], path)
+	return cstring(raw_data(buf[:]))
+}
+
+Endpoint_Identity :: struct {
+	dev:   posix.dev_t,
+	ino:   posix.ino_t,
+	valid: bool,
+}
+
+// endpoint_identity identifies the filesystem entry at path so a
+// later cleanup can tell its own endpoint from a replacement.
+endpoint_identity :: proc(path: string) -> Endpoint_Identity {
+	buf: [128]u8
+	cpath := path_cstring(path, &buf)
+	if cpath == nil {
+		return {}
+	}
+	st: posix.stat_t
+	if posix.stat(cpath, &st) != .OK {
+		return {}
+	}
+	return {dev = st.st_dev, ino = st.st_ino, valid = true}
+}
+
+// remove_unix_owned unlinks path only when the entry now at path
+// is still the endpoint identified by identity. A replacement
+// entry, or an entry that cannot be identified, is preserved.
+remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
+	if !identity.valid {
+		return
+	}
+	current := endpoint_identity(path)
+	if !current.valid || current.dev != identity.dev || current.ino != identity.ino {
+		return
+	}
+	buf: [128]u8
+	if cpath := path_cstring(path, &buf); cpath != nil {
+		posix.unlink(cpath)
+	}
+}
+
 // listen_unix binds a stream socket at path. The caller owns the
-// endpoint and should remove_unix(path) after closing it.
+// endpoint; capture endpoint_identity(path) and release it with
+// remove_unix_owned so a replacement entry is never removed.
 listen_unix :: proc(path: string) -> (posix.FD, bool) {
 	addr, ok := make_addr(path)
 	if !ok {
@@ -32,8 +80,9 @@ listen_unix :: proc(path: string) -> (posix.FD, bool) {
 		return -1, false
 	}
 	if posix.listen(fd, 16) != .OK {
+		identity := endpoint_identity(path)
 		posix.close(fd)
-		posix.unlink(cstring(raw_data(path)))
+		remove_unix_owned(path, identity)
 		return -1, false
 	}
 	return fd, true
@@ -53,15 +102,6 @@ connect_unix :: proc(path: string) -> (posix.FD, bool) {
 		return -1, false
 	}
 	return fd, true
-}
-
-remove_unix :: proc(path: string) {
-	buf: [256]u8
-	if len(path) >= len(buf) {
-		return
-	}
-	copy(buf[:], path)
-	posix.unlink(cstring(raw_data(buf[:len(path)+1])))
 }
 
 write_all :: proc(fd: posix.FD, data: string) -> bool {
@@ -86,8 +126,9 @@ Line_Reader :: struct {
 	end:   int,
 }
 
-// read_line returns one line without its newline, or ok=false at
-// EOF/error. A final unterminated line at EOF is still returned.
+// read_line returns one newline-terminated line without its
+// newline (a trailing CR is stripped), or ok=false at EOF/error.
+// Unterminated input at EOF is discarded, never delivered.
 read_line :: proc(r: ^Line_Reader) -> (line: string, ok: bool) {
 	b: strings.Builder
 	strings.builder_init(&b)
@@ -114,11 +155,9 @@ read_line :: proc(r: ^Line_Reader) -> (line: string, ok: bool) {
 			return "", false
 		}
 		if n == 0 {
-			if len(strings.to_string(b)) == 0 {
-				strings.builder_destroy(&b)
-				return "", false
-			}
-			return strings.to_string(b), true
+			// EOF: any unfinished line in the builder is discarded.
+			strings.builder_destroy(&b)
+			return "", false
 		}
 		r.start = 0
 		r.end = int(n)

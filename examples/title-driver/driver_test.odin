@@ -59,3 +59,18 @@ test_noop_empty_undo_missing_and_malformed :: proc(t: ^testing.T) {
 	expect_reply(t, &model, "{\"op\":\"bogus\"}", "{\"ok\":false,\"error\":\"Unknown_Operation\"}")
 	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
 }
+
+@(test)
+test_blank_trailing_and_utf8_rejected_before_dispatch :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	bad_lines := []string{"", "   ", "{\"op\":\"inspect\",\"role\":\"slide.title\"} extra", "{\"op\":\"inspect\",\"role\":\"slide.title\"} {}", "{\"op\":\"inspect\",\"role\":\"slide.title\"}\xff", "[1,2]", "{\"op\":\"commit\",\"id\":1,\"base_revision\":0,\"text\":\"Bad\"} trailing"}
+	for line in bad_lines {
+		expect_reply(t, &model, line, "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+	}
+	// None of the rejected lines mutated the document.
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
+	// Out-of-range and non-integer IDs are malformed on the wire too.
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":-1,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":1.5,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+}

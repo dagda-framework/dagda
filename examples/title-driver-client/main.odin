@@ -14,6 +14,17 @@ usage :: proc() {
 	fmt.eprintln("       title-client <socket-path> undo    <id> <base_revision>")
 }
 
+// parse_target accepts only the non-negative i64 range the wire
+// decoder accepts, so CLI and wire validation stay consistent.
+parse_target :: proc(id_s, rev_s: string) -> (i64, i64, bool) {
+	id, id_ok := strconv.parse_i64(id_s)
+	rev, rev_ok := strconv.parse_i64(rev_s)
+	if !id_ok || !rev_ok || id < 0 || rev < 0 {
+		return 0, 0, false
+	}
+	return id, rev, true
+}
+
 main :: proc() {
 	if len(os.args) < 3 {
 		usage()
@@ -38,9 +49,8 @@ main :: proc() {
 			usage()
 			os.exit(2)
 		}
-		id, id_ok := strconv.parse_u64(os.args[3])
-		rev, rev_ok := strconv.parse_u64(os.args[4])
-		if !id_ok || !rev_ok {
+		id, rev, nums_ok := parse_target(os.args[3], os.args[4])
+		if !nums_ok {
 			usage()
 			os.exit(2)
 		}
@@ -52,9 +62,8 @@ main :: proc() {
 			usage()
 			os.exit(2)
 		}
-		id, id_ok := strconv.parse_u64(os.args[3])
-		rev, rev_ok := strconv.parse_u64(os.args[4])
-		if !id_ok || !rev_ok {
+		id, rev, nums_ok := parse_target(os.args[3], os.args[4])
+		if !nums_ok {
 			usage()
 			os.exit(2)
 		}

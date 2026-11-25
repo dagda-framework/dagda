@@ -27,23 +27,31 @@ main :: proc() {
 	act.sa_handler = on_signal
 	posix.sigaction(.SIGINT, &act, nil)
 	posix.sigaction(.SIGTERM, &act, nil)
+	// A peer that disconnects mid-reply must end only its own
+	// connection, never the host: writes report EPIPE instead.
+	ignore: posix.sigaction_t
+	ignore.sa_handler = transmute(proc "c" (posix.Signal))posix.SIG_IGN
+	posix.sigaction(.SIGPIPE, &ignore, nil)
 
 	listen_fd, ok := driver.listen_unix(path)
 	if !ok {
 		fmt.eprintf("could not listen on %s\n", path)
 		os.exit(1)
 	}
-	defer {
-		posix.close(listen_fd)
-		driver.remove_unix(path)
+	identity := driver.endpoint_identity(path)
+	cleanup := proc(fd: posix.FD, path: string, identity: driver.Endpoint_Identity) {
+		posix.close(fd)
+		driver.remove_unix_owned(path, identity)
 	}
 
 	model: title_model.Model
 	if err := title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results"); err != .None {
 		fmt.eprintln("could not initialise title model")
+		cleanup(listen_fd, path, identity)
 		os.exit(1)
 	}
 	defer title_model.destroy(&model)
+	defer cleanup(listen_fd, path, identity)
 
 	fmt.printf("Listening %s\n", path)
 
@@ -62,15 +70,13 @@ main :: proc() {
 			if !has_line {
 				break
 			}
-			if len(line) == 0 {
-				delete(line)
-				continue
-			}
 			reply := driver.dispatch(&model, line)
 			delete(line)
-			driver.write_all(conn, reply)
-			driver.write_all(conn, "\n")
+			sent := driver.write_all(conn, reply) && driver.write_all(conn, "\n")
 			delete(reply)
+			if !sent {
+				break // this peer is gone; keep serving the next one
+			}
 		}
 		posix.close(conn)
 	}

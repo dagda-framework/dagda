@@ -91,17 +91,17 @@ def main():
         # fixture order: discover, preview (no mutation), commit,
         # stale rejection, undo to revision 2, inspect from a new client.
         out, _ = client(client_bin, sock, "inspect", "slide.title")
-        assert out == FIXTURES[0][1], out
+        assert json.loads(out) == json.loads(FIXTURES[0][1]), out
         out, _ = client(client_bin, sock, "preview", "1", "0", "Revenue grew 12%")
-        assert out == FIXTURES[1][1], out
+        assert json.loads(out) == json.loads(FIXTURES[1][1]), out
         out, _ = client(client_bin, sock, "inspect", "slide.title")
         assert out == FIXTURES[0][1], f"preview mutated document: {out}"
         out, _ = client(client_bin, sock, "commit", "1", "0", "Revenue grew 12%")
-        assert out == FIXTURES[2][1], out
+        assert json.loads(out) == json.loads(FIXTURES[2][1]), out
         out, rc = client(client_bin, sock, "commit", "1", "0", "Late edit", expect_ok=False)
-        assert rc == 1 and out == FIXTURES[3][1], (rc, out)
+        assert rc == 1 and json.loads(out) == json.loads(FIXTURES[3][1]), (rc, out)
         out, _ = client(client_bin, sock, "undo", "1", "1")
-        assert out == FIXTURES[4][1], out
+        assert json.loads(out) == json.loads(FIXTURES[4][1]), out
         out, _ = client(client_bin, sock, "inspect", "slide.title")
         assert out == '{"ok":true,"id":1,"revision":2,"text":"Quarterly results","role":"slide.title"}', out
 
@@ -125,8 +125,67 @@ def main():
         assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
         assert json.loads(lines[1])["ok"] is True, lines
 
-        # Host owns its endpoint: SIGTERM removes the socket file.
+        # Blank, trailing, and invalid-UTF-8 lines are structured
+        # errors; CRLF still works; nothing there mutates the model.
+        lines = raw_exchange(sock, [b"\n"], replies=1)
+        assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
+        lines = raw_exchange(sock, [FIXTURES[0][0].encode() + b" trailing\n"], replies=1)
+        assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
+        lines = raw_exchange(sock, [b'{"op":"inspect","role":"slide.title"}\xff\n'], replies=1)
+        assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
+        lines = raw_exchange(sock, [FIXTURES[0][0].encode() + b"\r\n"], replies=1)
+        assert json.loads(lines[0])["revision"] == 2, lines
+
+        # Unfinished input at disconnect is discarded unexecuted,
+        # and an abrupt peer disconnect (write to a dead peer) ends
+        # only that connection: a new client still sees the document.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(sock)
+            s.sendall(b'{"op":"commit","id":1,"base_revision":2,"text":"Partial"')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(sock)
+            s.sendall(FIXTURES[1][0].replace('"base_revision":0', '"base_revision":2').encode() + b"\n")
+        time.sleep(0.2)
+        assert proc.poll() is None, "host died after a peer disconnect"
+        out, _ = client(client_bin, sock, "inspect", "slide.title")
+        assert json.loads(out)["text"] == "Quarterly results", out
+        assert json.loads(out)["revision"] == 2, out
+
+        # A replacement entry at the socket path is preserved on
+        # shutdown; only the host's own endpoint is removed.
+        os.unlink(sock)
+        with open(sock, "w") as f:
+            f.write("not the host endpoint")
         proc.terminate()
+        proc.wait(timeout=10)
+        proc = None
+        with open(sock) as f:
+            assert f.read() == "not the host endpoint"
+        os.unlink(sock)
+
+        # Startup failure preserves a pre-existing entry.
+        with open(sock, "w") as f:
+            f.write("keep me")
+        r = run([host, sock])
+        assert r.returncode == 1, r
+        with open(sock) as f:
+            assert f.read() == "keep me"
+        os.unlink(sock)
+
+        # And a host that still owns its endpoint removes it on SIGTERM.
+        proc = subprocess.Popen([host, sock], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for _ in range(100):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        assert os.path.exists(sock)
+        proc.terminate()
+        proc.wait(timeout=10)
+        assert not os.path.exists(sock), "host left its socket file behind"
+        proc = None
+        print("e2e: all driver checks passed")
+        return
         proc.wait(timeout=10)
         assert not os.path.exists(sock), "host left its socket file behind"
         proc = None

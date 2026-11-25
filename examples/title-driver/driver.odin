@@ -2,6 +2,7 @@ package title_driver
 
 import "core:encoding/json"
 import "core:strings"
+import "core:unicode/utf8"
 import "dagda:dagda"
 import title_model "dagda:examples/title-model"
 
@@ -115,10 +116,52 @@ get_revision :: proc(obj: json.Object, key: string) -> (dagda.Revision, bool) {
 	return dagda.Revision(id), ok
 }
 
+// single_object reports whether line holds exactly one complete
+// JSON object and nothing else (surrounding whitespace aside).
+single_object :: proc(line: string) -> bool {
+	t := json.make_tokenizer(line, .JSON, true)
+	depth := 0
+	started := false
+	for {
+		token, err := json.get_token(&t)
+		if token.kind == .EOF {
+			return started && depth == 0
+		}
+		if err != .None || token.kind == .Invalid || token.kind == .Ident {
+			return false
+		}
+		if !started {
+			if token.kind != .Open_Brace {
+				return false
+			}
+			started = true
+		} else if depth == 0 {
+			return false // trailing content after the one object
+		}
+		switch token.kind {
+		case .Open_Brace, .Open_Bracket:
+			depth += 1
+		case .Close_Brace, .Close_Bracket:
+			depth -= 1
+			if depth < 0 {
+				return false
+			}
+		case .EOF, .Invalid, .Ident:
+			return false
+		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .String, .Colon, .Comma:
+		}
+	}
+}
+
 // dispatch handles one request line against the supplied model and
 // returns one owned reply line (without newline; caller deletes it).
-// It is transport-independent: no socket code lives here.
+// It is transport-independent: no socket code lives here. Exactly
+// one complete UTF-8 JSON object per line is accepted; anything
+// else is rejected before the model is touched.
 dispatch :: proc(model: ^title_model.Model, line: string) -> string {
+	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) {
+		return reply_error("Malformed_Request")
+	}
 	value, parse_err := json.parse_string(line, .JSON, true)
 	if parse_err != .None {
 		return reply_error("Malformed_Request")
