@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:unicode/utf8"
 import sdl "vendor:sdl3"
 
 foreign import freetype "system:freetype"
@@ -287,6 +288,34 @@ font_measure_width :: proc(font: ^Font, text: string, px_height: f32) -> f32 {
 		width += g.advance_x
 	}
 	return width
+}
+
+// Return the nearest caret in a single left-to-right line of UTF-8 text,
+// as a byte offset on a grapheme boundary (0 through len(text)). At a
+// midpoint the trailing boundary wins. An empty line returns 0.
+//
+// Use the font and px_height passed to font_draw_text. line_x is measured
+// from that call's text origin, in the same units as font_measure_width.
+// Subtract the text origin after converting the pointer to drawing space.
+// If a pane scales the finished drawing, undo that transform first. If it
+// draws at a scaled font size, use that size and the rendered coordinates.
+font_hit_test_caret :: proc(font: ^Font, text: string, px_height, line_x: f32) -> int {
+	if line_x <= 0 || !font.loaded {
+		return 0
+	}
+	left: f32
+	it := utf8.decode_grapheme_iterator_make(text)
+	for {
+		cluster, grapheme, ok := utf8.decode_grapheme_iterate(&it)
+		if !ok {
+			return len(text)
+		}
+		advance := font_measure_width(font, cluster, px_height)
+		if line_x < left + advance * 0.5 {
+			return grapheme.byte_index
+		}
+		left += advance
+	}
 }
 
 font_draw_text :: proc(
