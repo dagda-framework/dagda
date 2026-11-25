@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "dagda:dagda"
+import "dagda:dagda/driver"
 import "dagda:dagda/sdlhost"
 
 HEADLINE_ID :: dagda.Object_Id(1)
@@ -155,6 +156,43 @@ slide_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Actio
 	return false
 }
 
+slide_edits := []dagda.Advertised_Edit{
+	{object_id = HEADLINE_ID, edit = "replace_text", argument = .Text},
+}
+
+// slide_edit_handle is the app-owned replace_text handler: it
+// enforces the headline revision and records exactly one undo
+// entry per accepted replacement, like the keyboard path.
+slide_edit_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+	s := (^Slide_Canvas)(user_data)
+	if target.id != HEADLINE_ID {
+		return .Unknown_Object
+	}
+	if target.base_revision != dagda.Revision(s.headline_rev) {
+		return .Stale_Revision
+	}
+	cloned, err := strings.clone(arg.text)
+	if err != nil {
+		return .Alloc_Failed
+	}
+	if arg.text == s.headline {
+		delete(cloned)
+		return .Not_Handled
+	}
+	append(&s.undo_stack, Undo_Entry{kind = .Headline_Text, text = s.headline})
+	s.headline = cloned
+	s.headline_rev += 1
+	return .Applied
+}
+
+slide_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+	s := (^Slide_Canvas)(user_data)
+	if id != HEADLINE_ID {
+		return 0, false
+	}
+	return dagda.Revision(s.headline_rev), true
+}
+
 slide_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
 	s := (^Slide_Canvas)(user_data)
 	if id != HEADLINE_ID || new_text == s.headline {
@@ -260,6 +298,7 @@ main :: proc() {
 		canvas     = slide_canvas,
 		handle     = slide_handle,
 		on_pointer = slide_pointer,
+		edits      = driver.Edit_Source{edits = slide_edits, handler = slide_edit_handle, user_data = &slide, revision_of = slide_revision},
 		text_edit  = {
 			enabled   = true,
 			target_id = HEADLINE_ID,
