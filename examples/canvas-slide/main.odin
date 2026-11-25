@@ -100,7 +100,7 @@ slide_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Actio
 		return true
 	}
 	if id == UNDO_ID {
-		if len(s.undo_stack) == 0 {
+		if s.gesture != .None || len(s.undo_stack) == 0 {
 			return false
 		}
 		s.card = pop(&s.undo_stack)

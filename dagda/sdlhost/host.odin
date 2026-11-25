@@ -453,6 +453,22 @@ poll_control_stdin :: proc(
 	}
 }
 
+host_clear_pressed_on_cancel :: proc(h: ^Host) {
+	if h.has_pressed {
+		h.has_pressed = false
+		h.pressed_id = 0
+	}
+	h.needs_redraw = true
+}
+
+host_handle_pointer_cancel_event :: proc(h: ^Host, ev: ^sdl.Event) -> (res: Pointer_Result) {
+	res = pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
+	if res.cancelled {
+		host_clear_pressed_on_cancel(h)
+	}
+	return res
+}
+
 run :: proc(app: App, opts: Run_Options = {}) -> int {
 	signal_stopped = false
 	act: posix.sigaction_t
@@ -523,14 +539,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .MOUSE_MOTION:
-					changed, _, consumed := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-					if changed {
+					pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+					if pres.changed {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1
 							running = false
 						}
 					}
-					if running && !consumed {
+					if running && !pres.consumed {
 						id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
 						if hit != h.has_hovered || (hit && id != h.hovered_id) {
 							h.has_hovered = hit
@@ -543,14 +559,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
 						h.has_pressed = hit
 						h.pressed_id = hit ? id : 0
-						changed, suppress_click, _ := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-						if changed {
+						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+						if pres.changed {
 							if !host_rebuild_frame(&h) {
 								exit_code = 1
 								running = false
 							}
 						}
-						if running && !suppress_click {
+						if running && !pres.suppress_click {
 							if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
 								if !host_rebuild_frame(&h) {
 									exit_code = 1
@@ -559,38 +575,40 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							} else {
 								h.needs_redraw = true
 							}
-						} else if running && !changed {
+						} else if running && !pres.changed {
 							h.needs_redraw = true
 						}
 					} else if ev.button.button == sdl.BUTTON_RIGHT && h.pointer.active {
-						changed, _, _ := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-						h.has_pressed = false
-						h.pressed_id = 0
-						if changed {
+						pres := host_handle_pointer_cancel_event(&h, &ev)
+						if pres.changed {
 							if !host_rebuild_frame(&h) {
 								exit_code = 1
 								running = false
 							}
-						} else {
-							h.needs_redraw = true
 						}
 					}
 				case .MOUSE_BUTTON_UP:
 					if ev.button.button == sdl.BUTTON_LEFT {
-						changed, suppress_click, consumed := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
 						if h.has_pressed {
 							h.has_pressed = false
 							h.pressed_id = 0
 							h.needs_redraw = true
 						}
-						if changed {
+						if pres.changed {
 							if !host_rebuild_frame(&h) {
 								exit_code = 1
 								running = false
 							}
 						}
-						if running && consumed && !suppress_click {
-							if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
+						if running && pres.consumed && !pres.suppress_click && pres.has_click_id {
+							if pointer_try_activate(
+								h.frame,
+								{x = ev.button.x, y = ev.button.y},
+								pres.click_target_id,
+								h.app.handle,
+								h.app.user_data,
+							) {
 								if !host_rebuild_frame(&h) {
 									exit_code = 1
 									running = false
@@ -599,16 +617,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						}
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
-					p_changed, _, p_consumed := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-					if p_changed {
-						h.has_pressed = false
-						h.pressed_id = 0
+					pres := host_handle_pointer_cancel_event(&h, &ev)
+					if pres.changed {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1
 							running = false
 						}
 					}
-					if running && !p_consumed {
+					if running && !pres.consumed {
 						applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
 						if redraw {
 							h.needs_redraw = true

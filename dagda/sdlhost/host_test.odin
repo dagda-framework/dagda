@@ -348,24 +348,26 @@ test_canvas_pointer_gestures_delivery_cancel_and_click_preservation :: proc(t: ^
 
 	// Letterbox press (y=20 < offset.y=100) is ignored.
 	ev := btn_ev(.MOUSE_BUTTON_DOWN, sdl.BUTTON_LEFT, 150, 20)
-	changed, suppress, consumed := pointer_handle_event(&p, frame, &ev, record, &rec)
-	testing.expect_value(t, changed, false)
-	testing.expect_value(t, suppress, false)
-	testing.expect_value(t, consumed, false)
+	res := pointer_handle_event(&p, frame, &ev, record, &rec)
+	testing.expect_value(t, res.changed, false)
+	testing.expect_value(t, res.suppress_click, false)
+	testing.expect_value(t, res.consumed, false)
 	testing.expect_value(t, rec.count, 0)
 
-	// Press + Release without motion on ID 0 preserves click (suppress_click=false on release).
+	// Press + Release without motion on ID 0 preserves click with stable ID 0.
 	ev = btn_ev(.MOUSE_BUTTON_DOWN, sdl.BUTTON_LEFT, 150, 180) // canvas (150, 80)
-	changed, suppress, consumed = pointer_handle_event(&p, frame, &ev, record, &rec)
-	testing.expect_value(t, changed, true)
-	testing.expect_value(t, suppress, true)
-	testing.expect_value(t, consumed, true)
+	res = pointer_handle_event(&p, frame, &ev, record, &rec)
+	testing.expect_value(t, res.changed, true)
+	testing.expect_value(t, res.suppress_click, true)
+	testing.expect_value(t, res.consumed, true)
 
 	ev = btn_ev(.MOUSE_BUTTON_UP, sdl.BUTTON_LEFT, 150, 180)
-	changed, suppress, consumed = pointer_handle_event(&p, frame, &ev, record, &rec)
-	testing.expect_value(t, changed, true)
-	testing.expect_value(t, suppress, false) // button activation preserved!
-	testing.expect_value(t, consumed, true)
+	res = pointer_handle_event(&p, frame, &ev, record, &rec)
+	testing.expect_value(t, res.changed, true)
+	testing.expect_value(t, res.suppress_click, false) // button activation preserved!
+	testing.expect_value(t, res.has_click_id, true)
+	testing.expect_value(t, res.click_target_id, dagda.Object_Id(0))
+	testing.expect_value(t, res.consumed, true)
 	testing.expect_value(t, rec.count, 2)
 	testing.expect_value(t, rec.events[0].phase, Pointer_Phase.Press)
 	testing.expect_value(t, rec.events[0].has_target, true)
@@ -377,14 +379,15 @@ test_canvas_pointer_gestures_delivery_cancel_and_click_preservation :: proc(t: ^
 	// Drag on ID 2: multiple moves keep stable target_id=2 even off-element, release suppresses click.
 	rec = {}
 	ev = btn_ev(.MOUSE_BUTTON_DOWN, sdl.BUTTON_LEFT, 450, 200) // canvas (450, 100)
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	ev = mot_ev(470, 215) // canvas (470, 115)
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	ev = mot_ev(700, 350) // canvas (700, 250) - outside card.two
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	ev = btn_ev(.MOUSE_BUTTON_UP, sdl.BUTTON_LEFT, 700, 350)
-	_, suppress, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
-	testing.expect_value(t, suppress, true)
+	res = pointer_handle_event(&p, frame, &ev, record, &rec)
+	testing.expect_value(t, res.suppress_click, true)
+	testing.expect_value(t, res.has_click_id, false)
 	testing.expect_value(t, rec.count, 4)
 	testing.expect_value(t, rec.events[1].phase, Pointer_Phase.Move)
 	testing.expect_value(t, rec.events[1].target_id, dagda.Object_Id(2))
@@ -398,15 +401,16 @@ test_canvas_pointer_gestures_delivery_cancel_and_click_preservation :: proc(t: ^
 	// Escape cancels active gesture with stable target ID and last logical point.
 	rec = {}
 	ev = btn_ev(.MOUSE_BUTTON_DOWN, sdl.BUTTON_LEFT, 450, 200)
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	ev = mot_ev(500, 240) // canvas (500, 140)
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	esc: sdl.Event
 	esc.type = .KEY_DOWN
 	esc.key.key = sdl.K_ESCAPE
-	changed, _, consumed = pointer_handle_event(&p, frame, &esc, record, &rec)
-	testing.expect_value(t, changed, true)
-	testing.expect_value(t, consumed, true)
+	res = pointer_handle_event(&p, frame, &esc, record, &rec)
+	testing.expect_value(t, res.changed, true)
+	testing.expect_value(t, res.cancelled, true)
+	testing.expect_value(t, res.consumed, true)
 	testing.expect_value(t, p.active, false)
 	testing.expect_value(t, rec.count, 3)
 	testing.expect_value(t, rec.events[2].phase, Pointer_Phase.Cancel)
@@ -416,14 +420,158 @@ test_canvas_pointer_gestures_delivery_cancel_and_click_preservation :: proc(t: ^
 	// WINDOW_FOCUS_LOST cancels active gesture without consuming focus event.
 	rec = {}
 	ev = btn_ev(.MOUSE_BUTTON_DOWN, sdl.BUTTON_LEFT, 150, 180)
-	_, _, _ = pointer_handle_event(&p, frame, &ev, record, &rec)
+	_ = pointer_handle_event(&p, frame, &ev, record, &rec)
 	lost: sdl.Event
 	lost.type = .WINDOW_FOCUS_LOST
-	changed, _, consumed = pointer_handle_event(&p, frame, &lost, record, &rec)
-	testing.expect_value(t, changed, true)
-	testing.expect_value(t, consumed, false)
+	res = pointer_handle_event(&p, frame, &lost, record, &rec)
+	testing.expect_value(t, res.changed, true)
+	testing.expect_value(t, res.cancelled, true)
+	testing.expect_value(t, res.consumed, false)
 	testing.expect_value(t, p.active, false)
 	testing.expect_value(t, rec.count, 2)
 	testing.expect_value(t, rec.events[1].phase, Pointer_Phase.Cancel)
 	testing.expect_value(t, rec.events[1].target_id, dagda.Object_Id(0))
+}
+
+@(test)
+test_release_does_not_activate_replacement_button_at_identical_bounds :: proc(t: ^testing.T) {
+	Swap_State :: struct {
+		replaced:  bool,
+		hits_orig: int,
+		hits_new:  int,
+		elements:  [1]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Swap_State) -> dagda.Frame {
+		id := s.replaced ? dagda.Object_Id(9) : dagda.Object_Id(2)
+		s.elements[0] = {
+			info   = {id = id, role = "btn.slot"},
+			kind   = .Button,
+			text   = s.replaced ? "Replacement" : "Original",
+			bounds = {x = 100, y = 100, width = 200, height = 100},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 960, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Swap_State)(user_data)
+		if ev.phase == .Press && ev.has_target && ev.target_id == 2 {
+			// Replace button 2 with button 9 at identical bounds on press.
+			s.replaced = true
+			return true
+		}
+		return false
+	}
+	on_action :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^Swap_State)(user_data)
+		if action != .Activate {
+			return false
+		}
+		if id == 2 {
+			s.hits_orig += 1
+			return true
+		}
+		if id == 9 {
+			s.hits_new += 1
+			return true
+		}
+		return false
+	}
+
+	s: Swap_State
+	frame := make_frame(&s)
+	defer dagda.frame_destroy(&frame)
+
+	p: Pointer_State
+	down: sdl.Event
+	down.type = .MOUSE_BUTTON_DOWN
+	down.button.button = sdl.BUTTON_LEFT
+	down.button.x = 150
+	down.button.y = 150
+	res := pointer_handle_event(&p, frame, &down, on_pointer, &s)
+	testing.expect_value(t, res.changed, true)
+	testing.expect_value(t, s.replaced, true)
+
+	// Host rebuilds frame after press callback swapped button 2 -> button 9 at identical bounds.
+	dagda.frame_destroy(&frame)
+	frame = make_frame(&s)
+
+	up: sdl.Event
+	up.type = .MOUSE_BUTTON_UP
+	up.button.button = sdl.BUTTON_LEFT
+	up.button.x = 150
+	up.button.y = 150
+	res = pointer_handle_event(&p, frame, &up, on_pointer, &s)
+	testing.expect_value(t, res.has_click_id, true)
+	testing.expect_value(t, res.click_target_id, dagda.Object_Id(2))
+
+	// Release must NOT activate replacement button 9 (nor missing button 2).
+	activated := pointer_try_activate(frame, {x = 150, y = 150}, res.click_target_id, on_action, &s)
+	testing.expect_value(t, activated, false)
+	testing.expect_value(t, s.hits_orig, 0)
+	testing.expect_value(t, s.hits_new, 0)
+
+	// Ordinary press+release on button 9 without replacement still activates button 9.
+	res = pointer_handle_event(&p, frame, &down, on_pointer, &s)
+	res = pointer_handle_event(&p, frame, &up, on_pointer, &s)
+	testing.expect_value(t, res.has_click_id, true)
+	testing.expect_value(t, res.click_target_id, dagda.Object_Id(9))
+	activated = pointer_try_activate(frame, {x = 150, y = 150}, res.click_target_id, on_action, &s)
+	testing.expect_value(t, activated, true)
+	testing.expect_value(t, s.hits_new, 1)
+}
+
+@(test)
+test_cancel_clears_pressed_state_and_redraws_even_when_handler_returns_false :: proc(t: ^testing.T) {
+	noop_pointer :: proc(_: rawptr, _: Pointer_Event) -> bool {
+		return false
+	}
+
+	els := [1]dagda.Canvas_Element{
+		{info = {id = 2, role = "card"}, kind = .Button, text = "Card", bounds = {x = 100, y = 100, width = 200, height = 100}},
+	}
+	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, {width = 960, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	h: Host
+	h.frame = frame
+	h.app.on_pointer = noop_pointer
+
+	// Press sets pressed state and starts active gesture.
+	down: sdl.Event
+	down.type = .MOUSE_BUTTON_DOWN
+	down.button.button = sdl.BUTTON_LEFT
+	down.button.x = 150
+	down.button.y = 150
+	h.has_pressed = true
+	h.pressed_id = 2
+	_ = pointer_handle_event(&h.pointer, h.frame, &down, h.app.on_pointer, nil)
+	testing.expect_value(t, h.pointer.active, true)
+
+	// Escape cancels while handler returns false (no document change): pressed cleared + redraw requested.
+	h.needs_redraw = false
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	res := host_handle_pointer_cancel_event(&h, &esc)
+	testing.expect_value(t, res.cancelled, true)
+	testing.expect_value(t, res.changed, false)
+	testing.expect_value(t, h.has_pressed, false)
+	testing.expect_value(t, h.pressed_id, dagda.Object_Id(0))
+	testing.expect_value(t, h.needs_redraw, true)
+
+	// Same check for WINDOW_FOCUS_LOST when cancel handler returns false.
+	h.has_pressed = true
+	h.pressed_id = 2
+	_ = pointer_handle_event(&h.pointer, h.frame, &down, h.app.on_pointer, nil)
+	h.needs_redraw = false
+	lost: sdl.Event
+	lost.type = .WINDOW_FOCUS_LOST
+	res = host_handle_pointer_cancel_event(&h, &lost)
+	testing.expect_value(t, res.cancelled, true)
+	testing.expect_value(t, res.changed, false)
+	testing.expect_value(t, h.has_pressed, false)
+	testing.expect_value(t, h.pressed_id, dagda.Object_Id(0))
+	testing.expect_value(t, h.needs_redraw, true)
 }

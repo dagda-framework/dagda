@@ -410,13 +410,16 @@ def verify_viewport(
         resized_cb = resized["canvas_bounds"]
         wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
 
-        # 7. Cancelled drag (Escape) restores geometry and consumes no undo step.
+        # 7. Second drag: invoke Undo via real dagda-client mid-drag -> rejected without consuming history,
+        # then Escape + button-up restores geometry and consumes no undo step.
         rb = resized["bounds"]
         rcx = rb["x"] + rb["width"] / 2.0
         rcy = rb["y"] + rb["height"] / 2.0
+        end_x = rcx - 50.0 * scale
+        end_y = rcy + 40.0 * scale
         send_control(proc, reader, f"down {rcx:.2f} {rcy:.2f}")
         send_control(proc, reader, f"move {rcx - 25.0 * scale:.2f} {rcy + 20.0 * scale:.2f}")
-        send_control(proc, reader, f"move {rcx - 50.0 * scale:.2f} {rcy + 40.0 * scale:.2f}")
+        send_control(proc, reader, f"move {end_x:.2f} {end_y:.2f}")
         wait_for_card_canvas_bounds(
             client_bin,
             sock,
@@ -427,7 +430,14 @@ def verify_viewport(
                 "height": resized_cb["height"],
             },
         )
+        # Real dagda-client Undo during active drag must be rejected without consuming history.
+        code_mid, mid_undo = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
+        assert code_mid != 0 and mid_undo == {"ok": False, "error": "Not_Handled"}, (code_mid, mid_undo)
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+
+        # Escape cancels the drag, and subsequent button-up is a no-op.
         send_control(proc, reader, "key escape")
+        send_control(proc, reader, f"up {end_x:.2f} {end_y:.2f}")
         restored = wait_for_card_canvas_bounds(client_bin, sock, resized_cb, tol=0.001)
         assert restored["canvas_bounds"] == resized_cb, (restored["canvas_bounds"], resized_cb)
         wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")

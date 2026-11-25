@@ -34,6 +34,16 @@ Pointer_State :: struct {
 	moved:       bool,
 }
 
+// Pointer_Result summarizes how pointer_handle_event processed an SDL event.
+Pointer_Result :: struct {
+	changed:         bool,
+	consumed:        bool,
+	cancelled:       bool,
+	suppress_click:  bool,
+	has_click_id:    bool,
+	click_target_id: dagda.Object_Id,
+}
+
 window_to_canvas_unclamped :: proc(t: dagda.Canvas_Transform, p: dagda.Point) -> (dagda.Point, bool) {
 	if t.scale <= 0 {
 		return {}, false
@@ -62,23 +72,38 @@ pointer_cancel :: proc(
 	return true, changed
 }
 
+// pointer_try_activate activates target_id on release only if the exact same
+// stable element ID is still under the release point and supports .Activate.
+pointer_try_activate :: proc(
+	frame: dagda.Frame,
+	win_p: dagda.Point,
+	target_id: dagda.Object_Id,
+	handler: dagda.Action_Handler,
+	user_data: rawptr,
+) -> bool {
+	hit_id, hit := dagda.hit_test(frame, win_p)
+	if !hit || hit_id != target_id {
+		return false
+	}
+	return dagda.invoke(frame, target_id, .Activate, handler, user_data) == .Applied
+}
+
 // pointer_handle_event translates SDL pointer/cancel events on a canvas frame
 // into Pointer_Event callbacks with a stable target ID and logical canvas
 // coordinates.
 //
-// suppress_click is true when the host should not fire dagda.click for this
-// event (e.g. on press, after a drag moved, or on cancel). When a press and
-// release occur without motion, release returns suppress_click=false so button
-// activation is preserved.
+// On release without motion, Pointer_Result reports has_click_id=true with the
+// originally pressed target's stable ID and suppress_click=false so the host
+// can activate that element only if it is still under the pointer.
 pointer_handle_event :: proc(
 	p: ^Pointer_State,
 	frame: dagda.Frame,
 	ev: ^sdl.Event,
 	handler: Pointer_Handler,
 	user_data: rawptr,
-) -> (changed: bool, suppress_click: bool, consumed: bool) {
+) -> (res: Pointer_Result) {
 	if !frame.has_canvas || handler == nil {
-		return false, false, false
+		return {}
 	}
 
 	#partial switch ev.type {
@@ -87,11 +112,12 @@ pointer_handle_event :: proc(
 			win_p := dagda.Point{x = ev.button.x, y = ev.button.y}
 			canvas_p, in_canvas := dagda.window_point_to_canvas(frame.transform, win_p)
 			if !in_canvas {
-				return false, false, false
+				return {}
 			}
 			if p.active {
-				_, c := pointer_cancel(p, handler, user_data)
-				changed = c
+				cancelled, c := pointer_cancel(p, handler, user_data)
+				res.cancelled = cancelled
+				res.changed = c
 			}
 			id, hit := dagda.hit_test(frame, win_p)
 			p.active = true
@@ -106,34 +132,40 @@ pointer_handle_event :: proc(
 				target_id  = p.target_id,
 				point      = canvas_p,
 			}) {
-				changed = true
+				res.changed = true
 			}
-			return changed, true, true
+			res.suppress_click = true
+			res.consumed = true
+			return res
 		}
 		if ev.button.button == sdl.BUTTON_RIGHT && p.active {
-			_, changed = pointer_cancel(p, handler, user_data)
-			return changed, true, true
+			res.cancelled, res.changed = pointer_cancel(p, handler, user_data)
+			res.suppress_click = true
+			res.consumed = true
+			return res
 		}
 
 	case .MOUSE_MOTION:
 		if !p.active {
-			return false, false, false
+			return {}
 		}
 		canvas_p, ok := window_to_canvas_unclamped(frame.transform, {x = ev.motion.x, y = ev.motion.y})
 		if !ok {
-			return false, false, true
+			res.consumed = true
+			return res
 		}
 		if canvas_p != p.press_point {
 			p.moved = true
 		}
 		p.last_point = canvas_p
-		changed = handler(user_data, {
+		res.changed = handler(user_data, {
 			phase      = .Move,
 			has_target = p.has_target,
 			target_id  = p.target_id,
 			point      = canvas_p,
 		})
-		return changed, false, true
+		res.consumed = true
+		return res
 
 	case .MOUSE_BUTTON_UP:
 		if ev.button.button == sdl.BUTTON_LEFT && p.active {
@@ -145,29 +177,43 @@ pointer_handle_event :: proc(
 				p.moved = true
 			}
 			was_moved := p.moved
+			had_target := p.has_target
+			target_id := p.target_id
 			pe := Pointer_Event{
 				phase      = .Release,
-				has_target = p.has_target,
-				target_id  = p.target_id,
+				has_target = had_target,
+				target_id  = target_id,
 				point      = canvas_p,
 			}
 			p^ = {}
-			changed = handler(user_data, pe)
-			return changed, was_moved, true
+			res.changed = handler(user_data, pe)
+			res.consumed = true
+			if !was_moved && had_target {
+				res.has_click_id = true
+				res.click_target_id = target_id
+				res.suppress_click = false
+			} else {
+				res.suppress_click = true
+			}
+			return res
 		}
 
 	case .KEY_DOWN:
 		if ev.key.key == sdl.K_ESCAPE && p.active {
-			_, changed = pointer_cancel(p, handler, user_data)
-			return changed, true, true
+			res.cancelled, res.changed = pointer_cancel(p, handler, user_data)
+			res.suppress_click = true
+			res.consumed = true
+			return res
 		}
 
 	case .WINDOW_FOCUS_LOST:
 		if p.active {
-			_, changed = pointer_cancel(p, handler, user_data)
-			return changed, true, false
+			res.cancelled, res.changed = pointer_cancel(p, handler, user_data)
+			res.suppress_click = true
+			res.consumed = false
+			return res
 		}
 	}
 
-	return false, false, false
+	return {}
 }
