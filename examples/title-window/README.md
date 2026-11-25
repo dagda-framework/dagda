@@ -1,6 +1,6 @@
 # Dagda SDL3 Title Window (`examples/title-window`)
 
-Linux SDL3 host for the Dagda shared-title milestone. It opens a real SDL3 window showing one editable slide title backed by a local model fixture behind a narrow callback boundary, rendering committed and composing UTF-8 text with real TrueType glyphs via FreeType2.
+Linux SDL3 host for the Dagda shared-title milestone. It opens a real SDL3 window showing one editable slide title backed by `examples/title-model` through a narrow callback boundary, rendering committed and composing UTF-8 text with real TrueType glyphs via FreeType2.
 
 ## Linux dependencies
 
@@ -51,7 +51,7 @@ This opens a real SDL3 window, injects a deterministic sequence of SDL events (s
 
 ## Adapter and integration boundary
 
-- **`Model_Adapter`** (`adapter.odin`): three narrow callbacks (`snapshot`, `commit`, `undo`) plus `ctx: rawptr`. Swap `fixture_adapter(&fixture)` for the shared title model without changing window or editor code.
+- **`Model_Adapter`** (`adapter.odin`, `model_adapter.odin`): three narrow callbacks (`snapshot`, `commit`, `undo`) plus `ctx: rawptr`, wired to one window-thread `examples/title-model` `Model` instance via `title_model_adapter(&model)`. Maps all declared `title_model.Error` failures (`Unknown_Object`, `Stale_Revision`, `Invalid_Text`, `Alloc_Failed`) accurately and preserves borrowed snapshot lifetimes and one-step undo history.
 - **Composition busy gate**: call `window_external_commit_gate(&win)` (or `editor_external_commit_gate(&state)`) before applying an external commit. It returns `.Busy_Composing` while SDL preedit text is active so external callers can receive a retryable busy response.
 - **Unified layout (`compute_title_layout`)**: paints committed text, composing replacement, preedit selection, caret, and the `SDL_SetTextInputArea` candidate anchor from one layout pass.
 - **External model updates**: call `editor_sync_from_model(&win.editor, adapter)` when the model changes externally; it refreshes the snapshot, clamps caret/selection to valid UTF-8 boundaries, marks `needs_redraw`, and preserves `focused`.
