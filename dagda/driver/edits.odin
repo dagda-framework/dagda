@@ -191,12 +191,25 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 		}
 		target := dagda.Action_Target{id = id, base_revision = dagda.Revision(raw_rev)}
 		if op == "preview" {
-			// A successful preview must be based on the app's
-			// current revision, exactly like a commit would be.
-			if source.revision_of != nil {
-				if current, known := source.revision_of(source.user_data, id); known && current != target.base_revision {
-					return edit_error_reply(source, id, .Stale_Revision), false
-				}
+			// Preview uses the same live-object lookup as
+			// discovery: without a revision callback, or for an
+			// unknown ID, the object does not exist here. For a
+			// known ID the revision just read is compared and
+			// is the value reported on a stale reply.
+			if source.revision_of == nil {
+				return reply_error("Unknown_Object"), false
+			}
+			current, known := source.revision_of(source.user_data, id)
+			if !known {
+				return reply_error("Unknown_Object"), false
+			}
+			if current != target.base_revision {
+				b: strings.Builder
+				strings.builder_init(&b)
+				strings.write_string(&b, "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":")
+				strings.write_u64(&b, u64(current))
+				strings.write_byte(&b, '}')
+				return strings.to_string(b), false
 			}
 			preview, result := dagda.preview_edit(source.edits, target, name, arg)
 			if result != .Applied {

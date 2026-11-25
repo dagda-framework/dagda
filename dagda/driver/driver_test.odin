@@ -371,3 +371,33 @@ test_dispatch_edits_wire :: proc(t: ^testing.T) {
 	testing.expect_value(t, doc.title, "Draft")
 	testing.expect_value(t, doc.calls, 2) // commit + stale only; wrong kind never reached it
 }
+
+wire_no_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+	return 0, false
+}
+
+@(test)
+test_preview_unknown_object_cases :: proc(t: ^testing.T) {
+	// An advertised declaration is present for ID 1 in both
+	// cases; preview must still report Unknown_Object when the
+	// live-object lookup cannot vouch for it.
+	doc := Wire_Doc{title = strings.clone("Quarterly results")}
+	defer delete(doc.title)
+	elements := []dagda.Element{{info = {id = 1, role = "doc.title"}, kind = .Label, text = doc.title}}
+	frame, ok := dagda.resolve({elements = elements}, {width = 320, height = 120})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+	edits := []dagda.Advertised_Edit{{object_id = 1, edit = "replace_text", argument = .Text}}
+	request := `{"op":"preview","id":1,"edit":"replace_text","base_revision":0,"argument":{"kind":"text","text":"Draft"}}`
+
+	no_callback := Edit_Source{edits = edits, handler = wire_handle, user_data = &doc}
+	rep, _ := dispatch_edits(frame, nil, nil, no_callback, request)
+	defer delete(rep)
+	testing.expect_value(t, rep, `{"ok":false,"error":"Unknown_Object"}`)
+
+	unknown_id := Edit_Source{edits = edits, handler = wire_handle, user_data = &doc, revision_of = wire_no_revision}
+	rep2, _ := dispatch_edits(frame, nil, nil, unknown_id, request)
+	defer delete(rep2)
+	testing.expect_value(t, rep2, `{"ok":false,"error":"Unknown_Object"}`)
+	testing.expect_value(t, doc.calls, 0)
+}

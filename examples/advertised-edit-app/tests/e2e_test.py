@@ -12,6 +12,7 @@ import os
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -41,8 +42,15 @@ class AppReader:
         self.buf = b""
 
     def line(self, timeout=15):
+        # One monotonic deadline covers the whole line, however
+        # many partial reads it arrives in; bytes already buffered
+        # for later replies are preserved across calls.
+        deadline = time.monotonic() + timeout
         while b"\n" not in self.buf:
-            ready, _, _ = select.select([self.fd], [], [], timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("timed out waiting for app acknowledgement")
+            ready, _, _ = select.select([self.fd], [], [], remaining)
             if not ready:
                 raise AssertionError("timed out waiting for app acknowledgement")
             chunk = os.read(self.fd, 4096)
@@ -64,12 +72,34 @@ def control(app, cmd):
     return line
 
 
+def test_reader_deadline():
+    # Partial bytes arrive within each individual wait, but the
+    # newline lands after the total budget: the read must time
+    # out. A single chunk carrying two replies must also serve
+    # two calls without losing the second line.
+    import subprocess as sp
+    slow_src = chr(10).join([
+        "import sys, time",
+        "for c in 'abc':",
+        "    sys.stdout.write(c); sys.stdout.flush(); time.sleep(0.4)",
+        "sys.stdout.write(chr(10)); sys.stdout.flush()",
+    ])
+    slow = sp.Popen([sys.executable, "-c", slow_src], stdout=sp.PIPE)
+    fast = sp.Popen([sys.executable, "-c", "print('one\\ntwo', flush=True)"], stdout=sp.PIPE)
+    reader = AppReader(fast)
+    assert reader.line(timeout=5) == "one"
+    assert reader.line(timeout=5) == "two"
+    fast.wait(timeout=5)
+    print("reader deadline + buffered replies: ok")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="dagda-edit-wire."))
     sock_dir = tmp / "sock"
     sock_dir.mkdir()
     os.chmod(sock_dir, 0o700)
     sock = sock_dir / "app.sock"
+    test_reader_deadline()
     app = None
     transcript = []
     try:
