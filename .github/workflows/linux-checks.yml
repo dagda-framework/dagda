@@ -53,6 +53,12 @@ jobs:
       - name: Run the advertised edits end-to-end test
         run: python3 examples/advertised-edit-app/tests/e2e_test.py
 
+      - name: Run the rect edits window test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/rect-app/tests/e2e_rect_edits.py
+
       - name: Run the native counter acceptance test
         env:
           SDL_VIDEODRIVER: dummy
