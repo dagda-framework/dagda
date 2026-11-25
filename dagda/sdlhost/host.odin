@@ -25,6 +25,15 @@ App :: struct {
 	canvas:     Canvas_Proc,
 	handle:     dagda.Action_Handler,
 	on_pointer: Pointer_Handler,
+	// Optional advertised-edit source for the --socket endpoint.
+	// When its handler is set, edits / preview / commit requests
+	// dispatch through it; when omitted, the endpoint keeps its
+	// existing inspect / invoke behavior only. The app owns its
+	// revisions, mutation policy, and undo history.
+	edits: driver.Edit_Source,
+	// Optional Ctrl+Z undo hook, called on the host thread. It
+	// returns true when the app actually undid something.
+	on_undo: proc(user_data: rawptr) -> bool,
 }
 
 Run_Options :: struct {
@@ -303,6 +312,9 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		key = sdl.K_SPACE
 	case "escape":
 		key = sdl.K_ESCAPE
+	case "ctrl+z":
+		key = sdl.K_Z
+		mod = sdl.KMOD_LCTRL
 	case:
 		return false
 	}
@@ -530,6 +542,18 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
+				if ev.type == .KEY_DOWN && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && h.app.on_undo != nil {
+					if h.app.on_undo(h.app.user_data) {
+						if !host_rebuild_frame(&h) {
+							exit_code = 1
+							running = false
+						}
+					}
+					if !running || !sdl.PollEvent(&ev) {
+						break
+					}
+					continue
+				}
 				#partial switch ev.type {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
 					running = false
@@ -644,7 +668,12 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 
 		if running && srv.active {
-			applied, rebuild_failed := driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb)
+			applied, rebuild_failed: bool
+			if h.app.edits.handler != nil {
+				applied, rebuild_failed = driver.server_poll_edits(&srv, &h.frame, h.app.handle, h.app.user_data, h.app.edits, &h, host_rebuild_cb)
+			} else {
+				applied, rebuild_failed = driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb)
+			}
 			if rebuild_failed {
 				exit_code = 1
 				running = false
