@@ -1,5 +1,6 @@
 package dagda
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -158,4 +159,77 @@ test_advertised_edits_rejections_untouched :: proc(t: ^testing.T) {
 	testing.expect_value(t, doc.title_rev, Revision(0))
 	testing.expect(t, !doc.has_title_hist)
 	testing.expect(t, !doc_undo(&doc, 1))
+}
+
+Budget_State :: struct {
+	backing: mem.Allocator,
+	allowed: int,
+}
+
+budget_alloc_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	state := (^Budget_State)(data)
+	if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+		if state.allowed <= 0 {
+			return nil, .Out_Of_Memory
+		}
+		state.allowed -= 1
+	}
+	return state.backing.procedure(state.backing.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+@(test)
+test_preview_owns_name_and_text :: proc(t: ^testing.T) {
+	name_buf := []u8{'r', 'e', 'p', 'l', 'a', 'c', 'e', '_', 't', 'e', 'x', 't'}
+	text_buf := []u8{'D', 'r', 'a', 'f', 't'}
+	edits := []Advertised_Edit{{object_id = 1, edit = string(name_buf), argument = .Text}}
+	preview, result := preview_edit(edits, {id = 1, base_revision = 0}, string(name_buf), argument_text(string(text_buf)))
+	testing.expect_value(t, result, Edit_Result.Applied)
+	defer preview_destroy(&preview)
+	// Reusing both source buffers preserves the entire preview.
+	for &b in name_buf { b = 'x' }
+	for &b in text_buf { b = 'y' }
+	testing.expect_value(t, preview.edit, "replace_text")
+	testing.expect_value(t, preview.argument.text, "Draft")
+
+	// A failure after the name clone releases it (leak-checked
+	// by the test runner): only one allocation is allowed.
+	state := Budget_State{backing = context.allocator, allowed = 1}
+	allocator := mem.Allocator{procedure = budget_alloc_proc, data = &state}
+	static_edits := []Advertised_Edit{{object_id = 1, edit = "replace_text", argument = .Text}}
+	_, fail_result := preview_edit(static_edits, {id = 1, base_revision = 0}, "replace_text", argument_text("Hello"), allocator)
+	testing.expect_value(t, fail_result, Edit_Result.Alloc_Failed)
+}
+
+@(test)
+test_duplicate_declaration_first_wins :: proc(t: ^testing.T) {
+	doc: Test_Doc
+	doc_init(&doc)
+	defer doc_destroy(&doc)
+	edits := []Advertised_Edit{
+		{object_id = 1, edit = "replace_text", argument = .Text},
+		{object_id = 1, edit = "replace_text", argument = .Rect}, // conflicting duplicate: ignored
+		{object_id = 2, edit = "replace_text", argument = .Text}, // same name, other object: separate
+		{object_id = 2, edit = "set_rect", argument = .Rect},
+	}
+	// Discovery, lookup, preview, and commit all see the first
+	// declaration for (1, "replace_text"): Text, not Rect.
+	out: [2]Advertised_Edit
+	written, total := edits_for(edits, 1, out[:])
+	testing.expect_value(t, written, 1)
+	testing.expect_value(t, total, 1)
+	testing.expect_value(t, out[0].argument, Edit_Argument_Kind.Text)
+	found, ok := find_edit(edits, 1, "replace_text")
+	testing.expect(t, ok)
+	testing.expect_value(t, found.argument, Edit_Argument_Kind.Text)
+	_, wrong := preview_edit(edits, {id = 1, base_revision = 0}, "replace_text", argument_rect({width = 1, height = 1}))
+	testing.expect_value(t, wrong, Edit_Result.Wrong_Argument)
+	testing.expect_value(t, commit_edit(edits, {id = 1, base_revision = 0}, "replace_text", argument_text("First wins"), doc_handle, &doc), Edit_Result.Applied)
+	testing.expect_value(t, doc.title, "First wins")
+
+	// The same name on object 2 resolves to its own declaration.
+	found2, ok2 := find_edit(edits, 2, "replace_text")
+	testing.expect(t, ok2)
+	testing.expect_value(t, found2.object_id, Object_Id(2))
+	written, total = edits_for(edits, 2, out[:])
+	testing.expect_value(t, total, 2)
 }

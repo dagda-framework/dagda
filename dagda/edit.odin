@@ -39,6 +39,12 @@ argument_rect :: proc(rect: Rect) -> Edit_Argument {
 
 // One advertised edit. edit is the app-chosen name (for example
 // "replace_text" or "set_rect"); strings are borrowed from the app.
+//
+// Duplicate rule: at most one declaration counts per
+// (object_id, edit name). When an app declares the same pair
+// twice, the first declaration wins and later ones are ignored
+// consistently by discovery, lookup, preview, and commit. The
+// same edit name on a different object is a separate declaration.
 Advertised_Edit :: struct {
 	object_id: Object_Id,
 	edit:      string,
@@ -46,17 +52,28 @@ Advertised_Edit :: struct {
 }
 
 // edits_for writes the edits advertised for one object into out
-// in declaration order and returns how many were written plus
-// the total advertised for that object.
+// in declaration order (first declaration per edit name) and
+// returns how many were written plus the total for that object.
 edits_for :: proc(edits: []Advertised_Edit, id: Object_Id, out: []Advertised_Edit) -> (written: int, total: int) {
-	for edit in edits {
-		if edit.object_id == id {
-			if written < len(out) {
-				out[written] = edit
-				written += 1
-			}
-			total += 1
+	for edit, i in edits {
+		if edit.object_id != id {
+			continue
 		}
+		duplicate := false
+		for prev in edits[:i] {
+			if prev.object_id == id && prev.edit == edit.edit {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		if written < len(out) {
+			out[written] = edit
+			written += 1
+		}
+		total += 1
 	}
 	return written, total
 }
@@ -80,17 +97,19 @@ Edit_Result :: enum {
 	Not_Handled,
 }
 
-// An owned preview of a proposed edit: the validated argument,
-// copied so the caller may reuse its buffers immediately. It
-// changes no app state; release it with preview_destroy.
+// An owned preview of a proposed edit: both the edit name and
+// the text payload are copied, so the caller may reuse all of
+// its source buffers immediately. It changes no app state;
+// release it with preview_destroy.
 Edit_Preview :: struct {
 	target:    Action_Target,
-	edit:      string,
+	edit:      string, // owned by the preview
 	argument:  Edit_Argument, // text owned when kind is Text
 	allocator: mem.Allocator,
 }
 
 preview_destroy :: proc(preview: ^Edit_Preview) {
+	delete(preview.edit, preview.allocator)
 	if preview.argument.kind == .Text {
 		delete(preview.argument.text, preview.allocator)
 	}
@@ -122,10 +141,17 @@ preview_edit :: proc(edits: []Advertised_Edit, target: Action_Target, name: stri
 	if validation != .Applied {
 		return {}, validation
 	}
-	preview := Edit_Preview{target = target, edit = advertised.edit, argument = arg, allocator = allocator}
+	// Own the edit name first; if the text clone then fails,
+	// release the name so a partway failure owns nothing.
+	name_clone, name_err := strings.clone(advertised.edit, allocator)
+	if name_err != nil || len(name_clone) != len(advertised.edit) {
+		return {}, .Alloc_Failed
+	}
+	preview := Edit_Preview{target = target, edit = name_clone, argument = arg, allocator = allocator}
 	if arg.kind == .Text {
 		cloned, err := strings.clone(arg.text, allocator)
 		if err != nil || len(cloned) != len(arg.text) {
+			delete(name_clone, allocator)
 			return {}, .Alloc_Failed
 		}
 		preview.argument.text = cloned
