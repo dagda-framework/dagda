@@ -207,3 +207,95 @@ test_invalid_text_rejected :: proc(t: ^testing.T) {
 	testing.expect_value(t, snap.text, "Quarterly results")
 	testing.expect_value(t, snap.revision, dagda.Revision(0))
 }
+
+Recorder :: struct {
+	count:     int,
+	kinds:     [8]Change_Kind,
+	revisions: [8]dagda.Revision,
+	texts:     [8][64]u8,
+	text_lens: [8]int,
+	ids:       [8]dagda.Object_Id,
+}
+
+record_change :: proc(user_data: rawptr, kind: Change_Kind, snap: Snapshot) {
+	r := (^Recorder)(user_data)
+	i := r.count
+	r.count += 1
+	if i >= len(r.kinds) {
+		return
+	}
+	r.kinds[i] = kind
+	r.revisions[i] = snap.revision
+	r.ids[i] = snap.object.id
+	r.text_lens[i] = len(snap.text)
+	copy(r.texts[i][:], snap.text) // borrowed text: copy to keep
+}
+
+recorded_text :: proc(r: ^Recorder, i: int) -> string {
+	return string(r.texts[i][:r.text_lens[i]])
+}
+
+@(test)
+test_change_events_sequence :: proc(t: ^testing.T) {
+	model := make_model(t) // title #1, "Quarterly results", revision 0
+	defer destroy(&model)
+	rec: Recorder
+	set_observer(&model, record_change, &rec)
+
+	// Preview emits nothing.
+	p, err := preview(&model, target_at(&model), "Revenue grew")
+	testing.expect_value(t, err, Error.None)
+	preview_destroy(&p)
+	testing.expect_value(t, rec.count, 0)
+
+	// One real commit emits one commit event at revision 1.
+	rev0 := target_at(&model)
+	testing.expect_value(t, commit(&model, rev0, "Revenue grew"), Error.None)
+	testing.expect_value(t, rec.count, 1)
+	testing.expect_value(t, rec.kinds[0], Change_Kind.Commit)
+	testing.expect_value(t, rec.revisions[0], dagda.Revision(1))
+	testing.expect_value(t, rec.ids[0], dagda.Object_Id(1))
+	testing.expect_value(t, recorded_text(&rec, 0), "Revenue grew")
+
+	// Repeating the commit (no-op) and a stale edit emit nothing.
+	testing.expect_value(t, commit(&model, target_at(&model), "Revenue grew"), Error.None)
+	testing.expect_value(t, commit(&model, rev0, "Stale edit"), Error.Stale_Revision)
+	testing.expect_value(t, rec.count, 1)
+
+	// Undo emits one undo event at revision 2 with the old text.
+	testing.expect(t, undo(&model))
+	testing.expect_value(t, rec.count, 2)
+	testing.expect_value(t, rec.kinds[1], Change_Kind.Undo)
+	testing.expect_value(t, rec.revisions[1], dagda.Revision(2))
+	testing.expect_value(t, recorded_text(&rec, 1), "Quarterly results")
+
+	// Empty undo emits nothing.
+	testing.expect(t, !undo(&model))
+	testing.expect_value(t, rec.count, 2)
+}
+
+@(test)
+test_change_events_failed_edits_and_detach :: proc(t: ^testing.T) {
+	model := make_model(t)
+	defer destroy(&model)
+	rec: Recorder
+	set_observer(&model, record_change, &rec)
+	snap := snapshot(&model)
+
+	// Failed edits emit nothing.
+	bad_id := dagda.Action_Target{id = 99, base_revision = snap.revision}
+	testing.expect_value(t, commit(&model, bad_id, "X"), Error.Unknown_Object)
+	stale := dagda.Action_Target{id = snap.object.id, base_revision = snap.revision + 1}
+	testing.expect_value(t, commit(&model, stale, "X"), Error.Stale_Revision)
+	testing.expect_value(t, commit(&model, target_at(&model), "\xff\xfe"), Error.Invalid_Text)
+	_, preview_err := preview(&model, stale, "X")
+	testing.expect_value(t, preview_err, Error.Stale_Revision)
+	testing.expect_value(t, rec.count, 0)
+
+	// After detaching, a real commit and undo emit nothing.
+	clear_observer(&model)
+	testing.expect_value(t, commit(&model, target_at(&model), "Revenue grew"), Error.None)
+	testing.expect(t, undo(&model))
+	testing.expect_value(t, rec.count, 0)
+	testing.expect_value(t, snapshot(&model).revision, dagda.Revision(2))
+}

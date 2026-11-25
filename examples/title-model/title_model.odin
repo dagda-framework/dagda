@@ -12,17 +12,54 @@ Error :: enum {
 	Alloc_Failed,
 }
 
+Change_Kind :: enum {
+	Commit,
+	Undo,
+}
+
+// Change observer, called synchronously on the model-owner thread
+// exactly once after a commit or undo has advanced the revision.
+// The snapshot passed to the callback borrows the model's text:
+// it stays valid only until the next successful mutation or
+// destroy, so copy anything worth keeping. The observer must
+// not mutate the model (commit, undo, set_observer, destroy)
+// from inside its callback.
+Observer :: #type proc(user_data: rawptr, kind: Change_Kind, snap: Snapshot)
+
 // One title with a stable ID, an owned semantic role and
 // document-owned UTF-8 text. Storage is owned by the model
 // for its whole lifetime; call destroy to release it.
 Model :: struct {
-	object:      dagda.Object_Info,
-	revision:    dagda.Revision,
-	allocator:   mem.Allocator,
-	role:        []u8,
-	text:        []u8,
-	history:     []u8,
-	has_history: bool,
+	object:        dagda.Object_Info,
+	revision:      dagda.Revision,
+	allocator:     mem.Allocator,
+	role:          []u8,
+	text:          []u8,
+	history:       []u8,
+	has_history:   bool,
+	observer:      Observer,
+	observer_data: rawptr,
+	has_observer:  bool,
+}
+
+// set_observer attaches (or replaces) the single change observer.
+set_observer :: proc(model: ^Model, observer: Observer, user_data: rawptr = nil) {
+	model.observer = observer
+	model.observer_data = user_data
+	model.has_observer = observer != nil
+}
+
+// clear_observer detaches the observer, if any.
+clear_observer :: proc(model: ^Model) {
+	model.observer = nil
+	model.observer_data = nil
+	model.has_observer = false
+}
+
+notify_change :: proc(model: ^Model, kind: Change_Kind) {
+	if model.has_observer {
+		model.observer(model.observer_data, kind, snapshot(model))
+	}
 }
 
 // Borrowed view of the committed title. text stays valid until the
@@ -153,6 +190,7 @@ commit :: proc(model: ^Model, target: dagda.Action_Target, new_text: string) -> 
 	model.has_history = true
 	model.text = storage
 	model.revision += 1
+	notify_change(model, .Commit)
 	return .None
 }
 
@@ -168,5 +206,6 @@ undo :: proc(model: ^Model) -> (changed: bool) {
 	model.history = nil
 	model.has_history = false
 	model.revision += 1
+	notify_change(model, .Undo)
 	return true
 }
