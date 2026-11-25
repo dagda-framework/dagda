@@ -195,8 +195,8 @@ host_draw :: proc(h: ^Host) {
 		}
 		switch el.kind {
 		case .Label:
-			if h.app.text_edit.enabled && el.info.id == h.app.text_edit.target_id {
-				text_edit_draw(h, el.bounds, el.text, h.text_edit.focused)
+			if text_edit_is_target(h.app.text_edit, el.info.id) {
+				text_edit_draw(h, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id)
 			} else {
 				px := max(24 * text_scale, 12)
 				sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
@@ -698,9 +698,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					if ev.button.button == sdl.BUTTON_LEFT {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
 						if h.app.text_edit.enabled {
-							if hit && id == h.app.text_edit.target_id {
+							if hit && text_edit_is_target(h.app.text_edit, id) {
 								_ = focus_clear(&h.focus)
-								if text_edit_click(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.button.x) {
+								if text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x) {
 									h.needs_redraw = true
 								}
 							} else if text_edit_blur(&h.text_edit, h.ime_window) {

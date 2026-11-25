@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""End-to-end test for two distinct single-line elements editing one shared string."""
+
+import json
+import math
+import os
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+ODIN = ROOT / "scripts" / "odin.sh"
+
+CARET_AMBER_RGB = (255, 206, 84)
+PREEDIT_BG_RGB = (62, 78, 118)
+SEL_BG_RGB = (58, 108, 190)
+
+
+class DeadlineLineReader:
+    def __init__(self, stream) -> None:
+        self.fd = stream.fileno()
+        self.buf = bytearray()
+
+    def read_line(self, stage: str, timeout: float = 5.0) -> str:
+        deadline = time.monotonic() + timeout
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                raw = bytes(self.buf[:nl])
+                del self.buf[: nl + 1]
+                return raw.decode("utf-8").rstrip("\r")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out after {timeout:.2f}s waiting for complete line during {stage} "
+                    f"(partial={bytes(self.buf)!r})"
+                )
+            ready, _, _ = select.select([self.fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                raise AssertionError(f"unexpected EOF during {stage} (partial={bytes(self.buf)!r})")
+            self.buf.extend(chunk)
+
+
+def stop_process(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    return b if pb <= pc else c
+
+
+def decode_png_rgb(path: Path) -> tuple[int, int, bytearray]:
+    data = path.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", f"invalid PNG signature in {path}"
+    pos = 8
+    w = h = bit_depth = color_type = 0
+    idat = bytearray()
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        ctype = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if ctype == b"IHDR":
+            w, h, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", chunk)
+        elif ctype == b"IDAT":
+            idat.extend(chunk)
+        elif ctype == b"IEND":
+            break
+    assert bit_depth == 8 and color_type in (2, 6), (bit_depth, color_type)
+    bpp = 3 if color_type == 2 else 4
+    raw = zlib.decompress(bytes(idat))
+    stride = w * bpp
+    recon = bytearray(h * stride)
+    for y in range(h):
+        ftype = raw[y * (stride + 1)]
+        row_in = raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)]
+        row_out = y * stride
+        prev_out = (y - 1) * stride
+        for i in range(stride):
+            x = row_in[i]
+            a = recon[row_out + i - bpp] if i >= bpp else 0
+            b = recon[prev_out + i] if y > 0 else 0
+            c = recon[prev_out + i - bpp] if (y > 0 and i >= bpp) else 0
+            if ftype == 0:
+                v = x
+            elif ftype == 1:
+                v = (x + a) & 0xFF
+            elif ftype == 2:
+                v = (x + b) & 0xFF
+            elif ftype == 3:
+                v = (x + ((a + b) >> 1)) & 0xFF
+            elif ftype == 4:
+                v = (x + paeth(a, b, c)) & 0xFF
+            else:
+                raise AssertionError(f"unsupported PNG filter {ftype}")
+            recon[row_out + i] = v
+    rgb = bytearray(w * h * 3)
+    if bpp == 3:
+        rgb[:] = recon
+    else:
+        for i in range(w * h):
+            rgb[i * 3 : i * 3 + 3] = recon[i * 4 : i * 4 + 3]
+    return w, h, rgb
+
+
+def rgb_close(p: tuple[int, int, int], target: tuple[int, int, int], tol: int = 8) -> bool:
+    return abs(p[0] - target[0]) <= tol and abs(p[1] - target[1]) <= tol and abs(p[2] - target[2]) <= tol
+
+
+def rect_crop_bytes(w: int, h: int, rgb: bytearray, bounds: dict) -> bytes:
+    x0 = max(0, int(math.floor(bounds["x"])))
+    y0 = max(0, int(math.floor(bounds["y"])))
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])))
+    y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])))
+    out = bytearray()
+    for y in range(y0, y1):
+        off = y * w * 3
+        out.extend(rgb[off + x0 * 3 : off + x1 * 3])
+    return bytes(out)
+
+
+def inspect_visual_state(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[int, int, int]:
+    """Return (preedit_bg_hits, sel_bg_hits, max_amber_row_width) inside bounds."""
+    x0 = max(0, int(math.floor(bounds["x"])))
+    y0 = max(0, int(math.floor(bounds["y"])))
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])))
+    y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])))
+    preedit_bg_hits = 0
+    sel_bg_hits = 0
+    max_amber_row_width = 0
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        row_amber = 0
+        for x in range(x0, x1):
+            px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
+            if rgb_close(px, PREEDIT_BG_RGB):
+                preedit_bg_hits += 1
+            elif rgb_close(px, SEL_BG_RGB):
+                sel_bg_hits += 1
+            elif rgb_close(px, CARET_AMBER_RGB):
+                row_amber += 1
+        if row_amber > max_amber_row_width:
+            max_amber_row_width = row_amber
+    return preedit_bg_hits, sel_bg_hits, max_amber_row_width
+
+
+def run_client(client_bin: Path, sock: Path, *args: str) -> tuple[int, dict]:
+    proc = subprocess.run(
+        [str(client_bin), str(sock), *args],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    line = proc.stdout.strip()
+    assert line, f"empty stdout from dagda-client {args}: stderr={proc.stderr!r}"
+    return proc.returncode, json.loads(line)
+
+
+def send_control(win_proc: subprocess.Popen, reader: DeadlineLineReader, cmd: str) -> str:
+    assert win_proc.stdin is not None
+    win_proc.stdin.write((cmd + "\n").encode("utf-8"))
+    win_proc.stdin.flush()
+    resp = reader.read_line(f"control {cmd!r}", timeout=5.0)
+    assert resp.startswith("CONTROL_OK"), f"control {cmd!r} failed: {resp!r}"
+    return resp
+
+
+def wait_for_role_text(client_bin: Path, sock: Path, role: str, expected: str, timeout: float = 3.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        code, resp = run_client(client_bin, sock, "inspect", role)
+        last = (code, resp)
+        if code == 0 and resp.get("ok") is True and resp["elements"][0]["text"] == expected:
+            return resp
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {role} == {expected!r}; last={last}")
+
+
+def main() -> int:
+    capture_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build" / "shared-text-capture"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
+    build_dir = ROOT / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    app_bin = build_dir / "shared-text"
+    client_bin = build_dir / "dagda-client"
+
+    subprocess.check_call([str(ODIN), "build", "examples/shared-text", "-collection:dagda=.", f"-out:{app_bin}"], cwd=ROOT)
+    subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
+
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-shared-text."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line("shared-text startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # Initial capture to let any compositor map/resize settle.
+        init_png = capture_dir / "00-init.png"
+        send_control(proc, reader, f"screenshot {init_png}")
+        png_w, png_h, rgb0 = decode_png_rgb(init_png)
+
+        code1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        code2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        assert code1 == 0 and code2 == 0
+        el1 = el1_resp["elements"][0]
+        el2 = el2_resp["elements"][0]
+        assert el1["id"] == 1 and el2["id"] == 2 and el1["text"] == "Slide Title" and el2["text"] == "Slide Title"
+        b1, b2 = el1["bounds"], el2["bounds"]
+        el1_before = rect_crop_bytes(png_w, png_h, rgb0, b1)
+        el2_before = rect_crop_bytes(png_w, png_h, rgb0, b2)
+
+        # 1. Click inside first element (before text origin -> grapheme boundary 0) and insert "A".
+        y1 = b1["y"] + b1["height"] * 0.5
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "text A")
+        wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1")
+
+        # Verify BOTH elements redrew visually with the edit.
+        after_first_png = capture_dir / "01-after-first-edit.png"
+        send_control(proc, reader, f"screenshot {after_first_png}")
+        w1, h1, rgb1 = decode_png_rgb(after_first_png)
+        assert (w1, h1) == (png_w, png_h)
+        assert rect_crop_bytes(w1, h1, rgb1, b1) != el1_before, "outline.title did not redraw"
+        assert rect_crop_bytes(w1, h1, rgb1, b2) != el2_before, "canvas.title did not redraw"
+
+        # 2. Click at a different position in the second element (near end), select "Title", start preedit "e".
+        y2 = b2["y"] + b2["height"] * 0.5
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        for _ in range(5):
+            send_control(proc, reader, "key shift+left")
+        send_control(proc, reader, "preedit e")
+
+        preedit_png = capture_dir / "02-second-preedit.png"
+        deadline = time.monotonic() + 2.0
+        pre2_bg = uline2_w = 0
+        while True:
+            send_control(proc, reader, f"screenshot {preedit_png}")
+            wp, hp, rgbp = decode_png_rgb(preedit_png)
+            pre1_bg, sel1_bg, amber1_w = inspect_visual_state(wp, hp, rgbp, b1)
+            pre2_bg, sel2_bg, amber2_w = inspect_visual_state(wp, hp, rgbp, b2)
+            if (
+                pre2_bg >= 50
+                and amber2_w >= 6
+                and sel2_bg == 0
+                and pre1_bg == 0
+                and sel1_bg == 0
+                and amber1_w == 0
+            ):
+                uline2_w = amber2_w
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"preedit isolation check failed in {preedit_png}: "
+                    f"el1=(pre={pre1_bg},sel={sel1_bg},amber_w={amber1_w}) "
+                    f"el2=(pre={pre2_bg},sel={sel2_bg},amber_w={amber2_w})"
+                )
+            time.sleep(0.02)
+
+        # Revision and committed text are still untouched during preedit.
+        wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1")
+
+        # 3. Commit once (Enter swallowed + TEXT_INPUT "é") -> both elements show "ASlide é", last_id=2.
+        send_control(proc, reader, "key enter")
+        send_control(proc, reader, "text é")
+        wait_for_role_text(client_bin, sock, "outline.title", "ASlide é")
+        wait_for_role_text(client_bin, sock, "canvas.title", "ASlide é")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2")
+
+        # 4. Undo once (Ctrl+Z) -> both elements restore "ASlide Title", rev=3, undo=1, last_id=2.
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2")
+
+        print(
+            f"[shared-text] requested=800x540 captured={png_w}x{png_h}: "
+            f"el1_insert('ASlide Title',rev=1,id=1) -> "
+            f"el2_preedit(bg={pre2_bg},uline_w={uline2_w},el1_isolated=true) -> "
+            f"commit('ASlide é',rev=2,id=2) -> undo('ASlide Title',rev=3,undo=1,id=2)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+        print("All shared-text checks passed.")
+        return 0
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

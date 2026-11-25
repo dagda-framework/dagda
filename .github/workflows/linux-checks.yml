@@ -76,6 +76,12 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/canvas-slide/tests/acceptance_test.py build/canvas-capture
 
+      - name: Run the shared-text multi-element test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/shared-text/tests/e2e_shared_text.py build/shared-text-capture
+
       - name: Run the title edit conflict test
         env:
           SDL_VIDEODRIVER: dummy
