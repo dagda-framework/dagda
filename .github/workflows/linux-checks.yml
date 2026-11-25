@@ -1,0 +1,46 @@
+name: Linux checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  linux-checks:
+    name: Linux x86_64 checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install SDL3, FreeType, and a font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsdl3-dev libfreetype-dev fonts-liberation
+
+      - name: Install the pinned Odin compiler
+        run: bash scripts/setup-odin.sh
+
+      - name: Run the Odin test suites
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          ./scripts/odin.sh test dagda -collection:dagda=.
+          ./scripts/odin.sh test examples/title-model -collection:dagda=.
+          ./scripts/odin.sh test examples/title-driver -collection:dagda=.
+          ./scripts/odin.sh test examples/title-window -collection:dagda=.
+
+      - name: Build the title window
+        run: |
+          mkdir -p build
+          ./scripts/odin.sh build examples/title-window -collection:dagda=. -out:build/title-window
+
+      - name: Check the shared-title example output
+        run: |
+          ./scripts/odin.sh run examples/shared-title -collection:dagda=. > actual.txt
+          awk '/^```text$/{flag=1; next} /^```$/{if (flag) exit} flag' README.md > expected.txt
+          diff -u expected.txt actual.txt
+
+      - name: Run the title driver end-to-end test
+        run: python3 examples/title-driver/tests/e2e_test.py
