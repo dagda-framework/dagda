@@ -74,6 +74,76 @@ reply_error :: proc(name: string, revision: ^dagda.Revision = nil) -> string {
 	return strings.to_string(b)
 }
 
+// format_change_event encodes one committed model change as a single-line JSON
+// event object (without trailing newline; caller deletes the returned string).
+format_change_event :: proc(kind: title_model.Change_Kind, snap: title_model.Snapshot) -> string {
+	b: strings.Builder
+	strings.builder_init(&b)
+	strings.write_string(&b, "{\"event\":")
+	switch kind {
+	case .Commit:
+		write_json_string(&b, "commit")
+	case .Undo:
+		write_json_string(&b, "undo")
+	}
+	strings.write_string(&b, ",\"id\":")
+	strings.write_u64(&b, u64(snap.object.id))
+	strings.write_string(&b, ",\"revision\":")
+	strings.write_u64(&b, u64(snap.revision))
+	strings.write_string(&b, ",\"text\":")
+	write_json_string(&b, snap.text)
+	strings.write_byte(&b, '}')
+	return strings.to_string(b)
+}
+
+Watch_Result :: struct {
+	is_watch:   bool,
+	subscribed: bool,
+	id:         dagda.Object_Id,
+	reply:      string, // owned when is_watch == true; caller deletes it
+}
+
+// try_watch checks whether line is a {"op":"watch","role":"..."} request.
+// When is_watch is true, reply holds either the initial inspect snapshot
+// (subscribed == true) or an error reply (subscribed == false).
+try_watch :: proc(model: ^title_model.Model, line: string) -> Watch_Result {
+	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) || !id_fields_in_range(line) {
+		return {}
+	}
+	value, parse_err := json.parse_string(line, .JSON, true)
+	if parse_err != .None {
+		return {}
+	}
+	defer json.destroy_value(value)
+
+	obj, is_obj := value.(json.Object)
+	if !is_obj {
+		return {}
+	}
+	op, has_op := get_string(obj, "op")
+	if !has_op || op != "watch" {
+		return {}
+	}
+
+	role, ok := get_string(obj, "role")
+	if !ok {
+		return {is_watch = true, reply = reply_error("Malformed_Request")}
+	}
+	snap := title_model.snapshot(model)
+	objects := [1]dagda.Object_Info{snap.object}
+	ids: [1]dagda.Object_Id
+	written, total := dagda.find_by_role(objects[:], role, ids[:])
+	if total == 0 || written == 0 {
+		return {is_watch = true, reply = reply_error("Unknown_Role")}
+	}
+	return {
+		is_watch   = true,
+		subscribed = true,
+		id         = snap.object.id,
+		reply      = reply_success(snap.object.id, snap.revision, snap.text, role = snap.object.role, is_inspect = true),
+	}
+}
+
 error_name :: proc(err: title_model.Error) -> string {
 	switch err {
 	case .Unknown_Object:
