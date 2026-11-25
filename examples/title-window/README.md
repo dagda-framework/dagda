@@ -26,9 +26,28 @@ bash scripts/setup-odin.sh
 mkdir -p build
 ./scripts/odin.sh build examples/title-window -collection:dagda=. -out:build/title-window
 
-# Run interactively on a Linux Wayland/X11 desktop
+# Run interactively on a Linux Wayland/X11 desktop (standalone)
 ./scripts/odin.sh run examples/title-window -collection:dagda=.
+
+# Run with an explicit Unix-domain driver socket in a private directory
+./scripts/odin.sh build examples/title-driver-client -collection:dagda=. -out:build/title-client
+SOCK_DIR=$(mktemp -d /tmp/dagda-title.XXXXXX)
+SOCK=$SOCK_DIR/title.sock
+./build/title-window --socket "$SOCK" &
+./build/title-client "$SOCK" inspect slide.title
+./build/title-client "$SOCK" preview 1 0 "Revenue grew 12%"
+./build/title-client "$SOCK" commit 1 0 "Revenue grew 12%"
 ```
+
+When `--socket <path>` is passed, the window reuses `examples/title-driver`'s private-directory socket lifecycle (refuses an existing path, records endpoint device/inode identity at bind time, and unlinks only its own endpoint on shutdown) and serves newline-delimited JSON requests non-blockingly on the window thread against the window's single `title_model.Model`. `inspect` and `preview` run during active IME composition; valid external `commit` or `undo` requests during composition return `{"ok":false,"error":"Busy_Composing"}` while preserving the document, preedit, and focus.
+
+### Real-client E2E verification (injected window events + real `title-client`)
+
+```sh
+python3 examples/title-window/tests/e2e_window_driver.py build/window-driver-capture
+```
+
+This builds `build/title-window` and `build/title-client`, opens a real SDL3 window on the active display with `--socket` and `--control-stdin` (injected SDL3 events on the window thread, not physical IME keystrokes), verifies an idle/partial client does not block the window, and exercises typing, client `inspect`/`preview`, `Busy_Composing` rejection during composition, `Escape` cancel, external `commit`, `Stale_Revision` rejection, keyboard `Ctrl+Z` undo, post-undo `inspect`, and Wayland PNG captures.
 
 ### Interactive controls
 
