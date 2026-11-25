@@ -1,0 +1,61 @@
+package title_driver
+
+import "core:testing"
+import title_model "dagda:examples/title-model"
+
+// The five Round 3A wire fixtures, in sequence on one fresh model.
+FIXTURES: [5][2]string = {
+	{"{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}"},
+	{"{\"op\":\"preview\",\"id\":1,\"base_revision\":0,\"text\":\"Revenue grew 12%\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Revenue grew 12%\"}"},
+	{"{\"op\":\"commit\",\"id\":1,\"base_revision\":0,\"text\":\"Revenue grew 12%\"}", "{\"ok\":true,\"id\":1,\"revision\":1,\"text\":\"Revenue grew 12%\"}"},
+	{"{\"op\":\"commit\",\"id\":1,\"base_revision\":0,\"text\":\"Late edit\"}", "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":1}"},
+	{"{\"op\":\"undo\",\"id\":1,\"base_revision\":1}", "{\"ok\":true,\"id\":1,\"revision\":2,\"text\":\"Quarterly results\",\"changed\":true}"},
+}
+
+fresh_model :: proc(t: ^testing.T) -> title_model.Model {
+	model: title_model.Model
+	err := title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results")
+	testing.expect_value(t, err, title_model.Error.None)
+	return model
+}
+
+expect_reply :: proc(t: ^testing.T, model: ^title_model.Model, request, expected: string) {
+	reply := dispatch(model, request)
+	defer delete(reply)
+	testing.expect_value(t, reply, expected)
+}
+
+@(test)
+test_wire_fixtures :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	for fixture in FIXTURES {
+		expect_reply(t, &model, fixture[0], fixture[1])
+	}
+}
+
+@(test)
+test_preview_does_not_mutate :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	expect_reply(t, &model, "{\"op\":\"preview\",\"id\":1,\"base_revision\":0,\"text\":\"Draft\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Draft\"}")
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
+}
+
+@(test)
+test_noop_empty_undo_missing_and_malformed :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	// Empty undo reports no change at revision 0.
+	expect_reply(t, &model, "{\"op\":\"undo\",\"id\":1,\"base_revision\":0}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"changed\":false}")
+	// No-op commit preserves revision.
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":1,\"base_revision\":0,\"text\":\"Quarterly results\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\"}")
+	// Missing role and missing ID keep their distinct errors.
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.missing\"}", "{\"ok\":false,\"error\":\"Unknown_Role\"}")
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":99,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Unknown_Object\"}")
+	expect_reply(t, &model, "{\"op\":\"undo\",\"id\":99,\"base_revision\":0}", "{\"ok\":false,\"error\":\"Unknown_Object\"}")
+	// Malformed requests are structured and leave the document usable.
+	expect_reply(t, &model, "not json", "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+	expect_reply(t, &model, "{\"op\":\"bogus\"}", "{\"ok\":false,\"error\":\"Unknown_Operation\"}")
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
+}
