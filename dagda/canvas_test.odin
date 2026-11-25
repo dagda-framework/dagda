@@ -107,6 +107,62 @@ test_canvas_overlap_edges_letterbox :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_canvas_hit_paths_agree_past_edge :: proc(t: ^testing.T) {
+	canvas := Canvas{
+		size = {width = 960, height = 540},
+		elements = {
+			{info = {id = 5, role = "past.edge"}, kind = .Button, text = "Past", bounds = {x = 900, y = 480, width = 200, height = 120}},
+		},
+	}
+	frame, ok := resolve_canvas(canvas, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer frame_destroy(&frame)
+
+	rec: Shared_Recorder
+	misses := []Point{{x = 1080, y = 520}, {x = 1190, y = 520}}
+	for point in misses {
+		_, hit_a := hit_test(frame, point)
+		_, hit_b := hit_test_canvas(frame, point)
+		testing.expect(t, !hit_a)
+		testing.expect(t, !hit_b)
+		testing.expect_value(t, click(frame, point, shared_handle, &rec), Invoke_Result.Unknown_Object)
+	}
+	testing.expect_value(t, rec.calls, 0)
+
+	id, hit := hit_test_canvas(frame, {x = 1079, y = 520})
+	testing.expect(t, hit)
+	testing.expect_value(t, id, Object_Id(5))
+	testing.expect_value(t, click(frame, {x = 1079, y = 520}, shared_handle, &rec), Invoke_Result.Applied)
+	testing.expect_value(t, rec.calls, 1)
+	testing.expect_value(t, rec.last_id, Object_Id(5))
+}
+
+@(test)
+test_canvas_left_edge_exact_hit :: proc(t: ^testing.T) {
+	canvas := Canvas{
+		size = {width = 960, height = 540},
+		elements = {
+			{info = {id = 9, role = "edge"}, kind = .Button, text = "Edge", bounds = {x = 93, y = 100, width = 50, height = 50}},
+		},
+	}
+	frame, ok := resolve_canvas(canvas, {width = 853, height = 480})
+	testing.expect(t, ok)
+	defer frame_destroy(&frame)
+
+	bounds := frame.elements[0].bounds
+	point := Point{x = bounds.x, y = bounds.y + bounds.height / 2}
+	id, hit := hit_test(frame, point)
+	testing.expect(t, hit)
+	testing.expect_value(t, id, Object_Id(9))
+	id2, hit2 := hit_test_canvas(frame, point)
+	testing.expect(t, hit2)
+	testing.expect_value(t, id2, Object_Id(9))
+	rec: Shared_Recorder
+	testing.expect_value(t, click(frame, point, shared_handle, &rec), Invoke_Result.Applied)
+	testing.expect_value(t, rec.calls, 1)
+}
+
+@(test)
 test_canvas_zero_viewport :: proc(t: ^testing.T) {
 	canvas := test_canvas()
 	frame, ok := resolve_canvas(canvas, {width = 0, height = 0})

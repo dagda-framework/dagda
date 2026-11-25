@@ -185,9 +185,25 @@ find :: proc(frame: Frame, id: Object_Id) -> (Resolved_Element, bool) {
 	return {}, false
 }
 
-// hit_test returns the topmost (last-drawn) element whose
-// resolved bounds contain p.
+// hit_test is the one hit-testing path for every frame. For a
+// canvas frame the window point is first clipped to the fitted
+// canvas rectangle in window coordinates (so a letterbox click,
+// or one beyond the canvas edge on an element that extends past
+// it, misses), then resolved window rectangles are tested in
+// reverse draw order so the last-drawn element wins. Edges are
+// inclusive on the left/top and exclusive on the right/bottom.
 hit_test :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
+	if frame.has_canvas {
+		fitted := Rect{
+			x = frame.transform.offset.x,
+			y = frame.transform.offset.y,
+			width = frame.transform.canvas.width * frame.transform.scale,
+			height = frame.transform.canvas.height * frame.transform.scale,
+		}
+		if !contains(fitted, p) {
+			return 0, false
+		}
+	}
 	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
 		if contains(frame.elements[i].bounds, p) {
 			return frame.elements[i].info.id, true

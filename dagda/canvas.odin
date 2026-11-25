@@ -107,21 +107,10 @@ resolve_canvas :: proc(canvas: Canvas, viewport: Size, allocator := context.allo
 }
 
 // hit_test_canvas hit-tests a window point against a canvas
-// frame: the point must land inside the canvas (a letterbox
-// click misses even when an element extends past the canvas
-// edge), and the last-drawn matching element wins.
+// frame through the same single path as hit_test and click
+// (window-space clipping plus resolved window rectangles), so
+// all three always agree. window_point_to_canvas remains
+// available separately for document editing.
 hit_test_canvas :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
-	if !frame.has_canvas {
-		return hit_test(frame, p)
-	}
-	canvas_p, inside := window_point_to_canvas(frame.transform, p)
-	if !inside {
-		return 0, false
-	}
-	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
-		if contains(frame.elements[i].canvas_bounds, canvas_p) {
-			return frame.elements[i].info.id, true
-		}
-	}
-	return 0, false
+	return hit_test(frame, p)
 }
