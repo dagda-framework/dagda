@@ -1,5 +1,6 @@
 package main
 
+import title_model "../title-model"
 import "core:c"
 import "core:fmt"
 import "core:os"
@@ -389,10 +390,13 @@ run_demo_capture :: proc(win: ^Title_Window, adapter: Model_Adapter, capture_dir
 }
 
 main :: proc() {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model: title_model.Model
+	if err := title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results"); err != .None {
+		fmt.eprintf("title_model.init failed: %v\n", err)
+		os.exit(1)
+	}
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	win: Title_Window
 	if !window_init(&win, adapter) {

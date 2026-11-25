@@ -177,7 +177,7 @@ editor_commit_replacement :: proc(
 	adapter: Model_Adapter,
 	replacement: string,
 	new_caret: int,
-) -> dagda.Action_Error {
+) -> Model_Error {
 	target := dagda.Action_Target{
 		id            = state.snapshot_id,
 		base_revision = state.snapshot_revision,

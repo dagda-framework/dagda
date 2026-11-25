@@ -1,6 +1,8 @@
 package main
 
+import title_model "../title-model"
 import "core:c"
+import "core:mem"
 import "core:slice"
 import "core:testing"
 import "dagda:dagda"
@@ -8,12 +10,38 @@ import sdl "vendor:sdl3"
 
 TEST_TITLE_BOX :: sdl.FRect{x = 56, y = 112, w = 748, h = 72}
 
+make_test_model :: proc(t: ^testing.T, text := "Quarterly results") -> title_model.Model {
+	model: title_model.Model
+	err := title_model.init(&model, {id = 1, role = "slide.title"}, text)
+	testing.expect_value(t, err, title_model.Error.None)
+	return model
+}
+
+Fail_Alloc_State :: struct {
+	backing:     mem.Allocator,
+	fail_allocs: bool,
+}
+
+fail_alloc_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> ([]byte, mem.Allocator_Error) {
+	state := (^Fail_Alloc_State)(data)
+	if state.fail_allocs && (mode == .Alloc || mode == .Alloc_Non_Zeroed) {
+		return nil, .Out_Of_Memory
+	}
+	return state.backing.procedure(state.backing.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
 @(test)
 test_composition_does_not_commit_and_blocks_external_commits :: proc(t: ^testing.T) {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)
@@ -64,10 +92,9 @@ test_composition_does_not_commit_and_blocks_external_commits :: proc(t: ^testing
 
 @(test)
 test_escape_cancels_composition_cleanly_and_preserves_focus :: proc(t: ^testing.T) {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)
@@ -98,10 +125,9 @@ test_escape_cancels_composition_cleanly_and_preserves_focus :: proc(t: ^testing.
 
 @(test)
 test_external_model_change_redraws_without_stealing_or_dropping_focus :: proc(t: ^testing.T) {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)
@@ -113,7 +139,7 @@ test_external_model_change_redraws_without_stealing_or_dropping_focus :: proc(t:
 	// External commit while focused keeps focus and marks redraw.
 	snap := adapter_snapshot(adapter)
 	res := adapter_commit(adapter, dagda.Action_Target{id = snap.id, base_revision = snap.revision}, "Revenue grew 12%")
-	testing.expect_value(t, res.err, dagda.Action_Error.None)
+	testing.expect_value(t, res.err, Model_Error.None)
 
 	changed := editor_sync_from_model(&state, adapter)
 	testing.expect_value(t, changed, true)
@@ -140,7 +166,7 @@ test_external_model_change_redraws_without_stealing_or_dropping_focus :: proc(t:
 
 	snap = adapter_snapshot(adapter)
 	res = adapter_commit(adapter, dagda.Action_Target{id = snap.id, base_revision = snap.revision}, "Short")
-	testing.expect_value(t, res.err, dagda.Action_Error.None)
+	testing.expect_value(t, res.err, Model_Error.None)
 
 	state.needs_redraw = false
 	changed = editor_sync_from_model(&state, adapter)
@@ -152,10 +178,9 @@ test_external_model_change_redraws_without_stealing_or_dropping_focus :: proc(t:
 
 @(test)
 test_keyboard_undo_restores_title_advances_revision_and_keeps_focus :: proc(t: ^testing.T) {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)
@@ -191,15 +216,14 @@ test_keyboard_undo_restores_title_advances_revision_and_keeps_focus :: proc(t: ^
 
 	// Old revision 0 proposal must still be rejected as stale after undo.
 	stale := adapter_commit(adapter, dagda.Action_Target{id = snap.id, base_revision = 0}, "Stale")
-	testing.expect_value(t, stale.err, dagda.Action_Error.Stale_Revision)
+	testing.expect_value(t, stale.err, Model_Error.Stale_Revision)
 }
 
 @(test)
 test_utf8_backspace_and_noop_commit :: proc(t: ^testing.T) {
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Café", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t, "Café")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)
@@ -218,8 +242,116 @@ test_utf8_backspace_and_noop_commit :: proc(t: ^testing.T) {
 	// No-op commit leaves revision unchanged.
 	snap := adapter_snapshot(adapter)
 	noop := adapter_commit(adapter, dagda.Action_Target{id = snap.id, base_revision = snap.revision}, "Caf")
-	testing.expect_value(t, noop.err, dagda.Action_Error.None)
+	testing.expect_value(t, noop.err, Model_Error.None)
 	testing.expect_value(t, noop.snapshot.revision, dagda.Revision(1))
+}
+
+@(test)
+test_real_adapter_type_preview_commit_undo_stale_and_busy_preedit :: proc(t: ^testing.T) {
+	model := make_test_model(t, "Quarterly results")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// 1. Human types in the window through the real adapter.
+	type_ev: sdl.Event
+	type_ev.type = .TEXT_INPUT
+	type_ev.text.text = " — Q4"
+	editor_handle_sdl_event(&state, adapter, &type_ev, TEST_TITLE_BOX)
+
+	after_type := title_model.snapshot(&model)
+	testing.expect_value(t, after_type.object.id, dagda.Object_Id(1))
+	testing.expect_value(t, after_type.revision, dagda.Revision(1))
+	testing.expect_value(t, after_type.text, "Quarterly results — Q4")
+	testing.expect_value(t, state.committed_text, "Quarterly results — Q4")
+
+	// 2. External caller previews against inspected revision 1 without mutating the model.
+	inspected := dagda.Action_Target{id = after_type.object.id, base_revision = after_type.revision}
+	p, prev_err := title_model.preview(&model, inspected, "Revenue grew 12%")
+	testing.expect_value(t, prev_err, title_model.Error.None)
+	testing.expect_value(t, p.text, "Revenue grew 12%")
+	title_model.preview_destroy(&p)
+
+	still_rev1 := title_model.snapshot(&model)
+	testing.expect_value(t, still_rev1.revision, dagda.Revision(1))
+	testing.expect_value(t, still_rev1.text, "Quarterly results — Q4")
+
+	// 3. Stale external edit against revision 0 is rejected without mutating model.
+	stale_res := adapter_commit(adapter, dagda.Action_Target{id = 1, base_revision = 0}, "Stale rename")
+	testing.expect_value(t, stale_res.err, Model_Error.Stale_Revision)
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect_value(t, title_model.snapshot(&model).text, "Quarterly results — Q4")
+
+	// 4. Busy external commit during active preedit is blocked by the host gate.
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "draft"
+	edit_ev.edit.start = 5
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Busy_Composing)
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+
+	esc_ev: sdl.Event
+	esc_ev.type = .KEY_DOWN
+	esc_ev.key.key = sdl.K_ESCAPE
+	editor_handle_sdl_event(&state, adapter, &esc_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Ready)
+
+	// 5. External commit against inspected revision 1 succeeds and syncs to window without stealing focus.
+	commit_res := adapter_commit(adapter, inspected, "Revenue grew 12%")
+	testing.expect_value(t, commit_res.err, Model_Error.None)
+	testing.expect_value(t, commit_res.snapshot.revision, dagda.Revision(2))
+	testing.expect_value(t, commit_res.snapshot.text, "Revenue grew 12%")
+
+	synced := editor_sync_from_model(&state, adapter)
+	testing.expect_value(t, synced, true)
+	testing.expect_value(t, state.committed_text, "Revenue grew 12%")
+	testing.expect_value(t, state.snapshot_revision, dagda.Revision(2))
+	testing.expect_value(t, state.focused, true)
+
+	// 6. Keyboard Undo from the window restores the pre-external title and advances revision to 3 on the same model.
+	undo_ev: sdl.Event
+	undo_ev.type = .KEY_DOWN
+	undo_ev.key.key = sdl.K_Z
+	undo_ev.key.mod = sdl.KMOD_LCTRL
+	editor_handle_sdl_event(&state, adapter, &undo_ev, TEST_TITLE_BOX)
+
+	after_undo := title_model.snapshot(&model)
+	testing.expect_value(t, after_undo.text, "Quarterly results — Q4")
+	testing.expect_value(t, after_undo.revision, dagda.Revision(3))
+	testing.expect_value(t, state.committed_text, "Quarterly results — Q4")
+	testing.expect_value(t, state.focused, true)
+
+	// One-step history: second Undo makes no further change, and prior revisions remain stale.
+	editor_handle_sdl_event(&state, adapter, &undo_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(3))
+	testing.expect_value(t, adapter_commit(adapter, inspected, "Late").err, Model_Error.Stale_Revision)
+}
+
+@(test)
+test_real_adapter_surfaces_all_model_errors :: proc(t: ^testing.T) {
+	fail_state := Fail_Alloc_State{backing = context.allocator}
+	alloc := mem.Allocator{procedure = fail_alloc_proc, data = &fail_state}
+
+	model: title_model.Model
+	testing.expect_value(t, title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results", alloc), title_model.Error.None)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	testing.expect_value(t, adapter_commit(adapter, {id = 999, base_revision = 0}, "Other").err, Model_Error.Unknown_Object)
+	testing.expect_value(t, adapter_commit(adapter, {id = 1, base_revision = 5}, "Other").err, Model_Error.Stale_Revision)
+	testing.expect_value(t, adapter_commit(adapter, {id = 1, base_revision = 0}, "\xff\xfe").err, Model_Error.Invalid_Text)
+
+	fail_state.fail_allocs = true
+	alloc_res := adapter_commit(adapter, {id = 1, base_revision = 0}, "Out of memory")
+	fail_state.fail_allocs = false
+	testing.expect_value(t, alloc_res.err, Model_Error.Alloc_Failed)
+	testing.expect_value(t, alloc_res.snapshot.text, "Quarterly results")
+	testing.expect_value(t, alloc_res.snapshot.revision, dagda.Revision(0))
 }
 
 @(test)
@@ -264,10 +396,9 @@ test_nonterminal_preedit_caret_selection_and_composing_replacement :: proc(t: ^t
 	testing.expect(t, font_init(&font), "Expected FreeType font to initialize")
 	defer font_destroy(&font)
 
-	fixture: Local_Fixture
-	fixture_init(&fixture, "Quarterly results", 1)
-	defer fixture_destroy(&fixture)
-	adapter := fixture_adapter(&fixture)
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
 
 	state: Editor_State
 	editor_init(&state, adapter)

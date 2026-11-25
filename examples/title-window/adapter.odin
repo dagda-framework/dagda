@@ -2,9 +2,19 @@ package main
 
 import "dagda:dagda"
 
-// Title_Snapshot is the read-only view of the shared title exposed to the window.
-// The text slice is valid until the next mutation of the backing model; callers
-// that retain it across frames must copy it.
+// Model_Error mirrors the declared failure modes of the backing title model.
+Model_Error :: enum {
+	None,
+	Unknown_Object,
+	Stale_Revision,
+	Invalid_Text,
+	Alloc_Failed,
+}
+
+// Title_Snapshot is a borrowed read-only view of the shared title exposed to
+// the window. The text slice stays valid until the next successful mutation
+// (commit or undo) or destruction of the backing model; callers that retain
+// it across frames must copy it.
 Title_Snapshot :: struct {
 	id:       dagda.Object_Id,
 	revision: dagda.Revision,
@@ -12,7 +22,7 @@ Title_Snapshot :: struct {
 }
 
 Commit_Result :: struct {
-	err:      dagda.Action_Error,
+	err:      Model_Error,
 	snapshot: Title_Snapshot,
 }
 
@@ -31,9 +41,7 @@ External_Commit_Gate :: enum {
 }
 
 // Model_Adapter is the narrow callback boundary between the SDL3 title window
-// and the backing document model. The local fixture in fixture.odin implements
-// this boundary so the host can run standalone and swap in the real shared
-// title model in the next round.
+// and the backing document model.
 Model_Adapter :: struct {
 	ctx:      rawptr,
 	snapshot: proc(ctx: rawptr) -> Title_Snapshot,
