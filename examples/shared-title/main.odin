@@ -33,7 +33,14 @@ apply :: proc(slide: ^Slide, action: Rename) -> dagda.Action_Error {
 
 main :: proc() {
 	slide := Slide{title = {object = {id = 1, role = "slide.title"}, text = "Quarterly results"}}
-	target := dagda.Action_Target{id = slide.title.object.id, base_revision = slide.revision}
+	objects := [1]dagda.Object_Info{slide.title.object}
+	ids: [1]dagda.Object_Id
+	written, total := dagda.find_by_role(objects[:], "slide.title", ids[:])
+	if written != 1 || total != 1 {
+		panic("Expected exactly one slide.title object")
+	}
+
+	target := dagda.Action_Target{id = ids[0], base_revision = slide.revision}
 	fmt.printf("Inspect  %s #%d at revision %d: %s\n", slide.title.object.role, target.id, slide.revision, slide.title.text)
 
 	proposal := Rename{target, "Revenue grew 12%"}
