@@ -25,6 +25,7 @@ Doc :: struct {
 doc_edits := []dagda.Advertised_Edit{
 	{object_id = 1, edit = "replace_text", argument = .Text},
 	{object_id = 2, edit = "set_rect", argument = .Rect},
+	{object_id = 2, edit = "reset_rect", argument = .None},
 }
 
 doc_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
@@ -46,6 +47,13 @@ doc_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string,
 	case 2:
 		if target.base_revision != doc.chart_rev {
 			return .Stale_Revision
+		}
+		if edit == "reset_rect" {
+			doc.chart_hist = doc.chart
+			doc.has_chart_hist = true
+			doc.chart = {x = 10, y = 20, width = 100, height = 50}
+			doc.chart_rev += 1
+			return .Applied
 		}
 		if arg.rect.width <= 0 || arg.rect.height <= 0 {
 			return .Not_Handled
@@ -175,11 +183,9 @@ main :: proc() {
 						break
 					}
 					line := string(control[:nl])
-					remaining := len(control) - (nl + 1)
-					if remaining > 0 {
-						copy(control[:remaining], control[nl + 1:])
-					}
-					resize(&control, remaining)
+					// Process the line before compacting the
+					// buffer: line borrows the bytes that the
+					// compaction would overwrite.
 					if line == "quit" {
 						fmt.println("CONTROL_OK quit")
 						running = false
@@ -191,6 +197,11 @@ main :: proc() {
 						fmt.printf("CONTROL_OK undo id=%d undone=%v revision=%d\n", id, undone, rev)
 					}
 					_ = os.flush(os.stdout)
+					remaining := len(control) - (nl + 1)
+					if remaining > 0 {
+						copy(control[:remaining], control[nl + 1:])
+					}
+					resize(&control, remaining)
 					if !running {
 						break
 					}

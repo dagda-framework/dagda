@@ -12,6 +12,7 @@ usage :: proc() {
 	fmt.eprintln("       dagda-client <socket-path> invoke  <id> <action>")
 	fmt.eprintln("       dagda-client <socket-path> edits   <id>")
 	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> text <text>")
+	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> none")
 	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> rect <x> <y> <width> <height>")
 	fmt.eprintln("       dagda-client <socket-path> commit  <id> <edit> <base_revision> text <text>")
 	fmt.eprintln("       dagda-client <socket-path> commit  <id> <edit> <base_revision> rect <x> <y> <width> <height>")
@@ -81,6 +82,12 @@ run_client :: proc() -> int {
 		driver.write_json_string(&b, os.args[4])
 		fmt.sbprintf(&b, ",\"base_revision\":%d,\"argument\":", rev)
 		switch os.args[6] {
+		case "none":
+			if len(os.args) != 7 {
+				usage()
+				return 2
+			}
+			strings.write_string(&b, "{\"kind\":\"none\"}")
 		case "text":
 			if len(os.args) != 8 {
 				usage()

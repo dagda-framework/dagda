@@ -9,6 +9,7 @@ and its undo history.
 """
 import json
 import os
+import select
 import shutil
 import subprocess
 import tempfile
@@ -34,10 +35,31 @@ def inspect(client_bin, sock, role):
     return resp["elements"][0]
 
 
+class AppReader:
+    def __init__(self, app):
+        self.fd = app.stdout.fileno()
+        self.buf = b""
+
+    def line(self, timeout=15):
+        while b"\n" not in self.buf:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if not ready:
+                raise AssertionError("timed out waiting for app acknowledgement")
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                raise AssertionError("app closed stdout")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line.decode().strip()
+
+
+READER = None
+
+
 def control(app, cmd):
     app.stdin.write(cmd + "\n")
     app.stdin.flush()
-    line = app.stdout.readline().strip()
+    line = READER.line()
     assert line.startswith("CONTROL_OK"), (cmd, line)
     return line
 
@@ -56,7 +78,9 @@ def main():
             subprocess.check_call([str(ODIN), "build", src, "-collection:dagda=.", f"-out:{out}"], cwd=ROOT)
         app = subprocess.Popen([str(app_bin), str(sock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, cwd=ROOT)
-        assert app.stdout.readline().strip() == f"Listening {sock}"
+        global READER
+        READER = AppReader(app)
+        assert READER.line() == f"Listening {sock}"
 
         def run(*args, **kw):
             code, resp = client(client_bin, sock, *args, **kw)
@@ -67,7 +91,7 @@ def main():
         _, edits1 = run("edits", "1")
         assert edits1 == {"ok": True, "id": 1, "revision": 0, "edits": [{"name": "replace_text", "argument": "text"}]}, edits1
         _, edits2 = run("edits", "2")
-        assert edits2 == {"ok": True, "id": 2, "revision": 0, "edits": [{"name": "set_rect", "argument": "rect"}]}, edits2
+        assert edits2 == {"ok": True, "id": 2, "revision": 0, "edits": [{"name": "set_rect", "argument": "rect"}, {"name": "reset_rect", "argument": "none"}]}, edits2
         assert inspect(client_bin, sock, "doc.title")["text"] == "Quarterly results"
         assert inspect(client_bin, sock, "doc.chart")["text"] == "10,20,100,50"
 
@@ -101,6 +125,30 @@ def main():
         assert rect_done == {"ok": True, "id": 2, "edit": "set_rect", "revision": 1}, rect_done
         assert inspect(client_bin, sock, "doc.chart")["text"] == "72,240,360,180"
 
+        # A stale preview is rejected with the current revision
+        # and changes nothing.
+        code, stale_prev = run("preview", "1", "replace_text", "0", "text", "Sneaky", expect_ok=False)
+        assert code == 1 and stale_prev == {"ok": False, "error": "Stale_Revision", "revision": 1}, stale_prev
+        assert inspect(client_bin, sock, "doc.title")["text"] == "Revenue grew"
+
+        # Fractional rectangle preview and commit agree exactly.
+        frac = ["72.5", "240.25", "360.125", "180.75"]
+        _, frac_prev = run("preview", "2", "set_rect", "1", "rect", *frac)
+        assert frac_prev["argument"] == {"kind": "rect", "rect": {"x": 72.5, "y": 240.25, "width": 360.125, "height": 180.75}}, frac_prev
+        _, frac_done = run("commit", "2", "set_rect", "1", "rect", *frac)
+        assert frac_done == {"ok": True, "id": 2, "edit": "set_rect", "revision": 2}, frac_done
+        assert inspect(client_bin, sock, "doc.chart")["text"] == "72.5,240.25,360.125,180.75"
+
+        # A discoverable no-argument edit previews and commits
+        # through the CLI's none form.
+        _, edits2b = run("edits", "2")
+        assert {"name": "reset_rect", "argument": "none"} in edits2b["edits"], edits2b
+        _, reset_prev = run("preview", "2", "reset_rect", "2", "none")
+        assert reset_prev["ok"] and reset_prev["argument"] == {"kind": "none"}, reset_prev
+        _, reset_done = run("commit", "2", "reset_rect", "2", "none")
+        assert reset_done == {"ok": True, "id": 2, "edit": "reset_rect", "revision": 3}, reset_done
+        assert inspect(client_bin, sock, "doc.chart")["text"] == "10,20,100,50"
+
         # The preserved undo history still restores the prior text.
         line = control(app, "undo 1")
         transcript.append(f"control: undo 1 -> {line}")
@@ -108,6 +156,18 @@ def main():
         assert inspect(client_bin, sock, "doc.title")["text"] == "Quarterly results"
         _, undone = run("edits", "1")
         assert undone["revision"] == 2, undone
+
+        # Two undo commands sent together are acknowledged in order.
+        _, again = run("commit", "1", "replace_text", "2", "text", "Again")
+        assert again["revision"] == 3, again
+        app.stdin.write("undo 1\nundo 2\n")
+        app.stdin.flush()
+        ack1 = READER.line()
+        ack2 = READER.line()
+        transcript.append(f"control: undo 1 + undo 2 -> {ack1} | {ack2}")
+        assert "id=1" in ack1 and "id=2" in ack2, (ack1, ack2)
+        assert inspect(client_bin, sock, "doc.title")["text"] == "Quarterly results"
+        assert inspect(client_bin, sock, "doc.chart")["text"] == "72.5,240.25,360.125,180.75"
 
         control(app, "quit")
         app.wait(timeout=10)

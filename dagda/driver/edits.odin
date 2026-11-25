@@ -39,7 +39,15 @@ write_argument :: proc(b: ^strings.Builder, arg: dagda.Edit_Argument) {
 		strings.write_string(b, ",\"text\":")
 		write_json_string(b, arg.text)
 	case .Rect:
-		fmt.sbprintf(b, ",\"rect\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}}", arg.rect.x, arg.rect.y, arg.rect.width, arg.rect.height)
+		strings.write_string(b, ",\"rect\":{\"x\":")
+		write_f32_exact(b, arg.rect.x)
+		strings.write_string(b, ",\"y\":")
+		write_f32_exact(b, arg.rect.y)
+		strings.write_string(b, ",\"width\":")
+		write_f32_exact(b, arg.rect.width)
+		strings.write_string(b, ",\"height\":")
+		write_f32_exact(b, arg.rect.height)
+		strings.write_byte(b, '}')
 	case .None:
 	}
 	strings.write_byte(b, '}')
@@ -183,6 +191,13 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 		}
 		target := dagda.Action_Target{id = id, base_revision = dagda.Revision(raw_rev)}
 		if op == "preview" {
+			// A successful preview must be based on the app's
+			// current revision, exactly like a commit would be.
+			if source.revision_of != nil {
+				if current, known := source.revision_of(source.user_data, id); known && current != target.base_revision {
+					return edit_error_reply(source, id, .Stale_Revision), false
+				}
+			}
 			preview, result := dagda.preview_edit(source.edits, target, name, arg)
 			if result != .Applied {
 				return edit_error_reply(source, id, result), false
