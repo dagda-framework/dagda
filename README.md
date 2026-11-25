@@ -24,13 +24,17 @@ Retry    Stale_Revision (document still reads "Revenue grew 12%")
 
 ## Read the Odin
 
-The example discovers the title by its semantic role. Dagda supplies the target, which carries the discovered object ID and the document revision the caller saw; the title model owns the role and text for its whole lifetime.
+The example discovers the title by its semantic role. Dagda supplies the target, which carries the discovered object ID and the document revision the caller saw. The title model owns both strings.
 
 ```odin
 snap := title_model.snapshot(&model)
 objects := [1]dagda.Object_Info{snap.object}
 ids: [1]dagda.Object_Id
 written, total := dagda.find_by_role(objects[:], "slide.title", ids[:])
+if written != 1 || total != 1 {
+	panic("Expected exactly one slide.title object")
+}
+
 target := dagda.Action_Target{id = ids[0], base_revision = snap.revision}
 ```
 
@@ -38,13 +42,18 @@ A preview clones the proposed text into storage the preview itself owns, so the 
 
 ```odin
 p, preview_err := title_model.preview(&model, target, "Revenue grew 12%")
+if preview_err != .None {
+	panic("Example preview failed")
+}
+defer title_model.preview_destroy(&p)
+fmt.printf("Preview  %s (document still reads %q)\n", p.text, title_model.snapshot(&model).text)
+
 if err := title_model.commit(&model, target, "Revenue grew 12%"); err != .None {
 	panic("Example commit failed")
 }
-err := title_model.commit(&model, target, "An edit based on the old revision")
 ```
 
-A second proposal can still name the right title and be out of date: that retry reports `Stale_Revision`. Checking the revision before writing gives the caller a chance to read the new headline and reconsider its edit. [Full example](examples/shared-title/main.odin) · [Title model](examples/title-model/title_model.odin) · [Dagda core](dagda/core.odin)
+In the final line of the demo, retrying the original target returns `Stale_Revision`. Checking the revision before writing gives the caller a chance to read the new headline and reconsider its edit. [Full example](examples/shared-title/main.odin) · [Title model](examples/title-model/title_model.odin) · [Dagda core](dagda/core.odin)
 
 ## From the document to the window
 
