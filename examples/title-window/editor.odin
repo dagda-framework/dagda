@@ -105,8 +105,7 @@ editor_sync_from_model :: proc(state: ^Editor_State, adapter: Model_Adapter) -> 
 	state.committed_text = strings.clone(snap.text)
 	state.snapshot_id = snap.id
 	state.snapshot_revision = snap.revision
-	state.caret = clamp_utf8_boundary(state.committed_text, state.caret)
-	state.anchor = clamp_utf8_boundary(state.committed_text, state.anchor)
+	editor_reconcile_caret(state)
 	state.needs_redraw = true
 	return true
 }
@@ -180,11 +179,22 @@ next_rune_boundary :: proc(s: string, offset: int) -> int {
 	return min(offset + width, len(s))
 }
 
+// editor_reconcile_caret brings the displayed caret and selection
+// anchor onto Dagda grapheme boundaries of the committed text, and
+// mirrors them into the editing session, so the window paints the
+// same offsets the next edit will use.
+editor_reconcile_caret :: proc(state: ^Editor_State) {
+	state.caret = dagda.clamp_grapheme_boundary(state.committed_text, state.caret)
+	state.anchor = dagda.clamp_grapheme_boundary(state.committed_text, state.anchor)
+	editor_sync_session(state)
+}
+
 editor_apply_snapshot :: proc(state: ^Editor_State, snap: Title_Snapshot) {
 	delete(state.committed_text)
 	state.committed_text = strings.clone(snap.text)
 	state.snapshot_id = snap.id
 	state.snapshot_revision = snap.revision
+	editor_reconcile_caret(state)
 }
 
 editor_commit_replacement :: proc(
@@ -199,15 +209,15 @@ editor_commit_replacement :: proc(
 	}
 	res := adapter_commit(adapter, target, replacement)
 	editor_apply_snapshot(state, res.snapshot)
-	dagda.text_session_sync(&state.session, state.committed_text)
 	if res.err == .None {
-		state.caret = clamp_utf8_boundary(state.committed_text, new_caret)
+		state.caret = dagda.clamp_grapheme_boundary(state.committed_text, new_caret)
 		state.anchor = state.caret
+		editor_sync_session(state)
 		state.commit_count += 1
 		editor_set_status(state, fmt.tprintf("Committed rev %d", state.snapshot_revision))
 	} else {
-		state.caret = clamp_utf8_boundary(state.committed_text, state.caret)
-		state.anchor = clamp_utf8_boundary(state.committed_text, state.anchor)
+		// A stale rejection adopts the latest snapshot too:
+		// editor_apply_snapshot already reconciled both offsets.
 		editor_set_status(state, fmt.tprintf("Commit rejected: %v (synced rev %d)", res.err, state.snapshot_revision))
 	}
 	state.needs_redraw = true

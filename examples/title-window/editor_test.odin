@@ -42,6 +42,47 @@ fail_alloc_proc :: proc(
 }
 
 @(test)
+test_snapshot_adoption_reconciles_caret_to_grapheme :: proc(t: ^testing.T) {
+	model := make_test_model(t, "ax")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Press Left: caret sits between "a" and "x" at byte 1.
+	left_ev: sdl.Event
+	left_ev.type = .KEY_DOWN
+	left_ev.key.key = sdl.K_LEFT
+	editor_handle_sdl_event(&state, adapter, &left_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, state.caret, 1)
+	testing.expect_value(t, state.anchor, 1)
+
+	// Externally commit "e" + U+0301 + "x": byte 1 now falls
+	// inside the first grapheme, so adopting the snapshot must
+	// reconcile the displayed caret and anchor to byte 0 before
+	// any further key event.
+	snap := title_model.snapshot(&model)
+	target := dagda.Action_Target{id = snap.object.id, base_revision = snap.revision}
+	testing.expect_value(t, title_model.commit(&model, target, "e\xcc\x81x"), title_model.Error.None)
+	testing.expect(t, editor_sync_from_model(&state, adapter))
+	testing.expect_value(t, state.committed_text, "e\xcc\x81x")
+	testing.expect_value(t, state.caret, 0)
+	testing.expect_value(t, state.anchor, 0)
+	testing.expect_value(t, state.session.caret, 0)
+	testing.expect_value(t, state.session.anchor, 0)
+
+	// Typing Q inserts at the reconciled caret: revision 2.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "Q"
+	editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, title_model.snapshot(&model).text, "Qe\xcc\x81x")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(2))
+}
+
+@(test)
 test_failed_preedit_and_text_proposals_preserve_state :: proc(t: ^testing.T) {
 	model := make_test_model(t)
 	defer title_model.destroy(&model)
