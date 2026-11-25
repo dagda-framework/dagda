@@ -2,10 +2,14 @@ package main
 
 import title_model "../title-model"
 import "core:c"
+import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:slice"
+import "core:sys/posix"
 import "core:testing"
 import "dagda:dagda"
+import driver "dagda:examples/title-driver"
 import sdl "vendor:sdl3"
 
 TEST_TITLE_BOX :: sdl.FRect{x = 56, y = 112, w = 748, h = 72}
@@ -522,4 +526,109 @@ test_ft_bitmap_copy_rejects_unsupported_formats_and_invalid_strides :: proc(t: ^
 		testing.expect_value(t, ok, false)
 		testing.expect_value(t, len(alpha), 0)
 	}
+}
+
+@(test)
+test_driver_dispatch_during_composition_and_nonblocking_partial_client :: proc(t: ^testing.T) {
+	model := make_test_model(t, "Quarterly results")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Commit one edit so undo would be valid when idle.
+	type_ev: sdl.Event
+	type_ev.type = .TEXT_INPUT
+	type_ev.text.text = "!"
+	editor_handle_sdl_event(&state, adapter, &type_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+
+	// Enter active composition.
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 2
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, editor_is_composing(&state), true)
+
+	// Inspect and preview succeed during composition.
+	insp := dispatch_window_line(&model, &state, adapter, `{"op":"inspect","role":"slide.title"}`)
+	defer delete(insp)
+	testing.expect_value(t, insp, `{"ok":true,"id":1,"revision":1,"text":"Quarterly results!","role":"slide.title"}`)
+
+	prev := dispatch_window_line(&model, &state, adapter, `{"op":"preview","id":1,"base_revision":1,"text":"Revenue grew 12%"}`)
+	defer delete(prev)
+	testing.expect_value(t, prev, `{"ok":true,"id":1,"revision":1,"text":"Revenue grew 12%"}`)
+
+	// Valid external commit and undo during composition return Busy_Composing and preserve document, preedit, and focus.
+	busy_commit := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":1,"text":"Revenue grew 12%"}`)
+	defer delete(busy_commit)
+	testing.expect_value(t, busy_commit, `{"ok":false,"error":"Busy_Composing"}`)
+
+	busy_undo := dispatch_window_line(&model, &state, adapter, `{"op":"undo","id":1,"base_revision":1}`)
+	defer delete(busy_undo)
+	testing.expect_value(t, busy_undo, `{"ok":false,"error":"Busy_Composing"}`)
+
+	// Stale commit during composition still reports Stale_Revision rather than Busy_Composing.
+	stale_during_comp := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":0,"text":"Stale"}`)
+	defer delete(stale_during_comp)
+	testing.expect_value(t, stale_during_comp, `{"ok":false,"error":"Stale_Revision","revision":1}`)
+
+	testing.expect_value(t, title_model.snapshot(&model).text, "Quarterly results!")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect_value(t, state.preedit_text, "café")
+	testing.expect_value(t, state.composing, true)
+	testing.expect_value(t, state.focused, true)
+
+	// Cancel composition, then verify non-blocking server handles a partial client without blocking another client.
+	esc_ev: sdl.Event
+	esc_ev.type = .KEY_DOWN
+	esc_ev.key.key = sdl.K_ESCAPE
+	editor_handle_sdl_event(&state, adapter, &esc_ev, TEST_TITLE_BOX)
+
+	sock_dir := fmt.tprintf("/tmp/dagda-win-drv-test-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	sock_path := fmt.tprintf("%s/title.sock", sock_dir)
+
+	srv: Window_Driver_Server
+	testing.expect(t, driver_server_start(&srv, sock_path), "Expected driver server to start")
+	defer driver_server_stop(&srv)
+
+	// Client 1 connects and sends only a partial line (no newline yet).
+	c1, c1_ok := driver.connect_unix(sock_path)
+	testing.expect(t, c1_ok)
+	defer posix.close(c1)
+	testing.expect(t, driver.write_all(c1, `{"op":"insp`))
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	// Client 2 connects while Client 1 is still partial and completes a commit immediately.
+	c2, c2_ok := driver.connect_unix(sock_path)
+	testing.expect(t, c2_ok)
+	defer posix.close(c2)
+	testing.expect(t, driver.write_all(c2, "{\"op\":\"commit\",\"id\":1,\"base_revision\":1,\"text\":\"Revenue grew 12%\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	r2 := driver.Line_Reader{fd = c2}
+	rep2, ok2 := driver.read_line(&r2)
+	defer delete(rep2)
+	testing.expect(t, ok2)
+	testing.expect_value(t, rep2, `{"ok":true,"id":1,"revision":2,"text":"Revenue grew 12%"}`)
+	testing.expect_value(t, state.committed_text, "Revenue grew 12%")
+	testing.expect_value(t, state.focused, true)
+
+	// Client 1 now finishes its partial inspect line and observes rev 2.
+	testing.expect(t, driver.write_all(c1, "ect\",\"role\":\"slide.title\"}\n"))
+	driver_server_poll(&srv, &model, &state, adapter)
+	driver_server_poll(&srv, &model, &state, adapter)
+
+	r1 := driver.Line_Reader{fd = c1}
+	rep1, ok1 := driver.read_line(&r1)
+	defer delete(rep1)
+	testing.expect(t, ok1)
+	testing.expect_value(t, rep1, `{"ok":true,"id":1,"revision":2,"text":"Revenue grew 12%","role":"slide.title"}`)
 }

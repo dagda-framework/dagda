@@ -4,20 +4,32 @@ import title_model "../title-model"
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
+import "core:sys/posix"
 import "dagda:dagda"
 import sdl "vendor:sdl3"
+
+signal_stopped: bool
+
+on_window_signal :: proc "c" (_: posix.Signal) {
+	signal_stopped = true
+}
 
 WINDOW_WIDTH  :: 860
 WINDOW_HEIGHT :: 340
 TITLE_PX      :: f32(30)
 
 Title_Window :: struct {
-	window:    ^sdl.Window,
-	renderer:  ^sdl.Renderer,
-	font:      Font,
-	editor:    Editor_State,
-	title_box: sdl.FRect,
+	window:                 ^sdl.Window,
+	renderer:               ^sdl.Renderer,
+	font:                   Font,
+	editor:                 Editor_State,
+	title_box:              sdl.FRect,
+	control_stdin:          bool,
+	has_text_input_area:    bool,
+	last_text_input_area:   sdl.Rect,
+	last_text_input_cursor: c.int,
 }
 
 window_init :: proc(win: ^Title_Window, adapter: Model_Adapter) -> bool {
@@ -73,13 +85,19 @@ window_sync_text_input :: proc(win: ^Title_Window) {
 	if win.window == nil {
 		return
 	}
+	if win.control_stdin {
+		win.editor.needs_clear_composition = false
+		return
+	}
 	if win.editor.needs_clear_composition {
 		_ = sdl.ClearComposition(win.window)
 		win.editor.needs_clear_composition = false
 	}
 	if win.editor.focused {
+		just_started := false
 		if !sdl.TextInputActive(win.window) {
 			_ = sdl.StartTextInput(win.window)
+			just_started = true
 		}
 		layout := compute_title_layout(&win.font, &win.editor, win.title_box, TITLE_PX)
 		area := sdl.Rect{
@@ -88,11 +106,20 @@ window_sync_text_input :: proc(win: ^Title_Window) {
 			w = c.int(win.title_box.w),
 			h = c.int(win.title_box.h),
 		}
-		_ = sdl.SetTextInputArea(win.window, &area, layout.candidate_cursor_x)
+		if just_started ||
+		   !win.has_text_input_area ||
+		   area != win.last_text_input_area ||
+		   layout.candidate_cursor_x != win.last_text_input_cursor {
+			_ = sdl.SetTextInputArea(win.window, &area, layout.candidate_cursor_x)
+			win.has_text_input_area = true
+			win.last_text_input_area = area
+			win.last_text_input_cursor = layout.candidate_cursor_x
+		}
 	} else {
 		if sdl.TextInputActive(win.window) {
 			_ = sdl.StopTextInput(win.window)
 		}
+		win.has_text_input_area = false
 	}
 }
 
@@ -389,7 +416,161 @@ run_demo_capture :: proc(win: ^Title_Window, adapter: Model_Adapter, capture_dir
 		win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused)
 }
 
+poll_control_stdin :: proc(
+	win: ^Title_Window,
+	adapter: Model_Adapter,
+	in_buf: ^[dynamic]u8,
+	running: ^bool,
+) {
+	pfd := posix.pollfd{fd = posix.STDIN_FILENO, events = {.IN}}
+	if posix.poll(&pfd, 1, 0) <= 0 {
+		return
+	}
+	if .IN not_in pfd.revents {
+		return
+	}
+	tmp: [1024]u8
+	n := posix.read(posix.STDIN_FILENO, raw_data(tmp[:]), c.size_t(len(tmp)))
+	if n <= 0 {
+		return
+	}
+	append(in_buf, ..tmp[:int(n)])
+
+	for {
+		nl := -1
+		for j in 0 ..< len(in_buf^) {
+			if in_buf^[j] == '\n' {
+				nl = j
+				break
+			}
+		}
+		if nl < 0 {
+			break
+		}
+		line_end := nl
+		if line_end > 0 && in_buf^[line_end - 1] == '\r' {
+			line_end -= 1
+		}
+		line := strings.clone(string(in_buf^[:line_end]))
+		defer delete(line)
+
+		remaining := len(in_buf^) - (nl + 1)
+		if remaining > 0 {
+			copy(in_buf^[:remaining], in_buf^[nl + 1:])
+		}
+		resize(in_buf, remaining)
+
+		if strings.has_prefix(line, "type ") {
+			text := line[len("type "):]
+			cstr := strings.clone_to_cstring(text)
+			defer delete(cstr)
+			ev: sdl.Event
+			ev.type = .TEXT_INPUT
+			ev.text.text = cstr
+			_ = editor_handle_sdl_event(&win.editor, adapter, &ev, win.title_box)
+			window_sync_text_input(win)
+			_ = window_render(win)
+			fmt.printf("CONTROL_OK rev=%d text=%q focused=%v composing=%v\n",
+				win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
+			_ = os.flush(os.stdout)
+		} else if strings.has_prefix(line, "preedit ") {
+			rest := line[len("preedit "):]
+			sp1 := strings.index_byte(rest, ' ')
+			sp2 := sp1 >= 0 ? strings.index_byte(rest[sp1 + 1:], ' ') : -1
+			if sp1 >= 0 && sp2 >= 0 {
+				start_val, _ := strconv.parse_int(rest[:sp1])
+				len_val, _ := strconv.parse_int(rest[sp1 + 1:sp1 + 1 + sp2])
+				text := rest[sp1 + 1 + sp2 + 1:]
+				cstr := strings.clone_to_cstring(text)
+				defer delete(cstr)
+				ev: sdl.Event
+				ev.type = .TEXT_EDITING
+				ev.edit.text = cstr
+				ev.edit.start = c.int32_t(start_val)
+				ev.edit.length = c.int32_t(len_val)
+				_ = editor_handle_sdl_event(&win.editor, adapter, &ev, win.title_box)
+				window_sync_text_input(win)
+				_ = window_render(win)
+				fmt.printf("CONTROL_OK rev=%d text=%q preedit=%q focused=%v composing=%v\n",
+					win.editor.snapshot_revision, win.editor.committed_text, win.editor.preedit_text, win.editor.focused, win.editor.composing)
+				_ = os.flush(os.stdout)
+			}
+		} else if line == "escape" {
+			ev: sdl.Event
+			ev.type = .KEY_DOWN
+			ev.key.key = sdl.K_ESCAPE
+			_ = editor_handle_sdl_event(&win.editor, adapter, &ev, win.title_box)
+			window_sync_text_input(win)
+			_ = window_render(win)
+			fmt.printf("CONTROL_OK rev=%d text=%q focused=%v composing=%v\n",
+				win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
+			_ = os.flush(os.stdout)
+		} else if line == "undo" {
+			ev: sdl.Event
+			ev.type = .KEY_DOWN
+			ev.key.key = sdl.K_Z
+			ev.key.mod = sdl.KMOD_LCTRL
+			_ = editor_handle_sdl_event(&win.editor, adapter, &ev, win.title_box)
+			window_sync_text_input(win)
+			_ = window_render(win)
+			fmt.printf("CONTROL_OK rev=%d text=%q focused=%v composing=%v\n",
+				win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
+			_ = os.flush(os.stdout)
+		} else if strings.has_prefix(line, "screenshot ") {
+			path := line[len("screenshot "):]
+			window_sync_text_input(win)
+			ok := window_render(win, path)
+			if !ok {
+				fmt.printf("CONTROL_ERR screenshot failed: %s\n", path)
+				_ = os.flush(os.stdout)
+				running^ = false
+				os.exit(1)
+			}
+			fmt.printf("CONTROL_OK screenshot=%s rev=%d text=%q focused=%v composing=%v\n",
+				path, win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
+			_ = os.flush(os.stdout)
+		} else if line == "status" {
+			fmt.printf("CONTROL_OK rev=%d text=%q preedit=%q focused=%v composing=%v\n",
+				win.editor.snapshot_revision, win.editor.committed_text, win.editor.preedit_text, win.editor.focused, win.editor.composing)
+			_ = os.flush(os.stdout)
+		} else if line == "quit" {
+			fmt.println("CONTROL_OK quit")
+			_ = os.flush(os.stdout)
+			running^ = false
+			break
+		}
+	}
+}
+
 main :: proc() {
+	demo_capture_dir := ""
+	socket_path := ""
+	control_stdin := false
+
+	for i := 1; i < len(os.args); i += 1 {
+		arg := os.args[i]
+		if arg == "--demo-capture" && i + 1 < len(os.args) {
+			i += 1
+			demo_capture_dir = os.args[i]
+		} else if arg == "--socket" && i + 1 < len(os.args) {
+			i += 1
+			socket_path = os.args[i]
+		} else if arg == "--control-stdin" {
+			control_stdin = true
+		} else {
+			fmt.eprintln("usage: title-window [--socket <socket-path>] [--demo-capture <dir>]")
+			os.exit(2)
+		}
+	}
+
+	act: posix.sigaction_t
+	act.sa_handler = on_window_signal
+	posix.sigaction(.SIGINT, &act, nil)
+	posix.sigaction(.SIGTERM, &act, nil)
+	ignore: posix.sigaction_t
+	ignore.sa_handler = transmute(proc "c" (posix.Signal))posix.SIG_IGN
+	posix.sigaction(.SIGPIPE, &ignore, nil)
+
 	model: title_model.Model
 	if err := title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results"); err != .None {
 		fmt.eprintf("title_model.init failed: %v\n", err)
@@ -399,23 +580,36 @@ main :: proc() {
 	adapter := title_model_adapter(&model)
 
 	win: Title_Window
+	win.control_stdin = control_stdin
 	if !window_init(&win, adapter) {
 		os.exit(1)
 	}
 	defer window_destroy(&win)
 
-	if len(os.args) >= 3 && os.args[1] == "--demo-capture" {
-		run_demo_capture(&win, adapter, os.args[2])
+	if len(demo_capture_dir) > 0 {
+		run_demo_capture(&win, adapter, demo_capture_dir)
 		return
 	}
+
+	server: Window_Driver_Server
+	if len(socket_path) > 0 {
+		if !driver_server_start(&server, socket_path) {
+			os.exit(1)
+		}
+	}
+	defer driver_server_stop(&server)
+
+	control_buf: [dynamic]u8
+	defer delete(control_buf)
 
 	_ = window_render(&win)
 	external_step := 0
 	running := true
+	wait_ms: c.int = (server.active || control_stdin) ? 16 : 100
 
-	for running {
+	for running && !signal_stopped {
 		ev: sdl.Event
-		if sdl.WaitEventTimeout(&ev, 100) {
+		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
 				#partial switch ev.type {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
@@ -437,6 +631,13 @@ main :: proc() {
 					break
 				}
 			}
+		}
+
+		if server.active {
+			driver_server_poll(&server, &model, &win.editor, adapter)
+		}
+		if control_stdin {
+			poll_control_stdin(&win, adapter, &control_buf, &running)
 		}
 
 		window_sync_text_input(&win)

@@ -239,6 +239,20 @@ id_fields_in_range :: proc(line: string) -> bool {
 // one complete UTF-8 JSON object per line is accepted; anything
 // else is rejected before the model is touched.
 dispatch :: proc(model: ^title_model.Model, line: string) -> string {
+	return dispatch_guarded(model, line)
+}
+
+// dispatch_guarded runs the wire dispatcher with an optional pre-mutation
+// guard. Inspect and preview always run without invoking the guard. For valid
+// commit or undo requests (after wire validation, target checks, and UTF-8
+// validation), guard is called right before mutating model; returning a
+// non-empty error name aborts the mutation and replies {"ok":false,"error":"<name>"}.
+dispatch_guarded :: proc(
+	model: ^title_model.Model,
+	line: string,
+	guard_ctx: rawptr = nil,
+	guard: proc(ctx: rawptr) -> string = nil,
+) -> string {
 	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) || !id_fields_in_range(line) {
 		return reply_error("Malformed_Request")
 	}
@@ -296,6 +310,21 @@ dispatch :: proc(model: ^title_model.Model, line: string) -> string {
 			title_model.preview_destroy(&p)
 			return reply
 		}
+		if err := dagda.check_target(target, snap.object, snap.revision); err != .None {
+			if err == .Stale_Revision {
+				rev := snap.revision
+				return reply_error("Stale_Revision", &rev)
+			}
+			return reply_error("Unknown_Object")
+		}
+		if !utf8.valid_string(text) {
+			return reply_error("Invalid_Text")
+		}
+		if guard != nil {
+			if busy := guard(guard_ctx); len(busy) > 0 {
+				return reply_error(busy)
+			}
+		}
 		if err := title_model.commit(model, target, text); err != .None {
 			if err == .Stale_Revision {
 				rev := title_model.snapshot(model).revision
@@ -319,6 +348,11 @@ dispatch :: proc(model: ^title_model.Model, line: string) -> string {
 				return reply_error("Stale_Revision", &rev)
 			}
 			return reply_error("Unknown_Object")
+		}
+		if guard != nil {
+			if busy := guard(guard_ctx); len(busy) > 0 {
+				return reply_error(busy)
+			}
 		}
 		changed := title_model.undo(model)
 		after := title_model.snapshot(model)
