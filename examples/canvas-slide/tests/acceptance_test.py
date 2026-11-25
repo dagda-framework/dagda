@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[3]
 ODIN = ROOT / "scripts" / "odin.sh"
 
 LETTERBOX_RGB = (14, 16, 22)
+SHEET_RGB = (26, 31, 42)
 IDLE_CARD_RGB = (52, 108, 194)
 HOVER_CARD_RGB = (64, 124, 214)
 
@@ -222,7 +223,32 @@ def assert_bbox_matches(bounds: dict, px0: int, py0: int, px1: int, py1: int) ->
     )
 
 
-def verify_viewport(canvas_bin: Path, client_bin: Path, capture_dir: Path, size_arg: str, tag: str) -> None:
+def capture_card_state(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    png_path: Path,
+    expected_state: str,
+    timeout: float = 2.0,
+) -> tuple[int, int, int, int, int, int, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        send_control(proc, reader, f"screenshot {png_path}")
+        try:
+            return find_card_pixel_bbox(png_path, expected_state=expected_state)
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def verify_viewport(
+    canvas_bin: Path,
+    client_bin: Path,
+    capture_dir: Path,
+    size_arg: str,
+    tag: str,
+    start_over_card: bool = False,
+) -> None:
     sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-canvas-{tag}."))
     os.chmod(sock_dir, 0o700)
     sock = sock_dir / "canvas.sock"
@@ -247,33 +273,34 @@ def verify_viewport(canvas_bin: Path, client_bin: Path, capture_dir: Path, size_
         assert card["id"] == 2 and card["kind"] == "button" and "activate" in card["actions"], card
         assert card["canvas_bounds"] == {"x": 220, "y": 200, "width": 520, "height": 220}, card
         bounds = card["bounds"]
-
-        # 1. Idle state PNG check.
-        idle_png = capture_dir / f"{tag}-{size_arg}-idle.png"
-        send_control(proc, reader, f"screenshot {idle_png}")
-        png_w, png_h, px0, py0, px1, py1, st_idle = find_card_pixel_bbox(idle_png, expected_state="idle")
-        assert_bbox_matches(bounds, px0, py0, px1, py1)
-
-        # 2. Hovered state PNG check (move pointer into card via SDL_PushEvent MOUSE_MOTION).
         cx = bounds["x"] + bounds["width"] / 2.0
         cy = bounds["y"] + bounds["height"] / 2.0
+
+        # Optionally pre-position the pointer over the card to prove the sequence
+        # recovers cleanly when the pointer starts inside the card.
+        if start_over_card:
+            send_control(proc, reader, f"hover {cx:.2f} {cy:.2f}")
+            pre_png = capture_dir / f"{tag}-{size_arg}-pre-hover.png"
+            _, _, ppx0, ppy0, ppx1, ppy1, st_pre = capture_card_state(proc, reader, pre_png, "hovered")
+            assert st_pre == "hovered"
+            assert_bbox_matches(bounds, ppx0, ppy0, ppx1, ppy1)
+
+        # 1. Explicitly move pointer outside the card and wait with a deadline for idle capture.
+        send_control(proc, reader, "hover 2.00 2.00")
+        idle_png = capture_dir / f"{tag}-{size_arg}-idle.png"
+        png_w, png_h, px0, py0, px1, py1, st_idle = capture_card_state(proc, reader, idle_png, "idle")
+        assert_bbox_matches(bounds, px0, py0, px1, py1)
+
+        # 2. Move pointer inside the card and wait with a deadline for hovered capture.
         send_control(proc, reader, f"hover {cx:.2f} {cy:.2f}")
         hover_png = capture_dir / f"{tag}-{size_arg}-hover.png"
-        deadline = time.monotonic() + 2.0
-        while True:
-            send_control(proc, reader, f"screenshot {hover_png}")
-            try:
-                hw, hh, hpx0, hpy0, hpx1, hpy1, st_hover = find_card_pixel_bbox(hover_png, expected_state="hovered")
-                break
-            except AssertionError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.02)
+        hw, hh, hpx0, hpy0, hpx1, hpy1, st_hover = capture_card_state(proc, reader, hover_png, "hovered")
         assert (hw, hh) == (png_w, png_h)
         assert_bbox_matches(bounds, hpx0, hpy0, hpx1, hpy1)
 
+        start_note = " start_over_card=true" if start_over_card else ""
         print(
-            f"[{tag}] requested={size_arg} captured={png_w}x{png_h}: "
+            f"[{tag}] requested={size_arg} captured={png_w}x{png_h}{start_note}: "
             f"inspected=({bounds['x']:.1f},{bounds['y']:.1f},{bounds['width']:.1f}x{bounds['height']:.1f}) "
             f"idle_png=({px0},{py0},{px1-px0}x{py1-py0},{st_idle}) "
             f"hover_png=({hpx0},{hpy0},{hpx1-hpx0}x{hpy1-hpy0},{st_hover})"
@@ -363,6 +390,19 @@ def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, cap
             f"row {in_bot} expected card fill, got {px_in_bot}"
         )
 
+        # Sample blank sheet to the right of all elements (x=771 at 801x542).
+        x_left = (png_w - 960.0 * scale) / 2.0
+        sheet_x = 771 if (png_w, png_h) == (801, 542) else int(x_left + 924.0 * scale)
+        sh_out_top = pixel_at(png_w, rgb, sheet_x, out_top)
+        sh_in_top = pixel_at(png_w, rgb, sheet_x, in_top)
+        sh_in_bot = pixel_at(png_w, rgb, sheet_x, in_bot)
+        sh_out_bot = pixel_at(png_w, rgb, sheet_x, out_bot)
+
+        assert rgb_close(sh_out_top, LETTERBOX_RGB), f"blank sheet x={sheet_x} row {out_top} expected letterbox, got {sh_out_top}"
+        assert rgb_close(sh_out_bot, LETTERBOX_RGB), f"blank sheet x={sheet_x} row {out_bot} expected letterbox, got {sh_out_bot}"
+        assert rgb_close(sh_in_top, SHEET_RGB), f"blank sheet x={sheet_x} row {in_top} expected sheet {SHEET_RGB}, got {sh_in_top}"
+        assert rgb_close(sh_in_bot, SHEET_RGB), f"blank sheet x={sheet_x} row {in_bot} expected sheet {SHEET_RGB}, got {sh_in_bot}"
+
         # 3. Clicks at outer row pixel centers must miss; clicks at adjacent interior centers must hit.
         click_x = sample_x + 0.5
         send_control(proc, reader, f"click {click_x:.2f} {out_top + 0.5:.2f}")
@@ -379,7 +419,8 @@ def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, cap
         print(
             f"[edge] requested=801x542 captured={png_w}x{png_h} fitted_y=[{y_top:.5f},{y_bot:.5f}): "
             f"canvas_bounds=(x={cb['x']}, width={cb['width']}) "
-            f"rows out=({out_top},{out_bot}) letterbox+miss, in=({in_top},{in_bot}) card+hit (clicks=2)"
+            f"card_x={sample_x} sheet_x={sheet_x} "
+            f"rows out=({out_top},{out_bot}) letterbox+miss, in=({in_top},{in_bot}) card+sheet+hit (clicks=2)"
         )
 
         send_control(proc, reader, "quit")
@@ -404,7 +445,7 @@ def main() -> int:
     subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
 
     verify_viewport(canvas_bin, client_bin, capture_dir, "800x540", "vp1")
-    verify_viewport(canvas_bin, client_bin, capture_dir, "640x480", "vp2")
+    verify_viewport(canvas_bin, client_bin, capture_dir, "640x480", "vp2", start_over_card=True)
     verify_fractional_edge_and_precision(canvas_bin, client_bin, capture_dir)
     print("All canvas acceptance checks passed.")
     return 0

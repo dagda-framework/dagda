@@ -153,8 +153,14 @@ host_draw :: proc(h: ^Host) {
 		clip := canvas_clip_rect(fitted)
 		sdl.SetRenderClipRect(r, &clip)
 		if clip.w > 0 && clip.h > 0 {
+			sheet := sdl.FRect{
+				x = f32(clip.x),
+				y = f32(clip.y),
+				w = f32(clip.w),
+				h = f32(clip.h),
+			}
 			sdl.SetRenderDrawColor(r, 26, 31, 42, 255)
-			sdl.RenderFillRect(r, &fitted)
+			sdl.RenderFillRect(r, &sheet)
 		}
 	} else {
 		sdl.SetRenderDrawColor(r, 22, 25, 32, 255)
