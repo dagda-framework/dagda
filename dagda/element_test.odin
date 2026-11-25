@@ -1,6 +1,7 @@
 package dagda
 
 import "core:fmt"
+import "core:mem"
 import "core:testing"
 
 // Counter is the first consumer: the app owns the count and builds
@@ -174,4 +175,91 @@ test_shared_role_distinct_ids_dispatch :: proc(t: ^testing.T) {
 	testing.expect_value(t, click(frame, centre, shared_handle, &rec), Invoke_Result.Applied)
 	testing.expect_value(t, rec.last_id, Object_Id(20))
 	testing.expect_value(t, rec.calls, 2)
+}
+
+// shared_role_frame builds: button(id 10, role "shared.action"),
+// a differently named label between them, button(id 20, same role).
+shared_role_frame :: proc(t: ^testing.T) -> Frame {
+	view := View{elements = {
+		{info = {id = 10, role = "shared.action"}, kind = .Button, text = "First"},
+		{info = {id = 99, role = "other.label"}, kind = .Label, text = "Between"},
+		{info = {id = 20, role = "shared.action"}, kind = .Button, text = "Second"},
+	}}
+	frame, ok := resolve(view, {width = 320, height = 200})
+	testing.expect(t, ok)
+	return frame
+}
+
+@(test)
+test_role_query_consumer_loop :: proc(t: ^testing.T) {
+	frame := shared_role_frame(t)
+	defer frame_destroy(&frame)
+
+	// Compilable consumer loop: stop-at-first is just a break;
+	// here we walk every match in declaration order.
+	seen: [4]Resolved_Element
+	count := 0
+	query := query_by_role(frame, "shared.action")
+	for {
+		element, ok := next_match(&query)
+		if !ok {
+			break
+		}
+		seen[count] = element
+		count += 1
+	}
+	testing.expect_value(t, count, 2)
+	testing.expect_value(t, seen[0].info.id, Object_Id(10))
+	testing.expect_value(t, seen[1].info.id, Object_Id(20))
+	for i in 0 ..< count {
+		testing.expect_value(t, seen[i].kind, Element_Kind.Button)
+		testing.expect(t, Action.Activate in seen[i].actions)
+		testing.expect_value(t, seen[i].bounds, frame.elements[i * 2].bounds)
+	}
+
+	// Restart after exhaustion needs a fresh query; the exhausted
+	// one keeps reporting no match.
+	_, again := next_match(&query)
+	testing.expect(t, !again)
+	fresh := query_by_role(frame, "shared.action")
+	first, has_first := next_match(&fresh)
+	testing.expect(t, has_first)
+	testing.expect_value(t, first.info.id, Object_Id(10))
+
+	// No match.
+	none := query_by_role(frame, "missing.role")
+	_, has_none := next_match(&none)
+	testing.expect(t, !has_none)
+}
+
+@(test)
+test_role_query_empty_and_no_alloc :: proc(t: ^testing.T) {
+	empty, ok := resolve({}, {width = 100, height = 100})
+	testing.expect(t, ok)
+	defer frame_destroy(&empty)
+	query := query_by_role(empty, "shared.action")
+	_, has := next_match(&query)
+	testing.expect(t, !has)
+	_, has = next_match(&query)
+	testing.expect(t, !has)
+
+	// Traversal allocates nothing: a panic allocator would fail
+	// the test on any allocation attempt during the walk.
+	frame := shared_role_frame(t)
+	defer frame_destroy(&frame)
+	saved := context.allocator
+	context.allocator = mem.panic_allocator()
+	traversal := query_by_role(frame, "shared.action")
+	matches := 0
+	for {
+		_, found := next_match(&traversal)
+		if !found {
+			break
+		}
+		matches += 1
+	}
+	_, found_after := next_match(&traversal)
+	context.allocator = saved
+	testing.expect_value(t, matches, 2)
+	testing.expect(t, !found_after)
 }

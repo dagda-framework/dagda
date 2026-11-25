@@ -131,6 +131,39 @@ frame_destroy :: proc(frame: ^Frame) {
 	frame^ = {}
 }
 
+// A forward-only walk over the resolved elements whose role
+// matches exactly, in declaration order. Create one with
+// query_by_role and pull matches with next_match: break out of
+// the loop to stop at the first match, or keep calling until it
+// reports false to visit every match. Traversal is a single
+// forward pass and allocates nothing.
+//
+// The returned Resolved_Element is a copy of the frame's record,
+// but its text and role strings are borrowed from the view the
+// frame was resolved from: use them while that frame is alive.
+// After a frame rebuild, discard the old query and start a new
+// one against the new frame.
+Role_Query :: struct {
+	frame: Frame,
+	role:  string,
+	index: int,
+}
+
+query_by_role :: proc(frame: Frame, role: string) -> Role_Query {
+	return {frame = frame, role = role}
+}
+
+next_match :: proc(query: ^Role_Query) -> (Resolved_Element, bool) {
+	for query.index < len(query.frame.elements) {
+		element := query.frame.elements[query.index]
+		query.index += 1
+		if element.info.role == query.role {
+			return element, true
+		}
+	}
+	return {}, false
+}
+
 // find returns the resolved element with the given stable ID.
 find :: proc(frame: Frame, id: Object_Id) -> (Resolved_Element, bool) {
 	for element in frame.elements {
