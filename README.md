@@ -2,7 +2,7 @@
 
 Dagda is an experimental native UI framework for Odin, designed for applications that people and agents can operate together. In a slide editor, the headline on the canvas and the title in the outline represent the same object. The goal is for a person to edit it in either view, for an agent to propose a rename while the person works, and for either of them to undo the change.
 
-Today you can run the headless core on Linux. It demonstrates the part both interfaces will share: an Odin application defines an edit, previews its effect, and checks whether the document has changed before applying it.
+Today you can run the headless core on Linux. It demonstrates the part both interfaces will share: a title model that owns its text, previews a proposed edit without changing the document, and checks the document revision before applying it.
 
 ## Run the example
 
@@ -24,31 +24,27 @@ Retry    Stale_Revision (document still reads "Revenue grew 12%")
 
 ## Read the Odin
 
-The application defines what it means to rename a title. Dagda supplies the target, which carries an object ID and the document revision the caller saw.
+The example discovers the title by its semantic role. Dagda supplies the target, which carries the discovered object ID and the document revision the caller saw; the title model owns the role and text for its whole lifetime.
 
 ```odin
-Rename :: struct {
-	target: dagda.Action_Target,
-	text:   string,
-}
+snap := title_model.snapshot(&model)
+objects := [1]dagda.Object_Info{snap.object}
+ids: [1]dagda.Object_Id
+written, total := dagda.find_by_role(objects[:], "slide.title", ids[:])
+target := dagda.Action_Target{id = ids[0], base_revision = snap.revision}
 ```
 
-The same procedure runs on a copy of the slide for preview and on the original for commit.
+A preview clones the proposed text into storage the preview itself owns, so the document still reads the old title and discarding the preview changes nothing. Commit checks the ID and revision before installing its own copy of the new text.
 
 ```odin
-apply :: proc(slide: ^Slide, action: Rename) -> dagda.Action_Error {
-	if err := dagda.check_target(action.target, slide.title.object, slide.revision); err != .None {
-		return err
-	}
-	if action.text != slide.title.text {
-		slide.title.text = action.text
-		slide.revision += 1
-	}
-	return .None
+p, preview_err := title_model.preview(&model, target, "Revenue grew 12%")
+if err := title_model.commit(&model, target, "Revenue grew 12%"); err != .None {
+	panic("Example commit failed")
 }
+err := title_model.commit(&model, target, "An edit based on the old revision")
 ```
 
-A second proposal can still name the right title and be out of date. Checking the revision before writing gives the caller a chance to read the new headline and reconsider its edit. [Full example](examples/shared-title/main.odin) · [Dagda core](dagda/core.odin)
+A second proposal can still name the right title and be out of date: that retry reports `Stale_Revision`. Checking the revision before writing gives the caller a chance to read the new headline and reconsider its edit. [Full example](examples/shared-title/main.odin) · [Title model](examples/title-model/title_model.odin) · [Dagda core](dagda/core.odin)
 
 ## From the document to the window
 

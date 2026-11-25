@@ -151,6 +151,53 @@ test_alloc_failure_leaves_state_untouched :: proc(t: ^testing.T) {
 	testing.expect_value(t, snapshot(&model).revision, dagda.Revision(2))
 }
 
+Budget_State :: struct {
+	backing: mem.Allocator,
+	allowed: int,
+}
+
+budget_allocator_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	state := (^Budget_State)(data)
+	if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+		if state.allowed <= 0 {
+			return nil, .Out_Of_Memory
+		}
+		state.allowed -= 1
+	}
+	return state.backing.procedure(state.backing.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+@(test)
+test_role_owned_not_borrowed :: proc(t: ^testing.T) {
+	role_buf := []u8{'s', 'l', 'i', 'd', 'e', '.', 't', 'i', 't', 'l', 'e'}
+	model: Model
+	testing.expect_value(t, init(&model, {id = 7, role = string(role_buf)}, "Quarterly results"), Error.None)
+	defer destroy(&model)
+	// Reusing the caller's storage must not change the model's role.
+	for &b in role_buf {
+		b = 'x'
+	}
+	snap := snapshot(&model)
+	testing.expect_value(t, snap.object.role, "slide.title")
+	objects := [1]dagda.Object_Info{snap.object}
+	ids: [1]dagda.Object_Id = {999}
+	written, total := dagda.find_by_role(objects[:], "slide.title", ids[:])
+	testing.expect_value(t, written, 1)
+	testing.expect_value(t, total, 1)
+	testing.expect_value(t, ids[0], dagda.Object_Id(7))
+}
+
+@(test)
+test_init_partial_alloc_failure_cleans_up :: proc(t: ^testing.T) {
+	// Only the first allocation (text) succeeds; the role clone fails.
+	state := Budget_State{backing = context.allocator, allowed = 1}
+	allocator := mem.Allocator{procedure = budget_allocator_proc, data = &state}
+	model: Model
+	testing.expect_value(t, init(&model, {id = 1, role = "slide.title"}, "Quarterly results", allocator), Error.Alloc_Failed)
+	testing.expect_value(t, snapshot(&model).text, "")
+	testing.expect_value(t, snapshot(&model).object.role, "")
+}
+
 @(test)
 test_invalid_text_rejected :: proc(t: ^testing.T) {
 	model := make_model(t)

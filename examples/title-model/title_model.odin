@@ -12,14 +12,16 @@ Error :: enum {
 	Alloc_Failed,
 }
 
-// One title with a stable ID and document-owned UTF-8 text.
-// Storage is owned by the model; call destroy to release it.
+// One title with a stable ID, an owned semantic role and
+// document-owned UTF-8 text. Storage is owned by the model
+// for its whole lifetime; call destroy to release it.
 Model :: struct {
-	object:    dagda.Object_Info,
-	revision:  dagda.Revision,
-	allocator: mem.Allocator,
-	text:      []u8,
-	history:   []u8,
+	object:      dagda.Object_Info,
+	revision:    dagda.Revision,
+	allocator:   mem.Allocator,
+	role:        []u8,
+	text:        []u8,
+	history:     []u8,
 	has_history: bool,
 }
 
@@ -38,6 +40,15 @@ Preview :: struct {
 	allocator: mem.Allocator,
 	storage:   []u8,
 	text:      string,
+}
+
+clone_bytes :: proc(text: string, allocator: mem.Allocator) -> ([]u8, Error) {
+	storage, err := make([]u8, len(text), allocator)
+	if err != nil {
+		return nil, .Alloc_Failed
+	}
+	copy(storage, text)
+	return storage, .None
 }
 
 clone_text :: proc(text: string, allocator: mem.Allocator) -> ([]u8, Error) {
@@ -64,20 +75,31 @@ action_error :: proc(err: dagda.Action_Error) -> Error {
 	return .None
 }
 
-// init clones text into document-owned storage at revision 0 with
-// no undo history. On failure the model is left zeroed.
+// init clones role and text into document-owned storage at
+// revision 0 with no undo history, so neither borrows caller
+// storage. On failure any partial allocation is released and
+// the model is left zeroed.
 init :: proc(model: ^Model, object: dagda.Object_Info, text: string, allocator := context.allocator) -> Error {
 	storage, err := clone_text(text, allocator)
 	if err != .None {
 		model^ = {}
 		return err
 	}
-	model^ = {object = object, revision = 0, allocator = allocator, text = storage}
+	role, role_err := clone_bytes(object.role, allocator)
+	if role_err != .None {
+		delete(storage, allocator)
+		model^ = {}
+		return role_err
+	}
+	owned := object
+	owned.role = string(role)
+	model^ = {object = owned, revision = 0, allocator = allocator, role = role, text = storage}
 	return .None
 }
 
 destroy :: proc(model: ^Model) {
 	delete(model.text, model.allocator)
+	delete(model.role, model.allocator)
 	if model.has_history {
 		delete(model.history, model.allocator)
 	}
