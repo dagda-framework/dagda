@@ -74,3 +74,28 @@ test_blank_trailing_and_utf8_rejected_before_dispatch :: proc(t: ^testing.T) {
 	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":-1,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Malformed_Request\"}")
 	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":1.5,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Malformed_Request\"}")
 }
+
+@(test)
+test_id_fields_signed_range_from_raw_tokens :: proc(t: ^testing.T) {
+	model := fresh_model(t)
+	defer title_model.destroy(&model)
+	// Signed maximum is in range for both fields: the requests are
+	// dispatched and answered with the model's own distinctions.
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":9223372036854775807,\"base_revision\":0,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Unknown_Object\"}")
+	expect_reply(t, &model, "{\"op\":\"commit\",\"id\":1,\"base_revision\":9223372036854775807,\"text\":\"X\"}", "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":0}")
+	// Beyond the maximum, including a huge decimal that a narrowing
+	// conversion would turn into a small positive integer, is
+	// malformed for either field and leaves the document unchanged.
+	huge := []string{
+		"{\"op\":\"commit\",\"id\":9223372036854775808,\"base_revision\":0,\"text\":\"X\"}",
+		"{\"op\":\"commit\",\"id\":1,\"base_revision\":9223372036854775808,\"text\":\"X\"}",
+		"{\"op\":\"commit\",\"id\":18446744073709551617,\"base_revision\":0,\"text\":\"X\"}",
+		"{\"op\":\"commit\",\"id\":1,\"base_revision\":18446744073709551617,\"text\":\"X\"}",
+		"{\"op\":\"undo\",\"id\":99999999999999999999999999,\"base_revision\":0}",
+		"{\"op\":\"undo\",\"id\":1,\"base_revision\":99999999999999999999999999}",
+	}
+	for line in huge {
+		expect_reply(t, &model, line, "{\"ok\":false,\"error\":\"Malformed_Request\"}")
+	}
+	expect_reply(t, &model, "{\"op\":\"inspect\",\"role\":\"slide.title\"}", "{\"ok\":true,\"id\":1,\"revision\":0,\"text\":\"Quarterly results\",\"role\":\"slide.title\"}")
+}

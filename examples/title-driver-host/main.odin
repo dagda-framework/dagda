@@ -33,12 +33,14 @@ main :: proc() {
 	ignore.sa_handler = transmute(proc "c" (posix.Signal))posix.SIG_IGN
 	posix.sigaction(.SIGPIPE, &ignore, nil)
 
-	listen_fd, ok := driver.listen_unix(path)
+	// The identity captured at bind time travels through listen
+	// failure (inside listen_unix), model init failure and
+	// shutdown, so cleanup always names the host's own entry.
+	listen_fd, identity, ok := driver.listen_unix(path)
 	if !ok {
 		fmt.eprintf("could not listen on %s\n", path)
 		os.exit(1)
 	}
-	identity := driver.endpoint_identity(path)
 	cleanup := proc(fd: posix.FD, path: string, identity: driver.Endpoint_Identity) {
 		posix.close(fd)
 		driver.remove_unix_owned(path, identity)

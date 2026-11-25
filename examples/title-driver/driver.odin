@@ -153,13 +153,78 @@ single_object :: proc(line: string) -> bool {
 	}
 }
 
+MAX_WIRE_INT :: "9223372036854775807"
+
+// numeric_token_in_range reports whether a raw JSON number token
+// is a non-negative integer within the signed 64-bit range. The
+// check runs on the original token text, before any conversion,
+// so a huge decimal that would narrow or wrap is rejected.
+numeric_token_in_range :: proc(kind: json.Token_Kind, text: string) -> bool {
+	if kind != .Integer || len(text) == 0 {
+		return false
+	}
+	for i in 0 ..< len(text) {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	trimmed := text
+	for len(trimmed) > 1 && trimmed[0] == '0' {
+		trimmed = trimmed[1:]
+	}
+	if len(trimmed) != len(MAX_WIRE_INT) {
+		return len(trimmed) < len(MAX_WIRE_INT)
+	}
+	return trimmed <= MAX_WIRE_INT
+}
+
+// id_fields_in_range validates every top-level id / base_revision
+// value from its original numeric token, consistent with the
+// client's signed-range parsing.
+id_fields_in_range :: proc(line: string) -> bool {
+	t := json.make_tokenizer(line, .JSON, true)
+	depth := 0
+	last_key := ""
+	pending := false
+	for {
+		token, err := json.get_token(&t)
+		if token.kind == .EOF {
+			return true
+		}
+		if err != .None {
+			return false
+		}
+		if pending {
+			if depth == 1 && !numeric_token_in_range(token.kind, token.text) {
+				return false
+			}
+			pending = false
+		}
+		switch token.kind {
+		case .Open_Brace, .Open_Bracket:
+			depth += 1
+		case .Close_Brace, .Close_Bracket:
+			depth -= 1
+		case .String:
+			if depth == 1 {
+				last_key = token.text
+			}
+		case .Colon:
+			if depth == 1 && (last_key == "\"id\"" || last_key == "\"base_revision\"") {
+				pending = true
+			}
+		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .Ident, .Comma, .EOF, .Invalid:
+		}
+	}
+}
+
 // dispatch handles one request line against the supplied model and
 // returns one owned reply line (without newline; caller deletes it).
 // It is transport-independent: no socket code lives here. Exactly
 // one complete UTF-8 JSON object per line is accepted; anything
 // else is rejected before the model is touched.
 dispatch :: proc(model: ^title_model.Model, line: string) -> string {
-	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) {
+	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) || !id_fields_in_range(line) {
 		return reply_error("Malformed_Request")
 	}
 	value, parse_err := json.parse_string(line, .JSON, true)

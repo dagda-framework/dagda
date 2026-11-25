@@ -151,6 +151,19 @@ def main():
         assert json.loads(out)["text"] == "Quarterly results", out
         assert json.loads(out)["revision"] == 2, out
 
+        # Signed-range wire validation from raw tokens, both fields.
+        for req in [
+            '{"op":"commit","id":9223372036854775808,"base_revision":2,"text":"X"}',
+            '{"op":"commit","id":1,"base_revision":18446744073709551617,"text":"X"}',
+        ]:
+            lines = raw_exchange(sock, [req.encode() + b"\n"], replies=1)
+            assert json.loads(lines[0]) == {"ok": False, "error": "Malformed_Request"}, lines
+        out, _ = client(client_bin, sock, "inspect", "slide.title")
+        assert json.loads(out)["revision"] == 2, out
+        # CLI rejects out-of-range numbers the wire would reject.
+        r = run([client_bin, sock, "commit", "9223372036854775808", "2", "X"])
+        assert r.returncode == 2, r
+
         # A replacement entry at the socket path is preserved on
         # shutdown; only the host's own endpoint is removed.
         os.unlink(sock)
@@ -171,6 +184,27 @@ def main():
         with open(sock) as f:
             assert f.read() == "keep me"
         os.unlink(sock)
+
+        # A replacement symlink to the moved original socket is
+        # preserved on shutdown (no-follow identity check).
+        proc = subprocess.Popen([host, sock], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for _ in range(100):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        assert os.path.exists(sock)
+        moved = sock + ".moved"
+        os.rename(sock, moved)
+        os.symlink(moved, sock)
+        proc.terminate()
+        proc.wait(timeout=10)
+        proc = None
+        assert os.path.islink(sock), "replacement symlink was removed"
+        assert os.readlink(sock) == moved
+        assert os.path.exists(moved), "moved original socket was removed"
+        os.unlink(sock)
+        os.unlink(moved)
 
         # And a host that still owns its endpoint removes it on SIGTERM.
         proc = subprocess.Popen([host, sock], stdout=subprocess.PIPE,

@@ -32,7 +32,9 @@ Endpoint_Identity :: struct {
 }
 
 // endpoint_identity identifies the filesystem entry at path so a
-// later cleanup can tell its own endpoint from a replacement.
+// later cleanup can tell its own endpoint from a replacement. It
+// uses a no-follow lookup: a symlink at path is identified as the
+// symlink itself, never as its target.
 endpoint_identity :: proc(path: string) -> Endpoint_Identity {
 	buf: [128]u8
 	cpath := path_cstring(path, &buf)
@@ -40,7 +42,7 @@ endpoint_identity :: proc(path: string) -> Endpoint_Identity {
 		return {}
 	}
 	st: posix.stat_t
-	if posix.stat(cpath, &st) != .OK {
+	if posix.lstat(cpath, &st) != .OK {
 		return {}
 	}
 	return {dev = st.st_dev, ino = st.st_ino, valid = true}
@@ -63,29 +65,31 @@ remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
 	}
 }
 
-// listen_unix binds a stream socket at path. The caller owns the
-// endpoint; capture endpoint_identity(path) and release it with
-// remove_unix_owned so a replacement entry is never removed.
-listen_unix :: proc(path: string) -> (posix.FD, bool) {
+// listen_unix binds a stream socket at path and, immediately
+// after a successful bind, captures the bound entry's own
+// identity with a no-follow lookup. The caller passes that
+// identity to remove_unix_owned on shutdown (and to any failure
+// cleanup) so a replacement entry is never removed.
+listen_unix :: proc(path: string) -> (posix.FD, Endpoint_Identity, bool) {
 	addr, ok := make_addr(path)
 	if !ok {
-		return -1, false
+		return -1, {}, false
 	}
 	fd := posix.socket(.UNIX, .STREAM)
 	if fd < 0 {
-		return -1, false
+		return -1, {}, false
 	}
 	if posix.bind(fd, (^posix.sockaddr)(&addr), posix.socklen_t(size_of(addr))) != .OK {
 		posix.close(fd)
-		return -1, false
+		return -1, {}, false
 	}
+	identity := endpoint_identity(path)
 	if posix.listen(fd, 16) != .OK {
-		identity := endpoint_identity(path)
 		posix.close(fd)
 		remove_unix_owned(path, identity)
-		return -1, false
+		return -1, {}, false
 	}
-	return fd, true
+	return fd, identity, true
 }
 
 connect_unix :: proc(path: string) -> (posix.FD, bool) {

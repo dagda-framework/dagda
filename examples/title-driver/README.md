@@ -48,7 +48,14 @@ kill %1   # the host removes its own socket file on SIGINT/SIGTERM
 The client prints the single JSON reply and exits `0` when
 `ok` is true, `1` otherwise. The socket path is always explicit;
 the host refuses to start if the path already exists and only
-ever removes the endpoint it created.
+ever removes the endpoint it created: it records the bound
+entry's identity (device and inode, via a no-follow lookup) at
+bind time and unlinks the path at shutdown only if that same
+entry is still there, so a replacement file or symlink is
+preserved. This assumes the socket directory itself is owned
+by the user running the host and is not writable by other
+local users who could swap entries mid-run; use a private
+directory such as a per-user temporary directory.
 
 ## Tests
 
