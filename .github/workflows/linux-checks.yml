@@ -65,6 +65,12 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/counter/tests/acceptance_test.py build/counter-capture
 
+      - name: Run the agent preview acceptance test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/canvas-slide/tests/agent_preview_acceptance.py
+
       - name: Run the native canvas acceptance test
         env:
           SDL_VIDEODRIVER: dummy
