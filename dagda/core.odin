@@ -29,3 +29,20 @@ check_target :: proc(target: Action_Target, object: Object_Info, revision: Revis
 	}
 	return .None
 }
+
+// find_by_role writes IDs of objects whose role exactly matches role into out
+// in input order, leaving any unused tail of out untouched. It allocates no
+// memory and returns the number of IDs written and the total number of matches.
+find_by_role :: proc(objects: []Object_Info, role: string, out: []Object_Id) -> (written: int, total: int) {
+	for object in objects {
+		if object.role != role {
+			continue
+		}
+		if written < len(out) {
+			out[written] = object.id
+			written += 1
+		}
+		total += 1
+	}
+	return written, total
+}
