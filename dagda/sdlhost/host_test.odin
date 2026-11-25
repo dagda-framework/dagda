@@ -932,6 +932,123 @@ test_preedit_caret_pixel_and_sdl_text_input_area_at_two_scales :: proc(t: ^testi
 }
 
 @(test)
+test_dual_undo_handlers_one_keypress_one_undo :: proc(t: ^testing.T) {
+	Dual_Undo_App :: struct {
+		field_undo_calls: int,
+		app_undo_calls:   int,
+		elements:         [2]dagda.Canvas_Element,
+	}
+	field_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
+		a := (^Dual_Undo_App)(user_data)
+		if id == 1 {
+			a.field_undo_calls += 1
+			return true
+		}
+		return false
+	}
+	app_undo :: proc(user_data: rawptr) -> bool {
+		a := (^Dual_Undo_App)(user_data)
+		a.app_undo_calls += 1
+		return true
+	}
+
+	app_state := Dual_Undo_App{
+		elements = {
+			{info = {id = 1, role = "slide.headline"}, kind = .Label, text = "Slide Canvas", bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = 220, y = 200, width = 520, height = 220}},
+		},
+	}
+	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = app_state.elements[:]}, {width = 800, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	h: Host
+	h.frame = frame
+	h.app = App{
+		user_data = &app_state,
+		on_undo   = app_undo,
+		text_edit = {
+			enabled   = true,
+			target_id = 1,
+			on_undo   = field_undo,
+		},
+	}
+	defer text_edit_destroy(&h.text_edit)
+
+	key_ev :: proc(key: sdl.Keycode, mod: sdl.Keymod = {}, repeat := false) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = key
+		ev.key.mod = mod
+		ev.key.repeat = repeat
+		return ev
+	}
+
+	// 1. Focus the text field: one initial Ctrl+Z calls field_undo exactly once, app_undo 0 times.
+	testing.expect(t, text_edit_focus(&h.text_edit, nil, nil, h.frame, h.app.text_edit))
+	ev := key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	rebuild, _, _ := host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, rebuild, true)
+	testing.expect_value(t, app_state.field_undo_calls, 1)
+	testing.expect_value(t, app_state.app_undo_calls, 0)
+
+	// 2. Modified/repeat Ctrl+Z while field is focused leave both callback counts unchanged.
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LGUI)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, app_state.field_undo_calls, 1)
+	testing.expect_value(t, app_state.app_undo_calls, 0)
+
+	// 3. During composition, Ctrl+Z preserves the preedit and history (neither handler called).
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "café"
+	pre.edit.start = 0
+	pre.edit.length = 4
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &app_state, &pre)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, rebuild, false)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "café")
+	testing.expect_value(t, app_state.field_undo_calls, 1)
+	testing.expect_value(t, app_state.app_undo_calls, 0)
+
+	// Cancel composition, then Tab transfers focus to button 2 and blurs text field.
+	esc := key_ev(sdl.K_ESCAPE)
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), false)
+
+	tab := key_ev(sdl.K_TAB)
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, h.focus.has_focus, true)
+	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(2))
+
+	// 4. With button focused, one initial Ctrl+Z calls app_undo exactly once, field_undo unchanged.
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, rebuild, true)
+	testing.expect_value(t, app_state.field_undo_calls, 1)
+	testing.expect_value(t, app_state.app_undo_calls, 1)
+
+	// 5. Modified/repeat Ctrl+Z with button focused leave both callback counts unchanged.
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LGUI)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	_, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, app_state.field_undo_calls, 1)
+	testing.expect_value(t, app_state.app_undo_calls, 1)
+}
+
+@(test)
 test_canvas_editable_text_click_places_caret_at_two_viewports :: proc(t: ^testing.T) {
 	font: Font
 	if !font_init(&font) {

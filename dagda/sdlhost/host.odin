@@ -548,6 +548,65 @@ host_handle_pointer_cancel_event :: proc(h: ^Host, ev: ^sdl.Event) -> (res: Poin
 	return res
 }
 
+is_initial_ctrl_z :: proc(ev: ^sdl.Event) -> bool {
+	return ev.type == .KEY_DOWN &&
+		!ev.key.repeat &&
+		ev.key.key == sdl.K_Z &&
+		(ev.key.mod & sdl.KMOD_CTRL) != {} &&
+		(ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {}
+}
+
+// host_dispatch_key_event routes KEY_DOWN, KEY_UP, and WINDOW_FOCUS_LOST in
+// priority order: active pointer gesture cancellation, focused editable text
+// (including field-scoped Ctrl+Z and composition protection), app-level Ctrl+Z
+// when the text field is not focused, and button keyboard focus.
+host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
+	pres := host_handle_pointer_cancel_event(h, ev)
+	if pres.changed {
+		needs_rebuild = true
+	}
+	if pres.consumed {
+		return
+	}
+
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev)
+	if tres.needs_redraw {
+		h.needs_redraw = true
+	}
+	if tres.needs_rebuild {
+		needs_rebuild = true
+	}
+	if tres.has_pending_edit {
+		has_pending_edit = true
+		pending_edit = tres.pending_edit
+	}
+	if tres.consumed {
+		return
+	}
+
+	if is_initial_ctrl_z(ev) && h.app.on_undo != nil {
+		if h.app.on_undo(h.app.user_data) {
+			needs_rebuild = true
+		}
+		return
+	}
+
+	applied, redraw := focus_handle_event(&h.focus, h.frame, ev, h.app.handle, h.app.user_data)
+	if h.focus.has_focus && h.text_edit.focused {
+		// Keyboard focus belongs to one element at a time:
+		// end the text-input session when Tab/Shift+Tab focuses a button.
+		_ = text_edit_blur(&h.text_edit, h.ime_window)
+		h.needs_redraw = true
+	}
+	if redraw {
+		h.needs_redraw = true
+	}
+	if applied {
+		needs_rebuild = true
+	}
+	return
+}
+
 run :: proc(app: App, opts: Run_Options = {}) -> int {
 	signal_stopped = false
 	act: posix.sigaction_t
@@ -724,48 +783,16 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						}
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
-					pres := host_handle_pointer_cancel_event(&h, &ev)
-					if pres.changed {
+					needs_rebuild, has_pending_edit, pending_edit := host_dispatch_key_event(&h, &ev)
+					if needs_rebuild {
 						if !host_rebuild_frame(&h) {
+							if has_pending_edit {
+								dagda.edit_destroy(&h.text_edit.session, &pending_edit)
+							}
 							exit_code = 1
 							running = false
-						}
-					}
-					t_consumed := false
-					if running && !pres.consumed {
-						tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev)
-						t_consumed = tres.consumed
-						if tres.needs_redraw {
-							h.needs_redraw = true
-						}
-						if tres.needs_rebuild {
-							if !host_rebuild_frame(&h) {
-								if tres.has_pending_edit {
-									dagda.edit_destroy(&h.text_edit.session, &tres.pending_edit)
-								}
-								exit_code = 1
-								running = false
-							} else if tres.has_pending_edit {
-								text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
-							}
-						}
-					}
-					if running && !pres.consumed && !t_consumed {
-						applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
-						if h.focus.has_focus && h.text_edit.focused {
-							// Keyboard focus belongs to one element at a time:
-							// end the text-input session when Tab/Shift+Tab focuses a button.
-							_ = text_edit_blur(&h.text_edit, h.ime_window)
-							h.needs_redraw = true
-						}
-						if redraw {
-							h.needs_redraw = true
-						}
-						if applied {
-							if !host_rebuild_frame(&h) {
-								exit_code = 1
-								running = false
-							}
+						} else if has_pending_edit {
+							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &pending_edit)
 						}
 					}
 				}
