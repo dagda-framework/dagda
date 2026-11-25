@@ -17,13 +17,14 @@ Canvas_Proc :: #type proc(user_data: rawptr) -> dagda.Canvas
 // App describes a native Dagda application hosted in an SDL3 window.
 // Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
 App :: struct {
-	title:     string,
-	width:     i32,
-	height:    i32,
-	user_data: rawptr,
-	view:      View_Proc,
-	canvas:    Canvas_Proc,
-	handle:    dagda.Action_Handler,
+	title:      string,
+	width:      i32,
+	height:     i32,
+	user_data:  rawptr,
+	view:       View_Proc,
+	canvas:     Canvas_Proc,
+	handle:     dagda.Action_Handler,
+	on_pointer: Pointer_Handler,
 }
 
 Run_Options :: struct {
@@ -86,6 +87,7 @@ Host :: struct {
 	hovered_id:   dagda.Object_Id,
 	has_pressed:  bool,
 	pressed_id:   dagda.Object_Id,
+	pointer:      Pointer_State,
 	focus:        Focus_State,
 	needs_redraw: bool,
 }
@@ -253,31 +255,26 @@ host_render :: proc(h: ^Host, screenshot_path := "") -> bool {
 	return ok
 }
 
+push_sdl_button :: proc(window: ^sdl.Window, x, y: f32, down: bool) -> bool {
+	win_id := sdl.GetWindowID(window)
+	ev: sdl.Event
+	ev.type = down ? .MOUSE_BUTTON_DOWN : .MOUSE_BUTTON_UP
+	ev.button.windowID = win_id
+	ev.button.button = sdl.BUTTON_LEFT
+	ev.button.down = down
+	ev.button.clicks = 1
+	ev.button.x = x
+	ev.button.y = y
+	return sdl.PushEvent(&ev)
+}
+
 // push_sdl_click injects a real mouse button down + up pair into SDL3's event
 // queue so automated tests exercise the exact SDL pointer input path.
 push_sdl_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
-	win_id := sdl.GetWindowID(window)
-	down: sdl.Event
-	down.type = .MOUSE_BUTTON_DOWN
-	down.button.windowID = win_id
-	down.button.button = sdl.BUTTON_LEFT
-	down.button.down = true
-	down.button.clicks = 1
-	down.button.x = x
-	down.button.y = y
-	if !sdl.PushEvent(&down) {
+	if !push_sdl_button(window, x, y, true) {
 		return false
 	}
-
-	up: sdl.Event
-	up.type = .MOUSE_BUTTON_UP
-	up.button.windowID = win_id
-	up.button.button = sdl.BUTTON_LEFT
-	up.button.down = false
-	up.button.clicks = 1
-	up.button.x = x
-	up.button.y = y
-	return sdl.PushEvent(&up)
+	return push_sdl_button(window, x, y, false)
 }
 
 push_sdl_hover :: proc(window: ^sdl.Window, x, y: f32) -> bool {
@@ -304,6 +301,8 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		key = sdl.K_RETURN
 	case "space":
 		key = sdl.K_SPACE
+	case "escape":
+		key = sdl.K_ESCAPE
 	case:
 		return false
 	}
@@ -382,17 +381,46 @@ poll_control_stdin :: proc(
 					_ = os.flush(os.stdout)
 				}
 			}
-		} else if strings.has_prefix(line, "hover ") {
-			rest := line[len("hover "):]
+		} else if strings.has_prefix(line, "hover ") || strings.has_prefix(line, "move ") {
+			is_move := strings.has_prefix(line, "move ")
+			rest := is_move ? line[len("move "):] : line[len("hover "):]
 			sp := strings.index_byte(rest, ' ')
 			if sp >= 0 {
 				x, ok_x := strconv.parse_f32(rest[:sp])
 				y, ok_y := strconv.parse_f32(rest[sp + 1:])
 				if ok_x && ok_y && push_sdl_hover(h.window, x, y) {
-					fmt.printf("CONTROL_OK hover %.2f %.2f\n", x, y)
+					fmt.printf("CONTROL_OK %s %.2f %.2f\n", is_move ? "move" : "hover", x, y)
 					_ = os.flush(os.stdout)
 				} else {
-					fmt.println("CONTROL_ERR invalid hover")
+					fmt.println("CONTROL_ERR invalid move")
+					_ = os.flush(os.stdout)
+				}
+			}
+		} else if strings.has_prefix(line, "down ") {
+			rest := line[len("down "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp >= 0 {
+				x, ok_x := strconv.parse_f32(rest[:sp])
+				y, ok_y := strconv.parse_f32(rest[sp + 1:])
+				if ok_x && ok_y && push_sdl_button(h.window, x, y, true) {
+					fmt.printf("CONTROL_OK down %.2f %.2f\n", x, y)
+					_ = os.flush(os.stdout)
+				} else {
+					fmt.println("CONTROL_ERR invalid down")
+					_ = os.flush(os.stdout)
+				}
+			}
+		} else if strings.has_prefix(line, "up ") {
+			rest := line[len("up "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp >= 0 {
+				x, ok_x := strconv.parse_f32(rest[:sp])
+				y, ok_y := strconv.parse_f32(rest[sp + 1:])
+				if ok_x && ok_y && push_sdl_button(h.window, x, y, false) {
+					fmt.printf("CONTROL_OK up %.2f %.2f\n", x, y)
+					_ = os.flush(os.stdout)
+				} else {
+					fmt.println("CONTROL_ERR invalid up")
 					_ = os.flush(os.stdout)
 				}
 			}
@@ -423,6 +451,22 @@ poll_control_stdin :: proc(
 			break
 		}
 	}
+}
+
+host_clear_pressed_on_cancel :: proc(h: ^Host) {
+	if h.has_pressed {
+		h.has_pressed = false
+		h.pressed_id = 0
+	}
+	h.needs_redraw = true
+}
+
+host_handle_pointer_cancel_event :: proc(h: ^Host, ev: ^sdl.Event) -> (res: Pointer_Result) {
+	res = pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
+	if res.cancelled {
+		host_clear_pressed_on_cancel(h)
+	}
+	return res
 }
 
 run :: proc(app: App, opts: Run_Options = {}) -> int {
@@ -495,41 +539,101 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .MOUSE_MOTION:
-					id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
-					if hit != h.has_hovered || (hit && id != h.hovered_id) {
-						h.has_hovered = hit
-						h.hovered_id = hit ? id : 0
-						h.needs_redraw = true
+					pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+					if pres.changed {
+						if !host_rebuild_frame(&h) {
+							exit_code = 1
+							running = false
+						}
+					}
+					if running && !pres.consumed {
+						id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
+						if hit != h.has_hovered || (hit && id != h.hovered_id) {
+							h.has_hovered = hit
+							h.hovered_id = hit ? id : 0
+							h.needs_redraw = true
+						}
 					}
 				case .MOUSE_BUTTON_DOWN:
 					if ev.button.button == sdl.BUTTON_LEFT {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
 						h.has_pressed = hit
 						h.pressed_id = hit ? id : 0
-						if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
+						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+						if pres.changed {
 							if !host_rebuild_frame(&h) {
 								exit_code = 1
 								running = false
 							}
-						} else {
+						}
+						if running && !pres.suppress_click {
+							if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
+								if !host_rebuild_frame(&h) {
+									exit_code = 1
+									running = false
+								}
+							} else {
+								h.needs_redraw = true
+							}
+						} else if running && !pres.changed {
 							h.needs_redraw = true
+						}
+					} else if ev.button.button == sdl.BUTTON_RIGHT && h.pointer.active {
+						pres := host_handle_pointer_cancel_event(&h, &ev)
+						if pres.changed {
+							if !host_rebuild_frame(&h) {
+								exit_code = 1
+								running = false
+							}
 						}
 					}
 				case .MOUSE_BUTTON_UP:
-					if ev.button.button == sdl.BUTTON_LEFT && h.has_pressed {
-						h.has_pressed = false
-						h.pressed_id = 0
-						h.needs_redraw = true
+					if ev.button.button == sdl.BUTTON_LEFT {
+						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
+						if h.has_pressed {
+							h.has_pressed = false
+							h.pressed_id = 0
+							h.needs_redraw = true
+						}
+						if pres.changed {
+							if !host_rebuild_frame(&h) {
+								exit_code = 1
+								running = false
+							}
+						}
+						if running && pres.consumed && !pres.suppress_click && pres.has_click_id {
+							if pointer_try_activate(
+								h.frame,
+								{x = ev.button.x, y = ev.button.y},
+								pres.click_target_id,
+								h.app.handle,
+								h.app.user_data,
+							) {
+								if !host_rebuild_frame(&h) {
+									exit_code = 1
+									running = false
+								}
+							}
+						}
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
-					applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
-					if redraw {
-						h.needs_redraw = true
-					}
-					if applied {
+					pres := host_handle_pointer_cancel_event(&h, &ev)
+					if pres.changed {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1
 							running = false
+						}
+					}
+					if running && !pres.consumed {
+						applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
+						if redraw {
+							h.needs_redraw = true
+						}
+						if applied {
+							if !host_rebuild_frame(&h) {
+								exit_code = 1
+								running = false
+							}
 						}
 					}
 				}
