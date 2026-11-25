@@ -320,3 +320,75 @@ test_nonterminal_preedit_caret_selection_and_composing_replacement :: proc(t: ^t
 	testing.expect_value(t, state.anchor, len("Quarterly "))
 	testing.expect_value(t, state.caret, len("Quarterly results"))
 }
+
+@(test)
+test_ft_bitmap_copy_positive_and_negative_padded_pitch :: proc(t: ^testing.T) {
+	// Positive pitch (top-to-bottom) with 2 trailing padding bytes per row.
+	pos_buf := [?]u8{
+		10, 20, 30, 0xEE, 0xEE, // row 0 (top)
+		40, 50, 60, 0xEE, 0xEE, // row 1 (bottom)
+	}
+	pos_bmp := FT_Bitmap{
+		rows       = 2,
+		width      = 3,
+		pitch      = 5,
+		buffer     = raw_data(pos_buf[:]),
+		num_grays  = 256,
+		pixel_mode = FT_PIXEL_MODE_GRAY,
+	}
+	pos_alpha, pos_ok := copy_ft_bitmap_alpha(pos_bmp)
+	defer delete(pos_alpha)
+	testing.expect_value(t, pos_ok, true)
+	testing.expect(t, slice.equal(pos_alpha, []u8{10, 20, 30, 40, 50, 60}),
+		"Expected top-to-bottom 3x2 pixels with padding stripped")
+
+	// Negative pitch (bottom-to-top): buffer[0..4] is bottom row, buffer[4..8] is top row.
+	neg_buf := [?]u8{
+		40, 50, 60, 0xDD, // bottom row
+		10, 20, 30, 0xDD, // top row
+	}
+	neg_bmp := FT_Bitmap{
+		rows       = 2,
+		width      = 3,
+		pitch      = -4,
+		buffer     = raw_data(neg_buf[:]),
+		num_grays  = 256,
+		pixel_mode = FT_PIXEL_MODE_GRAY,
+	}
+	neg_alpha, neg_ok := copy_ft_bitmap_alpha(neg_bmp)
+	defer delete(neg_alpha)
+	testing.expect_value(t, neg_ok, true)
+	testing.expect(t, slice.equal(neg_alpha, []u8{10, 20, 30, 40, 50, 60}),
+		"Expected negative-pitch bottom-up rows flipped to top-to-bottom with padding stripped")
+}
+
+@(test)
+test_ft_bitmap_copy_rejects_unsupported_formats_and_invalid_strides :: proc(t: ^testing.T) {
+	dummy := [16]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	// Empty bitmap is valid and allocates nothing.
+	empty_alpha, empty_ok := copy_ft_bitmap_alpha(FT_Bitmap{width = 0, rows = 0, buffer = nil})
+	testing.expect_value(t, empty_ok, true)
+	testing.expect_value(t, len(empty_alpha), 0)
+
+	cases := []FT_Bitmap{
+		// Unsupported pixel modes
+		{width = 3, rows = 2, pitch = 3, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_MONO},
+		{width = 3, rows = 2, pitch = 12, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_BGRA},
+		{width = 3, rows = 2, pitch = 9, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_LCD},
+		// Unsupported gray levels
+		{width = 3, rows = 2, pitch = 3, buffer = raw_data(dummy[:]), num_grays = 16, pixel_mode = FT_PIXEL_MODE_GRAY},
+		// Invalid / undersized strides (zero, positive < width, negative abs < width)
+		{width = 3, rows = 2, pitch = 0, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_GRAY},
+		{width = 3, rows = 2, pitch = 2, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_GRAY},
+		{width = 3, rows = 2, pitch = -2, buffer = raw_data(dummy[:]), num_grays = 256, pixel_mode = FT_PIXEL_MODE_GRAY},
+		// Non-empty dimensions with nil buffer
+		{width = 2, rows = 2, pitch = 2, buffer = nil, num_grays = 256, pixel_mode = FT_PIXEL_MODE_GRAY},
+	}
+
+	for bmp in cases {
+		alpha, ok := copy_ft_bitmap_alpha(bmp)
+		testing.expect_value(t, ok, false)
+		testing.expect_value(t, len(alpha), 0)
+	}
+}

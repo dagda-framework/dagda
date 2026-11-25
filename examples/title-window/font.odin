@@ -15,6 +15,15 @@ FT_Face :: ^FT_FaceRec
 
 FT_LOAD_RENDER :: 4
 
+FT_PIXEL_MODE_NONE  :: u8(0)
+FT_PIXEL_MODE_MONO  :: u8(1)
+FT_PIXEL_MODE_GRAY  :: u8(2)
+FT_PIXEL_MODE_GRAY2 :: u8(3)
+FT_PIXEL_MODE_GRAY4 :: u8(4)
+FT_PIXEL_MODE_LCD   :: u8(5)
+FT_PIXEL_MODE_LCD_V :: u8(6)
+FT_PIXEL_MODE_BGRA  :: u8(7)
+
 FT_Vector :: struct {
 	x: c.long,
 	y: c.long,
@@ -205,6 +214,46 @@ font_ascender :: proc(font: ^Font, px_height: f32) -> f32 {
 	return f32(font.face.size.metrics.ascender) / 64.0
 }
 
+// copy_ft_bitmap_alpha copies an FT_Bitmap into a tightly packed top-to-bottom
+// 8-bit alpha buffer (width * rows bytes).
+//
+// Supported contract:
+// - Empty bitmaps (width == 0 or rows == 0) succeed with an empty slice.
+// - Non-empty bitmaps must be 8-bit grayscale (pixel_mode == FT_PIXEL_MODE_GRAY,
+//   num_grays == 256), have a non-nil buffer, and have abs(pitch) >= width.
+// - Positive pitch is top-to-bottom (row 0 at offset 0); negative pitch is
+//   bottom-to-top (buffer points to the bottom row, so top row 0 is at
+//   offset (rows - 1) * abs(pitch)).
+// - Unsupported pixel modes, bit depths, nil buffers, or undersized pitches
+//   return (nil, false) without reading pixel memory.
+copy_ft_bitmap_alpha :: proc(bmp: FT_Bitmap, allocator := context.allocator) -> (alpha: []u8, ok: bool) {
+	w := int(bmp.width)
+	h := int(bmp.rows)
+	if w == 0 || h == 0 {
+		return nil, true
+	}
+	if bmp.buffer == nil {
+		return nil, false
+	}
+	if bmp.pixel_mode != FT_PIXEL_MODE_GRAY || bmp.num_grays != 256 {
+		return nil, false
+	}
+	pitch := int(bmp.pitch)
+	stride := pitch >= 0 ? pitch : -pitch
+	if stride < w {
+		return nil, false
+	}
+
+	alpha = make([]u8, w * h, allocator)
+	for row in 0 ..< h {
+		src_row := pitch > 0 ? row * stride : (h - 1 - row) * stride
+		for col in 0 ..< w {
+			alpha[row * w + col] = bmp.buffer[src_row + col]
+		}
+	}
+	return alpha, true
+}
+
 font_get_glyph :: proc(font: ^Font, ch: rune, px_height: f32) -> ^Cached_Glyph {
 	px := u32(max(math.round(px_height), 1))
 	key := Glyph_Key{codepoint = ch, px_height = px}
@@ -221,19 +270,12 @@ font_get_glyph :: proc(font: ^Font, ch: rune, px_height: f32) -> ^Cached_Glyph {
 
 	slot := font.face.glyph
 	bmp := slot.bitmap
-	w := int(bmp.width)
-	h := int(bmp.rows)
-	pitch := int(bmp.pitch)
-
-	alpha: []u8
-	if w > 0 && h > 0 && bmp.buffer != nil {
-		alpha = make([]u8, w * h)
-		for row in 0 ..< h {
-			src_row := pitch >= 0 ? row * pitch : (h - 1 - row) * (-pitch)
-			for col in 0 ..< w {
-				alpha[row * w + col] = bmp.buffer[src_row + col]
-			}
-		}
+	alpha, bmp_ok := copy_ft_bitmap_alpha(bmp)
+	w := 0
+	h := 0
+	if bmp_ok && len(alpha) > 0 {
+		w = int(bmp.width)
+		h = int(bmp.rows)
 	}
 
 	font.glyphs[key] = Cached_Glyph{
