@@ -20,35 +20,42 @@ mkdir -p build
 ./scripts/odin.sh build examples/title-driver-client -collection:dagda=. -out:build/title-client
 ```
 
-Then use two terminals. In the first, start the window on a socket inside a fresh private directory:
+Then use two terminals. In **Terminal 1**, create a fresh private socket directory, print the copyable socket assignment, and start the window:
 
 ```sh
 SOCK_DIR=$(mktemp -d /tmp/dagda-title.XXXXXX)
 SOCK=$SOCK_DIR/title.sock
-./build/title-window --socket "$SOCK"   # prints: Listening /tmp/dagda-title.XXXXXX/title.sock
+echo "SOCK=$SOCK"
+./build/title-window --socket "$SOCK"
 ```
 
-In the second terminal, watch the title, then inspect, preview, and commit a rename (the window is the same `$SOCK`; export it there too or paste the printed path):
+The `echo` prints one line like `SOCK=/tmp/dagda-title.AbCdEf/title.sock`, and the window then prints `Listening /tmp/dagda-title.AbCdEf/title.sock`. Leave the window running.
+
+In **Terminal 2**, paste the exact `SOCK=...` line Terminal 1 printed (your directory name will differ), start the watcher, and wait until it prints the revision-0 snapshot before running the edit commands in the same terminal:
 
 ```sh
+SOCK=/tmp/dagda-title.AbCdEf/title.sock   # paste the line Terminal 1 printed
 ./build/title-client "$SOCK" watch slide.title &
+# wait for this snapshot to print before continuing:
 # {"ok":true,"id":1,"revision":0,"text":"Quarterly results","role":"slide.title"}
+
 ./build/title-client "$SOCK" inspect slide.title
 ./build/title-client "$SOCK" preview 1 0 "Revenue grew 12%"
 ./build/title-client "$SOCK" commit 1 0 "Revenue grew 12%"
-# the watch client prints: {"event":"commit","id":1,"revision":1,"text":"Revenue grew 12%"}
+# the watcher prints: {"event":"commit","id":1,"revision":1,"text":"Revenue grew 12%"}
 ```
 
-Now click the title in the window if it is not already focused and press **Ctrl+Z**. The window restores “Quarterly results”, keeps keyboard focus, and the watch client prints:
+Now click the title in the window if it is not already focused and press **Ctrl+Z**. The window restores “Quarterly results”, keeps keyboard focus, and the watcher in Terminal 2 prints:
 
 ```json
 {"event":"undo","id":1,"revision":2,"text":"Quarterly results"}
 ```
 
-To clean up, close the window (or press Ctrl+C in the first terminal), stop the watch client with Ctrl+C in the second, and remove the now-empty socket directory. The window removes its own socket file on shutdown, so `rmdir "$SOCK_DIR"` succeeds:
+To clean up, close the window. The window removes its own socket file on shutdown, the watcher sees the connection close (EOF) and exits on its own, and Terminal 1 — which still has `SOCK_DIR` set — can then remove the empty directory:
 
 ```sh
-kill %1 2>/dev/null; rmdir "$SOCK_DIR"
+# Terminal 1, after closing the window:
+rmdir "$SOCK_DIR"
 ```
 
 A preview never changes the document, and a commit based on an old revision is rejected with `Stale_Revision` and the current revision, so a person's edit made between preview and commit always survives.
