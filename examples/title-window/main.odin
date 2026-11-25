@@ -9,6 +9,7 @@ import sdl "vendor:sdl3"
 
 WINDOW_WIDTH  :: 860
 WINDOW_HEIGHT :: 340
+TITLE_PX      :: f32(30)
 
 Title_Window :: struct {
 	window:    ^sdl.Window,
@@ -19,18 +20,23 @@ Title_Window :: struct {
 }
 
 window_init :: proc(win: ^Title_Window, adapter: Model_Adapter) -> bool {
+	if !font_init(&win.font) {
+		return false
+	}
+
 	if !sdl.Init({.VIDEO}) {
 		fmt.eprintf("SDL_Init failed: %s\n", sdl.GetError())
+		font_destroy(&win.font)
 		return false
 	}
 
 	if !sdl.CreateWindowAndRenderer("Dagda — Shared Title", WINDOW_WIDTH, WINDOW_HEIGHT, {.RESIZABLE}, &win.window, &win.renderer) {
 		fmt.eprintf("SDL_CreateWindowAndRenderer failed: %s\n", sdl.GetError())
 		sdl.Quit()
+		font_destroy(&win.font)
 		return false
 	}
 
-	font_init(&win.font)
 	editor_init(&win.editor, adapter)
 	win.title_box = sdl.FRect{x = 56, y = 112, w = WINDOW_WIDTH - 112, h = 72}
 	window_sync_text_input(win)
@@ -74,15 +80,14 @@ window_sync_text_input :: proc(win: ^Title_Window) {
 		if !sdl.TextInputActive(win.window) {
 			_ = sdl.StartTextInput(win.window)
 		}
-		before := win.editor.committed_text[:win.editor.caret]
-		caret_offset := c.int(font_measure_width(&win.font, before, 30) + 18)
+		layout := compute_title_layout(&win.font, &win.editor, win.title_box, TITLE_PX)
 		area := sdl.Rect{
 			x = c.int(win.title_box.x),
 			y = c.int(win.title_box.y),
 			w = c.int(win.title_box.w),
 			h = c.int(win.title_box.h),
 		}
-		_ = sdl.SetTextInputArea(win.window, &area, caret_offset)
+		_ = sdl.SetTextInputArea(win.window, &area, layout.candidate_cursor_x)
 	} else {
 		if sdl.TextInputActive(win.window) {
 			_ = sdl.StopTextInput(win.window)
@@ -111,33 +116,33 @@ window_draw :: proc(win: ^Title_Window) {
 
 	// Header metadata
 	header := fmt.tprintf("slide.title  #%d  rev %d", win.editor.snapshot_id, win.editor.snapshot_revision)
-	font_draw_text(&win.font, r, header, 56, 48, 16, sdl.Color{165, 177, 198, 255})
+	font_draw_text(&win.font, r, header, 56, 46, 18, sdl.Color{165, 177, 198, 255})
 
 	// Focus badge
-	badge_x := max(w - 190, 360)
-	badge_rect := sdl.FRect{x = badge_x, y = 44, w = 132, h = 28}
+	badge_x := max(w - 186, 360)
+	badge_rect := sdl.FRect{x = badge_x, y = 42, w = 130, h = 30}
 	if win.editor.focused {
 		sdl.SetRenderDrawColor(r, 29, 78, 57, 255)
 		sdl.RenderFillRect(r, &badge_rect)
 		sdl.SetRenderDrawColor(r, 64, 179, 126, 255)
 		sdl.RenderRect(r, &badge_rect)
-		font_draw_text(&win.font, r, "FOCUSED", badge_x + 10, 50, 16, sdl.Color{198, 246, 213, 255})
+		font_draw_text(&win.font, r, "FOCUSED", badge_x + 26, 48, 16, sdl.Color{198, 246, 213, 255})
 	} else {
 		sdl.SetRenderDrawColor(r, 48, 54, 68, 255)
 		sdl.RenderFillRect(r, &badge_rect)
 		sdl.SetRenderDrawColor(r, 98, 108, 128, 255)
 		sdl.RenderRect(r, &badge_rect)
-		font_draw_text(&win.font, r, "BLURRED", badge_x + 10, 50, 16, sdl.Color{165, 177, 198, 255})
+		font_draw_text(&win.font, r, "BLURRED", badge_x + 26, 48, 16, sdl.Color{165, 177, 198, 255})
 	}
 
 	// Active composition badge
 	if win.editor.composing {
-		comp_rect := sdl.FRect{x = badge_x - 168, y = 44, w = 158, h = 28}
+		comp_rect := sdl.FRect{x = badge_x - 154, y = 42, w = 144, h = 30}
 		sdl.SetRenderDrawColor(r, 92, 62, 22, 255)
 		sdl.RenderFillRect(r, &comp_rect)
 		sdl.SetRenderDrawColor(r, 245, 180, 72, 255)
 		sdl.RenderRect(r, &comp_rect)
-		font_draw_text(&win.font, r, "COMPOSING", comp_rect.x + 8, 50, 16, sdl.Color{254, 235, 200, 255})
+		font_draw_text(&win.font, r, "COMPOSING", comp_rect.x + 18, 48, 16, sdl.Color{254, 235, 200, 255})
 	}
 
 	// Title input box
@@ -150,74 +155,93 @@ window_draw :: proc(win: ^Title_Window) {
 	}
 	sdl.RenderRect(r, &win.title_box)
 
-	text_x := win.title_box.x + 18
-	text_y := win.title_box.y + 24
-	title_px: f32 = 24
+	layout := compute_title_layout(&win.font, &win.editor, win.title_box, TITLE_PX)
 
-	// Selection highlight
-	if has_selection(&win.editor) {
-		sel_start, sel_end := selection_bounds(&win.editor)
-		x0 := text_x + font_measure_width(&win.font, win.editor.committed_text[:sel_start], title_px)
-		x1 := text_x + font_measure_width(&win.font, win.editor.committed_text[:sel_end], title_px)
-		sel_rect := sdl.FRect{x = x0, y = win.title_box.y + 14, w = max(x1 - x0, 2), h = 44}
+	// Committed selection highlight (when not composing)
+	if layout.has_committed_sel {
+		sel_rect := sdl.FRect{
+			x = layout.committed_sel_x,
+			y = win.title_box.y + 14,
+			w = max(layout.committed_sel_w, 2),
+			h = 44,
+		}
 		sdl.SetRenderDrawColor(r, 52, 92, 152, 255)
 		sdl.RenderFillRect(r, &sel_rect)
 	}
 
-	// Draw committed text before caret, inline preedit (if any), and committed text after caret.
-	before := win.editor.committed_text[:win.editor.caret]
-	after := win.editor.committed_text[win.editor.caret:]
-	cursor_x := text_x
-	cursor_x += font_draw_text(&win.font, r, before, cursor_x, text_y, title_px, sdl.Color{240, 244, 250, 255})
+	// Draw committed text before insertion/replacement point
+	font_draw_text(&win.font, r, layout.before_text, layout.before_x, layout.text_y, layout.title_px, sdl.Color{240, 244, 250, 255})
 
-	caret_x := cursor_x
-	if win.editor.composing && len(win.editor.preedit_text) > 0 {
-		preedit_w := font_measure_width(&win.font, win.editor.preedit_text, title_px)
-		preedit_bg := sdl.FRect{x = cursor_x - 2, y = win.title_box.y + 14, w = preedit_w + 4, h = 44}
+	// Draw active composition preedit (replacing any selected committed range)
+	if win.editor.composing && len(layout.preedit_text) > 0 {
+		preedit_bg := sdl.FRect{
+			x = layout.preedit_x - 2,
+			y = win.title_box.y + 14,
+			w = layout.preedit_w + 4,
+			h = 44,
+		}
 		sdl.SetRenderDrawColor(r, 76, 54, 24, 255)
 		sdl.RenderFillRect(r, &preedit_bg)
 
-		font_draw_text(&win.font, r, win.editor.preedit_text, cursor_x, text_y, title_px, sdl.Color{255, 214, 122, 255})
+		// Preedit active selection subrange (if preedit_length > 0)
+		if layout.has_preedit_sel {
+			psel := sdl.FRect{
+				x = layout.preedit_sel_x,
+				y = win.title_box.y + 14,
+				w = max(layout.preedit_sel_w, 2),
+				h = 44,
+			}
+			sdl.SetRenderDrawColor(r, 138, 92, 30, 255)
+			sdl.RenderFillRect(r, &psel)
+		}
 
-		underline := sdl.FRect{x = cursor_x, y = win.title_box.y + 54, w = preedit_w, h = 2}
+		font_draw_text(&win.font, r, layout.preedit_text, layout.preedit_x, layout.text_y, layout.title_px, sdl.Color{255, 214, 122, 255})
+
+		underline := sdl.FRect{
+			x = layout.preedit_x,
+			y = win.title_box.y + 56,
+			w = layout.preedit_w,
+			h = 2,
+		}
 		sdl.SetRenderDrawColor(r, 245, 180, 72, 255)
 		sdl.RenderFillRect(r, &underline)
-
-		cursor_x += preedit_w
-		caret_x = cursor_x
 	}
 
-	font_draw_text(&win.font, r, after, cursor_x, text_y, title_px, sdl.Color{240, 244, 250, 255})
+	// Draw committed text after insertion/replacement point
+	font_draw_text(&win.font, r, layout.after_text, layout.after_x, layout.text_y, layout.title_px, sdl.Color{240, 244, 250, 255})
 
-	// Caret bar
+	// Caret bar (uses exact layout.caret_x, honoring nonterminal preedit_start)
 	if win.editor.focused {
-		caret_rect := sdl.FRect{x = caret_x, y = win.title_box.y + 14, w = 2, h = 44}
+		caret_rect := sdl.FRect{x = layout.caret_x, y = win.title_box.y + 14, w = 2, h = 44}
 		sdl.SetRenderDrawColor(r, 118, 185, 255, 255)
 		sdl.RenderFillRect(r, &caret_rect)
 	}
 
-	// Separate composition line so preedit is visibly distinct from committed text.
+	// Separate composition status line
 	if win.editor.composing {
-		comp_line := fmt.tprintf("Preedit: %q | Gate: Busy_Composing | Esc to cancel", win.editor.preedit_text)
-		font_draw_text(&win.font, r, comp_line, 56, 204, 12, sdl.Color{245, 198, 108, 255})
+		comp_line := fmt.tprintf("Preedit: %q (start=%d len=%d) | Gate: Busy_Composing | Esc to cancel",
+			win.editor.preedit_text, win.editor.preedit_start, win.editor.preedit_length)
+		font_draw_text(&win.font, r, comp_line, 56, 200, 16, sdl.Color{245, 198, 108, 255})
 	} else {
 		gate_line := fmt.tprintf("Committed: %q | Gate: Ready", win.editor.committed_text)
-		font_draw_text(&win.font, r, gate_line, 56, 204, 12, sdl.Color{136, 152, 178, 255})
+		font_draw_text(&win.font, r, gate_line, 56, 200, 16, sdl.Color{136, 152, 178, 255})
 	}
 
 	// Status + keybind legend
-	font_draw_text(&win.font, r, win.editor.last_status, 56, 236, 12, sdl.Color{174, 214, 241, 255})
-	help := "Type to edit | Ctrl+Z Undo | Esc Cancel preedit | F2 External rename"
-	font_draw_text(&win.font, r, help, 56, 268, 10, sdl.Color{120, 132, 154, 255})
+	font_draw_text(&win.font, r, win.editor.last_status, 56, 232, 16, sdl.Color{174, 214, 241, 255})
+	help := "Type to edit  |  Ctrl+Z Undo  |  Esc Cancel preedit  |  F2 Simulated external rename"
+	font_draw_text(&win.font, r, help, 56, 266, 14, sdl.Color{120, 132, 154, 255})
 }
 
-window_render :: proc(win: ^Title_Window, screenshot_path := "") {
+window_render :: proc(win: ^Title_Window, screenshot_path := "") -> bool {
 	window_draw(win)
+	ok := true
 	if len(screenshot_path) > 0 {
-		_ = window_save_screenshot(win, screenshot_path)
+		ok = window_save_screenshot(win, screenshot_path)
 	}
 	sdl.RenderPresent(win.renderer)
 	win.editor.needs_redraw = false
+	return ok
 }
 
 window_save_screenshot :: proc(win: ^Title_Window, path: string) -> bool {
@@ -230,7 +254,7 @@ window_save_screenshot :: proc(win: ^Title_Window, path: string) -> bool {
 	cpath := strings.clone_to_cstring(path)
 	defer delete(cpath)
 	if !sdl.SavePNG(surface, cpath) {
-		fmt.eprintf("SDL_SavePNG failed: %s\n", sdl.GetError())
+		fmt.eprintf("SDL_SavePNG(%q) failed: %s\n", path, sdl.GetError())
 		return false
 	}
 	return true
@@ -255,57 +279,112 @@ simulate_external_rename :: proc(win: ^Title_Window, adapter: Model_Adapter, nex
 	return true
 }
 
+demo_assert :: proc(cond: bool, msg: string) {
+	if !cond {
+		fmt.eprintf("DEMO CHECK FAILED: %s\n", msg)
+		os.exit(1)
+	}
+}
+
 run_demo_capture :: proc(win: ^Title_Window, adapter: Model_Adapter, capture_dir: string) {
-	_ = os.make_directory(capture_dir)
+	if err := os.make_directory(capture_dir); err != nil && err != .Exist {
+		fmt.eprintf("Failed to create capture directory %q: %v\n", capture_dir, err)
+		os.exit(1)
+	}
 
 	pump :: proc(win: ^Title_Window, screenshot_path := "") {
 		ev: sdl.Event
 		for sdl.PollEvent(&ev) {}
 		window_sync_text_input(win)
-		window_render(win, screenshot_path)
+		if !window_render(win, screenshot_path) {
+			fmt.eprintf("Capture failed for %q\n", screenshot_path)
+			os.exit(1)
+		}
 	}
 
 	sdl.Delay(50)
 	pump(win)
-	fmt.printf("[1] Initial:       rev=%d text=%q focused=%v composing=%v\n",
-		win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
+	demo_assert(win.editor.snapshot_revision == 0, "initial revision should be 0")
+	demo_assert(win.editor.committed_text == "Quarterly results", "initial text mismatch")
+	demo_assert(win.editor.focused && !win.editor.composing, "initial focus/composing mismatch")
+	fmt.printf("[1] Initial:           rev=%d text=%q focused=%v composing=%v font=%q\n",
+		win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing, win.font.font_path)
 
-	// Inject active composition (SDL TEXT_EDITING)
-	preedit_cstr := cstring("Q4 ")
+	// Select "results" (7 chars) so composing preedit replaces the selected range.
+	for _ in 0 ..< 7 {
+		shift_left: sdl.Event
+		shift_left.type = .KEY_DOWN
+		shift_left.key.key = sdl.K_LEFT
+		shift_left.key.mod = sdl.KMOD_LSHIFT
+		editor_handle_sdl_event(&win.editor, adapter, &shift_left, win.title_box)
+	}
+
+	// Inject non-ASCII preedit "café" with nonterminal caret at rune index 2 ("ca|fé").
 	edit_ev: sdl.Event
 	edit_ev.type = .TEXT_EDITING
-	edit_ev.edit.text = preedit_cstr
-	edit_ev.edit.start = 3
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 2
 	edit_ev.edit.length = 0
 	editor_handle_sdl_event(&win.editor, adapter, &edit_ev, win.title_box)
-	blocked := simulate_external_rename(win, adapter, "Revenue grew 12%")
-	pump(win, fmt.tprintf("%s/01-composing-busy.png", capture_dir))
-	fmt.printf("[2] Composing:     rev=%d text=%q preedit=%q external_applied=%v focused=%v\n",
-		win.editor.snapshot_revision, win.editor.committed_text, win.editor.preedit_text, blocked, win.editor.focused)
+	blocked := simulate_external_rename(win, adapter, "Café & niño")
+	pump(win, fmt.tprintf("%s/01-nonascii-preedit-busy.png", capture_dir))
 
-	// Cancel composition with Escape
+	layout := compute_title_layout(&win.font, &win.editor, win.title_box, TITLE_PX)
+	demo_assert(win.editor.composing, "should be composing")
+	demo_assert(!blocked, "external rename must be blocked while composing")
+	demo_assert(win.editor.snapshot_revision == 0, "composition must not advance revision")
+	demo_assert(layout.before_text == "Quarterly ", "composing should replace selected committed range")
+	demo_assert(layout.caret_x > layout.preedit_x && layout.caret_x < layout.preedit_x + layout.preedit_w,
+		"nonterminal preedit caret must lie inside preedit span")
+	fmt.printf("[2] Non-ASCII preedit: rev=%d committed=%q preedit=%q start=%d external_applied=%v focused=%v\n",
+		win.editor.snapshot_revision, win.editor.committed_text, win.editor.preedit_text, win.editor.preedit_start, blocked, win.editor.focused)
+
+	// Cancel composition with Escape; selection and committed text survive.
 	esc_ev: sdl.Event
 	esc_ev.type = .KEY_DOWN
 	esc_ev.key.key = sdl.K_ESCAPE
 	editor_handle_sdl_event(&win.editor, adapter, &esc_ev, win.title_box)
 	pump(win)
-	fmt.printf("[3] Cancel Esc:    rev=%d text=%q composing=%v focused=%v\n",
+	demo_assert(!win.editor.composing, "Escape should end composition")
+	demo_assert(win.editor.snapshot_revision == 0, "cancel must not advance revision")
+	demo_assert(win.editor.committed_text == "Quarterly results", "cancel must preserve committed text")
+	demo_assert(win.editor.focused, "cancel must preserve focus")
+	fmt.printf("[3] Cancel Esc:        rev=%d text=%q composing=%v focused=%v\n",
 		win.editor.snapshot_revision, win.editor.committed_text, win.editor.composing, win.editor.focused)
 
-	// External rename now succeeds without stealing focus
-	applied := simulate_external_rename(win, adapter, "Revenue grew 12%")
-	pump(win, fmt.tprintf("%s/02-external-rename.png", capture_dir))
-	fmt.printf("[4] External edit: rev=%d text=%q applied=%v focused=%v\n",
+	// Commit non-ASCII replacement "español" over the selected range via TEXT_INPUT.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "español"
+	editor_handle_sdl_event(&win.editor, adapter, &input_ev, win.title_box)
+	pump(win, fmt.tprintf("%s/02-nonascii-committed.png", capture_dir))
+	demo_assert(win.editor.snapshot_revision == 1, "TEXT_INPUT commit should advance revision to 1")
+	demo_assert(win.editor.committed_text == "Quarterly español", "non-ASCII commit text mismatch")
+	demo_assert(win.editor.commit_count == 1, "expected exactly 1 commit")
+	fmt.printf("[4] Non-ASCII commit:  rev=%d text=%q commits=%d focused=%v\n",
+		win.editor.snapshot_revision, win.editor.committed_text, win.editor.commit_count, win.editor.focused)
+
+	// External rename now succeeds without stealing focus.
+	applied := simulate_external_rename(win, adapter, "Café & niño")
+	pump(win, fmt.tprintf("%s/03-external-rename.png", capture_dir))
+	demo_assert(applied, "external rename should succeed when not composing")
+	demo_assert(win.editor.snapshot_revision == 2, "external rename should advance revision to 2")
+	demo_assert(win.editor.committed_text == "Café & niño", "external rename text mismatch")
+	demo_assert(win.editor.focused, "external rename must preserve focus")
+	fmt.printf("[5] External edit:     rev=%d text=%q applied=%v focused=%v\n",
 		win.editor.snapshot_revision, win.editor.committed_text, applied, win.editor.focused)
 
-	// Keyboard Undo (Ctrl+Z) restores original title and keeps focus
+	// Keyboard Undo (Ctrl+Z) restores "Quarterly español" and keeps focus.
 	undo_ev: sdl.Event
 	undo_ev.type = .KEY_DOWN
 	undo_ev.key.key = sdl.K_Z
 	undo_ev.key.mod = sdl.KMOD_LCTRL
 	editor_handle_sdl_event(&win.editor, adapter, &undo_ev, win.title_box)
-	pump(win, fmt.tprintf("%s/03-after-undo.png", capture_dir))
-	fmt.printf("[5] Ctrl+Z Undo:   rev=%d text=%q focused=%v\n",
+	pump(win, fmt.tprintf("%s/04-after-undo.png", capture_dir))
+	demo_assert(win.editor.snapshot_revision == 3, "undo should advance revision to 3")
+	demo_assert(win.editor.committed_text == "Quarterly español", "undo should restore prior committed text")
+	demo_assert(win.editor.focused, "undo must preserve focus")
+	fmt.printf("[6] Ctrl+Z Undo:       rev=%d text=%q focused=%v\n",
 		win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused)
 }
 
@@ -326,7 +405,7 @@ main :: proc() {
 		return
 	}
 
-	window_render(&win)
+	_ = window_render(&win)
 	external_step := 0
 	running := true
 
@@ -342,7 +421,7 @@ main :: proc() {
 				case .KEY_DOWN:
 					if ev.key.key == sdl.K_F2 {
 						external_step += 1
-						next := external_step % 2 == 1 ? "Revenue grew 12%" : "Board review draft"
+						next := external_step % 2 == 1 ? "Café & niño" : "Revenue grew 12%"
 						_ = simulate_external_rename(&win, adapter, next)
 					} else {
 						_ = editor_handle_sdl_event(&win.editor, adapter, &ev, win.title_box)
@@ -358,7 +437,7 @@ main :: proc() {
 
 		window_sync_text_input(&win)
 		if win.editor.needs_redraw {
-			window_render(&win)
+			_ = window_render(&win)
 		}
 	}
 }

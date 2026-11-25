@@ -1,5 +1,6 @@
 package main
 
+import "core:c"
 import "core:fmt"
 import "core:strings"
 import "core:unicode/utf8"
@@ -204,8 +205,8 @@ editor_handle_text_editing :: proc(state: ^Editor_State, text: string, start: in
 	editor_clear_preedit(state)
 	if len(text) > 0 {
 		state.preedit_text = strings.clone(text)
-		state.preedit_start = max(start, 0)
-		state.preedit_length = max(length, 0)
+		state.preedit_start = start
+		state.preedit_length = length
 		state.composing = true
 		editor_set_status(state, "Composing (uncommitted preedit)")
 	} else {
@@ -213,6 +214,105 @@ editor_handle_text_editing :: proc(state: ^Editor_State, text: string, start: in
 	}
 	state.needs_redraw = true
 	return true
+}
+
+// rune_index_to_byte_offset converts a UTF-8 character index (as reported by
+// SDL_TextEditingEvent.start/length) into a byte offset in s.
+rune_index_to_byte_offset :: proc(s: string, rune_index: int) -> int {
+	if rune_index <= 0 {
+		return 0
+	}
+	seen := 0
+	for _, byte_idx in s {
+		if seen == rune_index {
+			return byte_idx
+		}
+		seen += 1
+	}
+	return len(s)
+}
+
+// Title_Layout is the single source of truth shared by window painting,
+// caret/selection geometry, and SDL_SetTextInputArea candidate anchoring.
+Title_Layout :: struct {
+	text_x:             f32,
+	text_y:             f32,
+	title_px:           f32,
+	before_text:        string,
+	preedit_text:       string,
+	after_text:         string,
+	before_x:           f32,
+	preedit_x:          f32,
+	preedit_w:          f32,
+	after_x:            f32,
+	has_committed_sel:  bool,
+	committed_sel_x:    f32,
+	committed_sel_w:    f32,
+	has_preedit_sel:    bool,
+	preedit_sel_x:      f32,
+	preedit_sel_w:      f32,
+	caret_x:            f32,
+	candidate_cursor_x: c.int,
+}
+
+compute_title_layout :: proc(font: ^Font, state: ^Editor_State, title_box: sdl.FRect, title_px: f32) -> Title_Layout {
+	layout := Title_Layout{
+		text_x   = title_box.x + 18,
+		text_y   = title_box.y + 18,
+		title_px = title_px,
+		before_x = title_box.x + 18,
+	}
+
+	sel_start, sel_end := selection_bounds(state)
+
+	if !state.composing {
+		layout.before_text = state.committed_text
+		layout.caret_x = layout.text_x + font_measure_width(font, state.committed_text[:state.caret], title_px)
+		layout.preedit_x = layout.caret_x
+		layout.after_x = layout.text_x + font_measure_width(font, state.committed_text, title_px)
+		if sel_start < sel_end {
+			layout.has_committed_sel = true
+			layout.committed_sel_x = layout.text_x + font_measure_width(font, state.committed_text[:sel_start], title_px)
+			layout.committed_sel_w = font_measure_width(font, state.committed_text[sel_start:sel_end], title_px)
+		}
+		layout.candidate_cursor_x = c.int(layout.caret_x - title_box.x)
+		return layout
+	}
+
+	// While composing, preedit visually replaces the active committed selection [sel_start, sel_end].
+	layout.before_text = state.committed_text[:sel_start]
+	layout.preedit_text = state.preedit_text
+	layout.after_text = state.committed_text[sel_end:]
+
+	before_w := font_measure_width(font, layout.before_text, title_px)
+	layout.preedit_x = layout.text_x + before_w
+	layout.preedit_w = font_measure_width(font, layout.preedit_text, title_px)
+	layout.after_x = layout.preedit_x + layout.preedit_w
+
+	total_runes := utf8.rune_count_in_string(layout.preedit_text)
+	start_rune := total_runes
+	len_runes := 0
+	if state.preedit_start >= 0 {
+		start_rune = clamp(state.preedit_start, 0, total_runes)
+		if state.preedit_length > 0 {
+			len_runes = clamp(state.preedit_length, 0, total_runes - start_rune)
+		}
+	}
+
+	pre_sel_start := rune_index_to_byte_offset(layout.preedit_text, start_rune)
+	pre_sel_end := rune_index_to_byte_offset(layout.preedit_text, start_rune + len_runes)
+
+	if len_runes > 0 {
+		layout.has_preedit_sel = true
+		layout.preedit_sel_x = layout.preedit_x + font_measure_width(font, layout.preedit_text[:pre_sel_start], title_px)
+		layout.preedit_sel_w = font_measure_width(font, layout.preedit_text[pre_sel_start:pre_sel_end], title_px)
+		layout.caret_x = layout.preedit_sel_x + layout.preedit_sel_w
+	} else {
+		layout.caret_x = layout.preedit_x + font_measure_width(font, layout.preedit_text[:pre_sel_start], title_px)
+	}
+
+	layout.candidate_cursor_x = c.int(layout.caret_x - title_box.x)
+	return layout
 }
 
 editor_handle_text_input :: proc(state: ^Editor_State, adapter: Model_Adapter, text: string) -> bool {
