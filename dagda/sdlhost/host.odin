@@ -118,6 +118,22 @@ host_rebuild_cb :: proc(ctx: rawptr) -> bool {
 	return host_rebuild_frame((^Host)(ctx))
 }
 
+// canvas_clip_rect returns the exact integer pixel clip rectangle whose pixel
+// centers (x + 0.5, y + 0.5) lie inside the half-open fitted canvas range
+// [fitted.x, fitted.x + fitted.w) x [fitted.y, fitted.y + fitted.h).
+canvas_clip_rect :: proc(fitted: sdl.FRect) -> sdl.Rect {
+	x0 := c.int(math.ceil(fitted.x - 0.5))
+	y0 := c.int(math.ceil(fitted.y - 0.5))
+	x1 := c.int(math.ceil(fitted.x + fitted.w - 0.5))
+	y1 := c.int(math.ceil(fitted.y + fitted.h - 0.5))
+	return sdl.Rect{
+		x = x0,
+		y = y0,
+		w = max(x1 - x0, 0),
+		h = max(y1 - y0, 0),
+	}
+}
+
 host_draw :: proc(h: ^Host) {
 	r := h.renderer
 	if h.frame.has_canvas {
@@ -132,19 +148,14 @@ host_draw :: proc(h: ^Host) {
 			w = t.canvas.width * t.scale,
 			h = t.canvas.height * t.scale,
 		}
-		if fitted.w > 0 && fitted.h > 0 {
+		// Clip canvas sheet and element painting to the exact pixel rows/columns
+		// whose centers lie inside the fitted canvas, matching dagda.hit_test.
+		clip := canvas_clip_rect(fitted)
+		sdl.SetRenderClipRect(r, &clip)
+		if clip.w > 0 && clip.h > 0 {
 			sdl.SetRenderDrawColor(r, 26, 31, 42, 255)
 			sdl.RenderFillRect(r, &fitted)
 		}
-
-		// Clip all canvas element painting to the fitted canvas rectangle.
-		clip := sdl.Rect{
-			x = c.int(math.floor(fitted.x)),
-			y = c.int(math.floor(fitted.y)),
-			w = max(c.int(math.ceil(fitted.x + fitted.w)) - c.int(math.floor(fitted.x)), 0),
-			h = max(c.int(math.ceil(fitted.y + fitted.h)) - c.int(math.floor(fitted.y)), 0),
-		}
-		sdl.SetRenderClipRect(r, &clip)
 	} else {
 		sdl.SetRenderDrawColor(r, 22, 25, 32, 255)
 		sdl.RenderClear(r)
@@ -263,6 +274,16 @@ push_sdl_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
 	return sdl.PushEvent(&up)
 }
 
+push_sdl_hover :: proc(window: ^sdl.Window, x, y: f32) -> bool {
+	win_id := sdl.GetWindowID(window)
+	motion: sdl.Event
+	motion.type = .MOUSE_MOTION
+	motion.motion.windowID = win_id
+	motion.motion.x = x
+	motion.motion.y = y
+	return sdl.PushEvent(&motion)
+}
+
 push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	win_id := sdl.GetWindowID(window)
 	key: sdl.Keycode
@@ -352,6 +373,20 @@ poll_control_stdin :: proc(
 					_ = os.flush(os.stdout)
 				} else {
 					fmt.println("CONTROL_ERR invalid click")
+					_ = os.flush(os.stdout)
+				}
+			}
+		} else if strings.has_prefix(line, "hover ") {
+			rest := line[len("hover "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp >= 0 {
+				x, ok_x := strconv.parse_f32(rest[:sp])
+				y, ok_y := strconv.parse_f32(rest[sp + 1:])
+				if ok_x && ok_y && push_sdl_hover(h.window, x, y) {
+					fmt.printf("CONTROL_OK hover %.2f %.2f\n", x, y)
+					_ = os.flush(os.stdout)
+				} else {
+					fmt.println("CONTROL_ERR invalid hover")
 					_ = os.flush(os.stdout)
 				}
 			}

@@ -8,15 +8,21 @@ import "dagda:dagda/sdlhost"
 // Slide_Canvas is an app-owned fixed-aspect (16:9) canvas fixture.
 // Slide-specific types stay in the consuming app, outside Dagda core.
 Slide_Canvas :: struct {
-	selected:     bool,
-	clicks:       int,
-	headline_buf: [64]u8,
-	elements:     [2]dagda.Canvas_Element,
+	selected:      bool,
+	clicks:        int,
+	overflow_card: bool,
+	headline_buf:  [64]u8,
+	elements:      [2]dagda.Canvas_Element,
 }
 
 slide_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
 	s := (^Slide_Canvas)(user_data)
 	headline := fmt.bprintf(s.headline_buf[:], "Slide Canvas (selected=%v, clicks=%d)", s.selected, s.clicks)
+	card_bounds := dagda.Rect{x = 220, y = 200, width = 520, height = 220}
+	if s.overflow_card {
+		// Extends above and below the 960x540 canvas with fractional f32 x/width.
+		card_bounds = dagda.Rect{x = 93.125, y = -40, width = 200.0625, height = 620}
+	}
 	s.elements = {
 		{
 			info   = {id = 1, role = "slide.headline"},
@@ -28,7 +34,7 @@ slide_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
 			info   = {id = 2, role = "slide.card"},
 			kind   = .Button,
 			text   = s.selected ? "Selected Card" : "Filled Card",
-			bounds = {x = 220, y = 200, width = 520, height = 220},
+			bounds = card_bounds,
 		},
 	}
 	return {
@@ -49,9 +55,19 @@ slide_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Actio
 
 main :: proc() {
 	slide: Slide_Canvas
-	opts, ok := sdlhost.parse_cli_args(os.args[1:])
+	host_args := make([dynamic]string, 0, len(os.args))
+	defer delete(host_args)
+	for arg in os.args[1:] {
+		if arg == "--overflow-card" {
+			slide.overflow_card = true
+		} else {
+			append(&host_args, arg)
+		}
+	}
+
+	opts, ok := sdlhost.parse_cli_args(host_args[:])
 	if !ok {
-		fmt.eprintln("usage: canvas-slide [--size WxH] [--socket <socket-path>]")
+		fmt.eprintln("usage: canvas-slide [--size WxH] [--socket <socket-path>] [--overflow-card]")
 		os.exit(2)
 	}
 	app := sdlhost.App{

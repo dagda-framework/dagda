@@ -292,7 +292,7 @@ test_failed_rebuild_stops_pipelined_requests_and_surfaces_error :: proc(t: ^test
 test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
 	elements := [2]dagda.Canvas_Element{
 		{info = {id = 1, role = "slide.headline"}, kind = .Label, text = "Title", bounds = {x = 80, y = 60, width = 800, height = 80}},
-		{info = {id = 2, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = 220, y = 200, width = 520, height = 220}},
+		{info = {id = 2, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = 93.125, y = 200, width = 200.0625, height = 220}},
 	}
 	canvas := dagda.Canvas{
 		size     = {width = 960, height = 540},
@@ -306,5 +306,5 @@ test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
 	rep, applied := dispatch(frame, nil, nil, `{"op":"inspect","role":"slide.card"}`)
 	defer delete(rep)
 	testing.expect_value(t, applied, false)
-	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":146.67,"y":193.33,"width":346.67,"height":146.67},"canvas_bounds":{"x":220.00,"y":200.00,"width":520.00,"height":220.00},"actions":["activate"]}]}`)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.08,"y":193.33,"width":133.38,"height":146.67},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
 }

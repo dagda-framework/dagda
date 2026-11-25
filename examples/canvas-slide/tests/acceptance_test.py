@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Acceptance test for Dagda's native fixed-aspect canvas host (`examples/canvas-slide`).
 
-Verifies at two viewport sizes (800x540 and 640x480):
-1. Separate `dagda-client` discovers `slide.card` by role and reads both window `bounds`
-   and original `canvas_bounds` (220, 200, 520, 220).
-2. Captures a real PNG of the rendered window and compares the actual blue filled-rectangle
-   pixel bounding box directly against the inspected window `bounds`.
-3. Clicks in the letterbox outside the fitted canvas via `SDL_PushEvent` and verifies
-   application state stays unchanged (`selected=false, clicks=0`).
-4. Clicks inside the inspected rectangle bounds via `SDL_PushEvent` and verifies
-   `selected=true, clicks=1`.
+Verifies:
+1. Two viewport sizes (800x540 and 640x480):
+   - Separate `dagda-client` discovers `slide.card` by role (window `bounds` + `canvas_bounds`).
+   - Actual PNG pixels match inspected window `bounds` in BOTH idle RGB(52,108,194) and
+     hovered RGB(64,124,214) states, reporting actual captured dimensions separately from requested.
+   - Letterbox click leaves application state unchanged; card click updates headline.
+2. Fractional edge clipping & f32 canvas_bounds round-trip (801x542, --overflow-card):
+   - Card extends above and below the 960x540 canvas with x=93.125 and width=200.0625.
+   - Real `dagda-client` round-trips exact `x=93.125` and `width=200.0625`.
+   - At 801x542 (fitted vertical range [45.71875, 496.28125)), pixel rows 45 and 496 retain
+     the letterbox background RGB(14,16,22), adjacent interior rows 46 and 495 show the card,
+     and clicks at those exact pixel centers agree with the drawing.
 """
 
 import json
+import math
 import os
 import select
 import shutil
@@ -26,6 +30,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 ODIN = ROOT / "scripts" / "odin.sh"
+
+LETTERBOX_RGB = (14, 16, 22)
+IDLE_CARD_RGB = (52, 108, 194)
+HOVER_CARD_RGB = (64, 124, 214)
 
 
 class DeadlineLineReader:
@@ -66,7 +74,6 @@ def stop_process(proc: subprocess.Popen | None) -> None:
 
 
 def decode_png_rgb(path: Path) -> tuple[int, int, bytes]:
-    """Minimal stdlib PNG decoder (8-bit RGB or RGBA, non-interlaced)."""
     data = path.read_bytes()
     assert data[:8] == b"\x89PNG\r\n\x1a\n", f"not a PNG: {path}"
     pos = 8
@@ -95,17 +102,17 @@ def decode_png_rgb(path: Path) -> tuple[int, int, bytes]:
         idx += 1
         row = bytearray(raw[idx : idx + stride])
         idx += stride
-        if filt == 1:  # Sub
+        if filt == 1:
             for i in range(bpp, stride):
                 row[i] = (row[i] + row[i - bpp]) & 0xFF
-        elif filt == 2:  # Up
+        elif filt == 2:
             for i in range(stride):
                 row[i] = (row[i] + prev[i]) & 0xFF
-        elif filt == 3:  # Average
+        elif filt == 3:
             for i in range(stride):
                 left = row[i - bpp] if i >= bpp else 0
                 row[i] = (row[i] + ((left + prev[i]) >> 1)) & 0xFF
-        elif filt == 4:  # Paeth
+        elif filt == 4:
             for i in range(stride):
                 a = row[i - bpp] if i >= bpp else 0
                 b = prev[i]
@@ -123,18 +130,37 @@ def decode_png_rgb(path: Path) -> tuple[int, int, bytes]:
     return width, height, bytes(out)
 
 
-def find_card_pixel_bbox(png_path: Path) -> tuple[int, int, int, int]:
-    """Find bounding box (min_x, min_y, max_x_excl, max_y_excl) of the blue card fill RGB(52,108,194)."""
+def rgb_close(a: tuple[int, int, int], b: tuple[int, int, int], tol: int = 4) -> bool:
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol and abs(a[2] - b[2]) <= tol
+
+
+def pixel_at(w: int, rgb: bytes, x: int, y: int) -> tuple[int, int, int]:
+    off = (y * w + x) * 3
+    return rgb[off], rgb[off + 1], rgb[off + 2]
+
+
+def find_card_pixel_bbox(
+    png_path: Path, expected_state: str = "any"
+) -> tuple[int, int, int, int, int, int, str]:
+    """Find bounding box of card fill pixels in idle or hovered state.
+    Returns (png_w, png_h, min_x, min_y, max_x_excl, max_y_excl, detected_state).
+    """
     w, h, rgb = decode_png_rgb(png_path)
     min_x, min_y = w, h
     max_x, max_y = -1, -1
+    idle_hits = 0
+    hover_hits = 0
     for y in range(h):
         row_off = y * w * 3
         for x in range(w):
-            r = rgb[row_off + x * 3]
-            g = rgb[row_off + x * 3 + 1]
-            b = rgb[row_off + x * 3 + 2]
-            if abs(r - 52) <= 4 and abs(g - 108) <= 4 and abs(b - 194) <= 4:
+            px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
+            is_idle = rgb_close(px, IDLE_CARD_RGB)
+            is_hover = rgb_close(px, HOVER_CARD_RGB)
+            if is_idle:
+                idle_hits += 1
+            if is_hover:
+                hover_hits += 1
+            if is_idle or is_hover:
                 if x < min_x:
                     min_x = x
                 if y < min_y:
@@ -144,7 +170,13 @@ def find_card_pixel_bbox(png_path: Path) -> tuple[int, int, int, int]:
                 if y > max_y:
                     max_y = y
     assert max_x >= min_x and max_y >= min_y, f"card fill pixels not found in {png_path}"
-    return min_x, min_y, max_x + 1, max_y + 1
+    detected = "hovered" if hover_hits > idle_hits else "idle"
+    if expected_state != "any":
+        assert detected == expected_state, (
+            f"expected {expected_state} card fill in {png_path}, got {detected} "
+            f"(idle_hits={idle_hits}, hover_hits={hover_hits})"
+        )
+    return w, h, min_x, min_y, max_x + 1, max_y + 1, detected
 
 
 def run_client(client_bin: Path, sock: Path, *args: str) -> tuple[int, dict]:
@@ -180,6 +212,16 @@ def wait_for_headline(client_bin: Path, sock: Path, expected: str, timeout: floa
     raise AssertionError(f"timed out waiting for slide.headline == {expected!r}; last={last}")
 
 
+def assert_bbox_matches(bounds: dict, px0: int, py0: int, px1: int, py1: int) -> None:
+    pw, ph = px1 - px0, py1 - py0
+    assert abs(px0 - bounds["x"]) <= 2.5 and abs(py0 - bounds["y"]) <= 2.5, (
+        f"origin mismatch: png=({px0},{py0}) inspected=({bounds['x']},{bounds['y']})"
+    )
+    assert abs(pw - bounds["width"]) <= 4.0 and abs(ph - bounds["height"]) <= 4.0, (
+        f"size mismatch: png=({pw}x{ph}) inspected=({bounds['width']}x{bounds['height']})"
+    )
+
+
 def verify_viewport(canvas_bin: Path, client_bin: Path, capture_dir: Path, size_arg: str, tag: str) -> None:
     sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-canvas-{tag}."))
     os.chmod(sock_dir, 0o700)
@@ -199,43 +241,146 @@ def verify_viewport(canvas_bin: Path, client_bin: Path, capture_dir: Path, size_
         ready = reader.read_line(f"canvas startup ({size_arg})", timeout=5.0)
         assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
 
-        # Discover slide.card by role: check both window bounds and original canvas_bounds.
         code, card_resp = run_client(client_bin, sock, "inspect", "slide.card")
         assert code == 0 and card_resp["ok"] is True and len(card_resp["elements"]) == 1, (code, card_resp)
         card = card_resp["elements"][0]
         assert card["id"] == 2 and card["kind"] == "button" and "activate" in card["actions"], card
-        assert card["canvas_bounds"] == {"x": 220.0, "y": 200.0, "width": 520.0, "height": 220.0}, card
+        assert card["canvas_bounds"] == {"x": 220, "y": 200, "width": 520, "height": 220}, card
         bounds = card["bounds"]
-        assert bounds["width"] > 0 and bounds["height"] > 0, bounds
 
-        # Capture PNG and compare actual rendered card pixels against inspected window bounds.
-        png_path = capture_dir / f"{tag}-{size_arg}.png"
-        send_control(proc, reader, f"screenshot {png_path}")
-        px0, py0, px1, py1 = find_card_pixel_bbox(png_path)
-        pw, ph = px1 - px0, py1 - py0
-        assert abs(px0 - bounds["x"]) <= 2.5 and abs(py0 - bounds["y"]) <= 2.5, (
-            f"origin mismatch: png=({px0},{py0}) inspected=({bounds['x']},{bounds['y']})"
-        )
-        assert abs(pw - bounds["width"]) <= 4.0 and abs(ph - bounds["height"]) <= 4.0, (
-            f"size mismatch: png=({pw}x{ph}) inspected=({bounds['width']}x{bounds['height']})"
-        )
+        # 1. Idle state PNG check.
+        idle_png = capture_dir / f"{tag}-{size_arg}-idle.png"
+        send_control(proc, reader, f"screenshot {idle_png}")
+        png_w, png_h, px0, py0, px1, py1, st_idle = find_card_pixel_bbox(idle_png, expected_state="idle")
+        assert_bbox_matches(bounds, px0, py0, px1, py1)
+
+        # 2. Hovered state PNG check (move pointer into card via SDL_PushEvent MOUSE_MOTION).
+        cx = bounds["x"] + bounds["width"] / 2.0
+        cy = bounds["y"] + bounds["height"] / 2.0
+        send_control(proc, reader, f"hover {cx:.2f} {cy:.2f}")
+        hover_png = capture_dir / f"{tag}-{size_arg}-hover.png"
+        deadline = time.monotonic() + 2.0
+        while True:
+            send_control(proc, reader, f"screenshot {hover_png}")
+            try:
+                hw, hh, hpx0, hpy0, hpx1, hpy1, st_hover = find_card_pixel_bbox(hover_png, expected_state="hovered")
+                break
+            except AssertionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+        assert (hw, hh) == (png_w, png_h)
+        assert_bbox_matches(bounds, hpx0, hpy0, hpx1, hpy1)
+
         print(
-            f"[{tag}] {size_arg}: inspected bounds=({bounds['x']:.1f},{bounds['y']:.1f},{bounds['width']:.1f}x{bounds['height']:.1f}) "
-            f"matches PNG pixels=({px0},{py0},{pw}x{ph}), canvas_bounds={card['canvas_bounds']}"
+            f"[{tag}] requested={size_arg} captured={png_w}x{png_h}: "
+            f"inspected=({bounds['x']:.1f},{bounds['y']:.1f},{bounds['width']:.1f}x{bounds['height']:.1f}) "
+            f"idle_png=({px0},{py0},{px1-px0}x{py1-py0},{st_idle}) "
+            f"hover_png=({hpx0},{hpy0},{hpx1-hpx0}x{hpy1-hpy0},{st_hover})"
         )
 
-        # Click in letterbox (2, 2 is outside the 16:9 fitted canvas for non-16:9 viewports).
+        # 3. Letterbox click leaves state unchanged.
         send_control(proc, reader, "click 2.00 2.00")
-        # Confirm state is still unchanged.
         code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
         assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0)", (code, h0)
 
-        # Click inside the inspected card bounds via SDL_PushEvent -> selected=true, clicks=1.
-        cx = bounds["x"] + bounds["width"] / 2.0
-        cy = bounds["y"] + bounds["height"] / 2.0
+        # 4. Card click triggers handler.
         send_control(proc, reader, f"click {cx:.2f} {cy:.2f}")
         h1 = wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1)")
-        print(f"[{tag}] {size_arg}: letterbox click no-op; card click ({cx:.1f},{cy:.1f}) -> {h1['elements'][0]['text']}")
+        print(f"[{tag}] letterbox click no-op; card click ({cx:.1f},{cy:.1f}) -> {h1['elements'][0]['text']}")
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, capture_dir: Path) -> None:
+    """Verify 960x540 canvas in 801x542 viewport with card extending above/below canvas
+    and fractional f32 canvas_bounds (x=93.125, width=200.0625).
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-canvas-edge."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "canvas.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(canvas_bin), "--size", "801x542", "--overflow-card", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line("overflow canvas startup (801x542)", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # 1. Verify exact f32 canvas_bounds round-trip through real dagda-client.
+        code, card_resp = run_client(client_bin, sock, "inspect", "slide.card")
+        assert code == 0 and card_resp["ok"] is True, (code, card_resp)
+        card = card_resp["elements"][0]
+        cb = card["canvas_bounds"]
+        assert cb["x"] == 93.125 and cb["width"] == 200.0625, f"f32 precision lost: {cb}"
+        assert cb["y"] == -40 and cb["height"] == 620, cb
+        bounds = card["bounds"]
+
+        # 2. Capture PNG and compute exact fitted vertical range for actual captured viewport.
+        png_path = capture_dir / "edge-801x542-overflow.png"
+        send_control(proc, reader, f"screenshot {png_path}")
+        png_w, png_h, rgb = decode_png_rgb(png_path)
+
+        scale = min(png_w / 960.0, png_h / 540.0)
+        y_top = (png_h - 540.0 * scale) / 2.0
+        y_bot = y_top + 540.0 * scale
+        in_top = math.ceil(y_top - 0.5)
+        out_top = in_top - 1
+        out_bot = math.ceil(y_bot - 0.5)
+        in_bot = out_bot - 1
+
+        if (png_w, png_h) == (801, 542):
+            assert (out_top, in_top, in_bot, out_bot) == (45, 46, 495, 496), (
+                out_top, in_top, in_bot, out_bot, y_top, y_bot
+            )
+
+        # Sample horizontally near the middle of the card (avoiding text center).
+        sample_x = int(bounds["x"] + bounds["width"] * 0.25)
+        px_out_top = pixel_at(png_w, rgb, sample_x, out_top)
+        px_in_top = pixel_at(png_w, rgb, sample_x, in_top)
+        px_in_bot = pixel_at(png_w, rgb, sample_x, in_bot)
+        px_out_bot = pixel_at(png_w, rgb, sample_x, out_bot)
+
+        assert rgb_close(px_out_top, LETTERBOX_RGB), f"row {out_top} expected letterbox, got {px_out_top}"
+        assert rgb_close(px_out_bot, LETTERBOX_RGB), f"row {out_bot} expected letterbox, got {px_out_bot}"
+        assert rgb_close(px_in_top, IDLE_CARD_RGB) or rgb_close(px_in_top, HOVER_CARD_RGB), (
+            f"row {in_top} expected card fill, got {px_in_top}"
+        )
+        assert rgb_close(px_in_bot, IDLE_CARD_RGB) or rgb_close(px_in_bot, HOVER_CARD_RGB), (
+            f"row {in_bot} expected card fill, got {px_in_bot}"
+        )
+
+        # 3. Clicks at outer row pixel centers must miss; clicks at adjacent interior centers must hit.
+        click_x = sample_x + 0.5
+        send_control(proc, reader, f"click {click_x:.2f} {out_top + 0.5:.2f}")
+        send_control(proc, reader, f"click {click_x:.2f} {out_bot + 0.5:.2f}")
+        code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0)", (code, h0)
+
+        send_control(proc, reader, f"click {click_x:.2f} {in_top + 0.5:.2f}")
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1)")
+
+        send_control(proc, reader, f"click {click_x:.2f} {in_bot + 0.5:.2f}")
+        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=2)")
+
+        print(
+            f"[edge] requested=801x542 captured={png_w}x{png_h} fitted_y=[{y_top:.5f},{y_bot:.5f}): "
+            f"canvas_bounds=(x={cb['x']}, width={cb['width']}) "
+            f"rows out=({out_top},{out_bot}) letterbox+miss, in=({in_top},{in_bot}) card+hit (clicks=2)"
+        )
 
         send_control(proc, reader, "quit")
         proc.wait(timeout=5)
@@ -260,7 +405,8 @@ def main() -> int:
 
     verify_viewport(canvas_bin, client_bin, capture_dir, "800x540", "vp1")
     verify_viewport(canvas_bin, client_bin, capture_dir, "640x480", "vp2")
-    print("All two-viewport canvas acceptance checks passed.")
+    verify_fractional_edge_and_precision(canvas_bin, client_bin, capture_dir)
+    print("All canvas acceptance checks passed.")
     return 0
 
 
