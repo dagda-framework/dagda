@@ -31,6 +31,35 @@ test_counter_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagd
 }
 
 @(test)
+test_inspect_shared_role_in_declaration_order :: proc(t: ^testing.T) {
+	// Two buttons share a role with an unrelated element between
+	// them: inspect emits both, in declaration order, with their
+	// resolved bounds and advertised actions.
+	c: Test_Counter
+	elements := []dagda.Element{
+		{info = {id = 10, role = "shared.action"}, kind = .Button, text = "First"},
+		{info = {id = 99, role = "other.label"}, kind = .Label, text = "Between"},
+		{info = {id = 20, role = "shared.action"}, kind = .Button, text = "Second"},
+	}
+	frame, ok := dagda.resolve({elements = elements}, {width = 320, height = 200})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	rep, applied := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"shared.action"}`)
+	defer delete(rep)
+	testing.expect_value(t, applied, false)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":10,"role":"shared.action","kind":"button","text":"First","bounds":{"x":16.00,"y":16.00,"width":288.00,"height":40.00},"actions":["activate"]},{"id":20,"role":"shared.action","kind":"button","text":"Second","bounds":{"x":16.00,"y":112.00,"width":288.00,"height":40.00},"actions":["activate"]}]}`)
+
+	missing, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"missing"}`)
+	defer delete(missing)
+	testing.expect_value(t, missing, `{"ok":false,"error":"Unknown_Role"}`)
+
+	wrong_type, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":1}`)
+	defer delete(wrong_type)
+	testing.expect_value(t, wrong_type, `{"ok":false,"error":"Malformed_Request"}`)
+}
+
+@(test)
 test_dispatch_inspect_and_invoke :: proc(t: ^testing.T) {
 	c: Test_Counter
 	frame, ok := dagda.resolve(test_counter_view(&c), {width = 360, height = 180})

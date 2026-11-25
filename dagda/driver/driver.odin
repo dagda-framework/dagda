@@ -268,31 +268,25 @@ dispatch :: proc(
 			return reply_error("Malformed_Request"), false
 		}
 
-		objects := make([]dagda.Object_Info, len(frame.elements))
-		defer delete(objects)
-		for el, i in frame.elements {
-			objects[i] = el.info
-		}
-		ids := make([]dagda.Object_Id, len(frame.elements))
-		defer delete(ids)
-		written, total := dagda.find_by_role(objects, string(role_str), ids)
-		if total == 0 || written == 0 {
-			strings.builder_destroy(&b)
-			return reply_error("Unknown_Role"), false
-		}
-
+		// Emit each match directly from the frame role walk, in
+		// declaration order; a missing role is Unknown_Role.
 		strings.write_string(&b, "{\"ok\":true,\"elements\":[")
 		emitted := 0
-		for id in ids[:written] {
-			el, found := dagda.find(frame, id)
+		query := dagda.query_by_role(frame, string(role_str))
+		for {
+			el, found := dagda.next_match(&query)
 			if !found {
-				continue
+				break
 			}
 			if emitted > 0 {
 				strings.write_byte(&b, ',')
 			}
 			write_resolved_element(&b, el)
 			emitted += 1
+		}
+		if emitted == 0 {
+			strings.builder_destroy(&b)
+			return reply_error("Unknown_Role"), false
 		}
 		strings.write_string(&b, "]}")
 		return strings.to_string(b), false

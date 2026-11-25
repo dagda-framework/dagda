@@ -142,7 +142,9 @@ frame_destroy :: proc(frame: ^Frame) {
 // but its text and role strings are borrowed from the view the
 // frame was resolved from: use them while that frame is alive.
 // After a frame rebuild, discard the old query and start a new
-// one against the new frame.
+// one against the new frame. The filter string passed to
+// query_by_role is borrowed, not copied, and must stay valid
+// through the whole traversal.
 Role_Query :: struct {
 	frame: Frame,
 	role:  string,
