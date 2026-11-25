@@ -3,6 +3,7 @@ package driver
 import "core:fmt"
 import "core:os"
 import "core:sys/posix"
+import "core:strings"
 import "core:testing"
 import "dagda:dagda"
 
@@ -307,4 +308,66 @@ test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
 	defer delete(rep)
 	testing.expect_value(t, applied, false)
 	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.08,"y":193.33,"width":133.38,"height":146.67},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
+}
+
+Wire_Doc :: struct {
+	title: string,
+	rev:   dagda.Revision,
+	calls: int,
+}
+
+wire_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+	doc := (^Wire_Doc)(user_data)
+	doc.calls += 1
+	if target.base_revision != doc.rev {
+		return .Stale_Revision
+	}
+	delete(doc.title)
+	doc.title = strings.clone(arg.text)
+	doc.rev += 1
+	return .Applied
+}
+
+wire_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+	doc := (^Wire_Doc)(user_data)
+	return doc.rev, id == 1
+}
+
+@(test)
+test_dispatch_edits_wire :: proc(t: ^testing.T) {
+	doc := Wire_Doc{title = strings.clone("Quarterly results")}
+	defer delete(doc.title)
+	elements := []dagda.Element{{info = {id = 1, role = "doc.title"}, kind = .Label, text = doc.title}}
+	frame, ok := dagda.resolve({elements = elements}, {width = 320, height = 120})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+	source := Edit_Source{
+		edits = {{object_id = 1, edit = "replace_text", argument = .Text}},
+		handler = wire_handle,
+		user_data = &doc,
+		revision_of = wire_revision,
+	}
+	rep, _ := dispatch_edits(frame, nil, nil, source, `{"op":"edits","id":1}`)
+	defer delete(rep)
+	testing.expect_value(t, rep, `{"ok":true,"id":1,"revision":0,"edits":[{"name":"replace_text","argument":"text"}]}`)
+
+	prev, _ := dispatch_edits(frame, nil, nil, source, `{"op":"preview","id":1,"edit":"replace_text","base_revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	defer delete(prev)
+	testing.expect_value(t, prev, `{"ok":true,"id":1,"edit":"replace_text","revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	testing.expect_value(t, doc.title, "Quarterly results")
+	testing.expect_value(t, doc.calls, 0)
+
+	commit, applied := dispatch_edits(frame, nil, nil, source, `{"op":"commit","id":1,"edit":"replace_text","base_revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	defer delete(commit)
+	testing.expect(t, applied)
+	testing.expect_value(t, commit, `{"ok":true,"id":1,"edit":"replace_text","revision":1}`)
+
+	stale, _ := dispatch_edits(frame, nil, nil, source, `{"op":"commit","id":1,"edit":"replace_text","base_revision":0,"argument":{"kind":"text","text":"Late"}}`)
+	defer delete(stale)
+	testing.expect_value(t, stale, `{"ok":false,"error":"Stale_Revision","revision":1}`)
+	wrong, _ := dispatch_edits(frame, nil, nil, source, `{"op":"commit","id":1,"edit":"replace_text","base_revision":1,"argument":{"kind":"rect","rect":{"x":1,"y":2,"width":3,"height":4}}}`)
+	defer delete(wrong)
+	testing.expect_value(t, wrong, `{"ok":false,"error":"Wrong_Argument"}`)
+	testing.expect_value(t, doc.title, "Draft")
+	testing.expect_value(t, doc.calls, 2) // commit + stale only; wrong kind never reached it
 }
