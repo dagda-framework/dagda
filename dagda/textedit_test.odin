@@ -1,5 +1,6 @@
 package dagda
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -30,7 +31,7 @@ app_commit :: proc(app: ^Test_App, session: ^Text_Session, edit: ^Text_Edit) -> 
 	app.has_hist = true
 	app.text = strings.clone(edit.text)
 	app.revision += 1
-	text_session_sync(session, app.text)
+	apply_edit(session, edit^, app.text) // accepted: caret moves now
 	return true
 }
 
@@ -88,6 +89,68 @@ test_backspace_decomposed_and_emoji :: proc(t: ^testing.T) {
 	testing.expect(t, apply(&app2, &session2, &edit2))
 	testing.expect(t, app_undo(&app2, &session2))
 	testing.expect_value(t, app2.text, "A👩‍💻") // exact original bytes
+}
+
+fail_alloc_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+		return nil, .Out_Of_Memory
+	}
+	return nil, nil
+}
+
+@(test)
+test_proposed_edit_safety :: proc(t: ^testing.T) {
+	app: Test_App
+	app_init(&app, "\xcc\x81abc") // leading combining acute
+	defer app_destroy(&app)
+	session: Text_Session
+	text_session_init(&session, app.text)
+	defer text_session_destroy(&session)
+	session.caret = 0
+	session.anchor = 0
+
+	// Inserting "e" before U+0301 forms one grapheme: the
+	// proposed caret lands after the whole character, and the
+	// session does not move until the app accepts.
+	edit := insert_text(&session, app.text, "e")
+	testing.expect_value(t, edit.err, Edit_Error.None)
+	testing.expect_value(t, edit.text, "e\xcc\x81abc")
+	testing.expect_value(t, edit.caret, len("e\xcc\x81"))
+	testing.expect_value(t, session.caret, 0)
+	testing.expect(t, apply(&app, &session, &edit))
+	testing.expect_value(t, session.caret, len("e\xcc\x81"))
+
+	// Identical replacement is a no-op with empty text.
+	session.caret = 0
+	session.anchor = 1
+	noop := replace_range(&session, app.text, 0, 1, "e")
+	testing.expect_value(t, noop.err, Edit_Error.None)
+	testing.expect(t, !noop.changed)
+	testing.expect_value(t, noop.text, "")
+	edit_destroy(&session, &noop)
+
+	// Invalid inputs and ranges fail explicitly, session intact.
+	bad_input := insert_text(&session, app.text, "a\nb")
+	testing.expect_value(t, bad_input.err, Edit_Error.Invalid_Input)
+	testing.expect(t, !bad_input.changed && bad_input.text == "")
+	bad_range := replace_range(&session, app.text, 0, 999, "x")
+	testing.expect_value(t, bad_range.err, Edit_Error.Invalid_Range)
+	testing.expect_value(t, session.caret, 0)
+	testing.expect_value(t, session.anchor, 1)
+
+	// Allocation failure: explicit error, nothing to commit,
+	// prior caret/selection and prior preedit preserved.
+	testing.expect_value(t, begin_composition(&session, "old", 0, 0), Edit_Error.None)
+	saved_allocator := session.allocator
+	session.allocator = mem.Allocator{procedure = fail_alloc_proc, data = nil}
+	failed := backspace(&session, app.text)
+	testing.expect_value(t, failed.err, Edit_Error.Alloc_Failed)
+	testing.expect(t, !failed.changed && failed.text == "")
+	testing.expect_value(t, begin_composition(&session, "new", 0, 0), Edit_Error.Alloc_Failed)
+	testing.expect_value(t, session.preedit, "old")
+	testing.expect(t, is_composing(&session))
+	session.allocator = saved_allocator
+	testing.expect(t, cancel_composition(&session))
 }
 
 @(test)

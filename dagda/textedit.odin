@@ -28,13 +28,36 @@ Text_Session :: struct {
 	allocator:      mem.Allocator,
 }
 
-// One computed edit. text is owned by the caller (delete it with
-// the session allocator, or use edit_destroy); when changed is
-// false, text is empty and the app must not commit anything.
+Edit_Error :: enum {
+	None,
+	Alloc_Failed,
+	Invalid_Input, // not valid UTF-8, or contains a line break
+	Invalid_Range, // endpoints outside the committed text
+}
+
+// One proposed edit. It changes no session state until the app
+// accepts it with apply_edit. text is owned by the caller
+// (delete it with the session allocator, or use edit_destroy).
+// When changed is false the result is a no-op: text is empty and
+// the app must not commit anything. When err is not None the
+// proposal failed explicitly: text is empty, nothing may be
+// committed, and the session (including any prior preedit) is
+// exactly as it was before the call.
 Text_Edit :: struct {
 	text:    string,
-	caret:   int,
+	caret:   int, // proposed caret, on a grapheme boundary in text
 	changed: bool,
+	err:     Edit_Error,
+}
+
+// apply_edit accepts a proposed edit after the app has committed
+// it: the caret and selection move to the edit's caret, clamped
+// to a grapheme boundary of the latest committed text. Until
+// this is called (or the session is re-synced), a rejected edit
+// leaves the prior caret and selection untouched.
+apply_edit :: proc(session: ^Text_Session, edit: Text_Edit, committed: string) {
+	session.caret = clamp_grapheme_boundary(committed, edit.caret)
+	session.anchor = session.caret
 }
 
 edit_destroy :: proc(session: ^Text_Session, edit: ^Text_Edit) {
@@ -173,20 +196,56 @@ select_all :: proc(session: ^Text_Session, committed: string) {
 	session.caret = len(committed)
 }
 
+valid_single_line :: proc(s: string) -> bool {
+	if !utf8.valid_string(s) {
+		return false
+	}
+	for i in 0 ..< len(s) {
+		if s[i] == '\n' || s[i] == '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+// replace_range proposes replacing committed[start:end] with
+// inserted. Inputs are validated before any slicing, the
+// allocation result is checked, and the session is not mutated:
+// the proposed caret (adjusted to a grapheme boundary of the
+// resulting text, so inserting before a combining character
+// lands after the whole formed character) takes effect only
+// when the app accepts the edit with apply_edit.
 replace_range :: proc(session: ^Text_Session, committed: string, start, end: int, inserted: string) -> Text_Edit {
+	if !valid_single_line(committed) || !valid_single_line(inserted) {
+		return {caret = session.caret, err = .Invalid_Input}
+	}
+	if start < 0 || end < start || end > len(committed) {
+		return {caret = session.caret, err = .Invalid_Range}
+	}
 	if start == end && len(inserted) == 0 {
 		return {caret = session.caret}
 	}
-	b: strings.Builder
-	strings.builder_init(&b, session.allocator)
-	strings.write_string(&b, committed[:start])
-	strings.write_string(&b, inserted)
-	strings.write_string(&b, committed[end:])
-	text := strings.to_string(b)
-	caret := start + len(inserted)
-	session.caret = caret
-	session.anchor = caret
-	return {text = text, caret = caret, changed = text != committed}
+	total := start + len(inserted) + (len(committed) - end)
+	storage, alloc_err := make([]u8, total, session.allocator)
+	if alloc_err != nil {
+		return {caret = session.caret, err = .Alloc_Failed}
+	}
+	copy(storage, committed[:start])
+	copy(storage[start:], inserted)
+	copy(storage[start + len(inserted):], committed[end:])
+	text := string(storage)
+	proposed := start + len(inserted)
+	if proposed > 0 && proposed < len(text) {
+		// If the insertion point now falls inside a grapheme
+		// (e.g. "e" inserted before a leading U+0301 forms one
+		// character), land after that whole character.
+		proposed = next_grapheme_boundary(text, proposed - 1)
+	}
+	if text == committed {
+		delete(storage, session.allocator)
+		return {caret = proposed} // no-op: empty text, changed=false
+	}
+	return {text = text, caret = proposed, changed = true}
 }
 
 // insert_text replaces the current selection with inserted text
@@ -224,18 +283,30 @@ delete_forward :: proc(session: ^Text_Session, committed: string) -> Text_Edit {
 // The preedit is display state only: it can temporarily replace
 // the selection visually, but nothing is committed until
 // commit_composition. An empty preedit ends the composition.
-begin_composition :: proc(session: ^Text_Session, preedit: string, start: int, length: int) {
-	delete(session.preedit, session.allocator)
-	session.preedit = ""
-	session.preedit_start = 0
-	session.preedit_length = 0
-	session.composing = false
-	if len(preedit) > 0 {
-		session.preedit = strings.clone(preedit, session.allocator)
-		session.preedit_start = start
-		session.preedit_length = length
-		session.composing = true
+// On failure the prior preedit and composition state are
+// preserved untouched.
+begin_composition :: proc(session: ^Text_Session, preedit: string, start: int, length: int) -> Edit_Error {
+	if !valid_single_line(preedit) {
+		return .Invalid_Input
 	}
+	if len(preedit) == 0 {
+		delete(session.preedit, session.allocator)
+		session.preedit = ""
+		session.preedit_start = 0
+		session.preedit_length = 0
+		session.composing = false
+		return .None
+	}
+	cloned, clone_err := strings.clone(preedit, session.allocator)
+	if clone_err != nil {
+		return .Alloc_Failed
+	}
+	delete(session.preedit, session.allocator)
+	session.preedit = cloned
+	session.preedit_start = start
+	session.preedit_length = length
+	session.composing = true
+	return .None
 }
 
 // cancel_composition discards the preedit. Committed text, its
@@ -252,15 +323,19 @@ cancel_composition :: proc(session: ^Text_Session) -> bool {
 	return true
 }
 
-// commit_composition turns the active preedit into exactly one
-// edit replacing the current selection, then clears it.
+// commit_composition proposes exactly one edit replacing the
+// current selection with the active preedit. The preedit is
+// cleared only when the proposal was constructed successfully;
+// on failure the composition stays exactly as it was.
 commit_composition :: proc(session: ^Text_Session, committed: string) -> Text_Edit {
 	if !session.composing {
 		return {caret = session.caret}
 	}
-	preedit := session.preedit
-	edit := insert_text(session, committed, preedit)
-	delete(preedit, session.allocator)
+	edit := insert_text(session, committed, session.preedit)
+	if edit.err != .None {
+		return edit
+	}
+	delete(session.preedit, session.allocator)
 	session.preedit = ""
 	session.preedit_start = 0
 	session.preedit_length = 0

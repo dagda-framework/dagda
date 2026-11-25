@@ -42,6 +42,36 @@ fail_alloc_proc :: proc(
 }
 
 @(test)
+test_rejected_typing_preserves_selection_after_external_commit :: proc(t: ^testing.T) {
+	model := make_test_model(t, "abc")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Select all of "abc", then an external commit replaces it.
+	state.anchor = 0
+	state.caret = len("abc")
+	snap := title_model.snapshot(&model)
+	target := dagda.Action_Target{id = snap.object.id, base_revision = snap.revision}
+	testing.expect_value(t, title_model.commit(&model, target, "ABC"), title_model.Error.None)
+	// The editor is not synced: its snapshot revision is now stale.
+
+	// Typing against the editor's stale revision is rejected:
+	// the document still reads ABC and the full selection stays.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "q"
+	editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect_value(t, state.committed_text, "ABC")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect_value(t, state.anchor, 0)
+	testing.expect_value(t, state.caret, len("ABC"))
+}
+
+@(test)
 test_composition_does_not_commit_and_blocks_external_commits :: proc(t: ^testing.T) {
 	model := make_test_model(t)
 	defer title_model.destroy(&model)
