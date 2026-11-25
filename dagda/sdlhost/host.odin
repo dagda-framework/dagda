@@ -55,8 +55,11 @@ Host :: struct {
 	font:         Font,
 	frame:        dagda.Frame,
 	viewport:     dagda.Size,
+	has_hovered:  bool,
 	hovered_id:   dagda.Object_Id,
+	has_pressed:  bool,
 	pressed_id:   dagda.Object_Id,
+	focus:        Focus_State,
 	needs_redraw: bool,
 }
 
@@ -73,6 +76,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 		return false
 	}
 	h.frame = frame
+	_ = focus_reconcile(&h.focus, h.frame)
 	h.needs_redraw = true
 	return true
 }
@@ -107,9 +111,12 @@ host_draw :: proc(h: ^Host) {
 			font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{240, 244, 250, 255})
 
 		case .Button:
-			if h.pressed_id == el.info.id {
+			is_pressed := (h.has_pressed && h.pressed_id == el.info.id) ||
+			              (h.focus.has_space_pending && h.focus.space_pending_id == el.info.id)
+			is_hovered := h.has_hovered && h.hovered_id == el.info.id
+			if is_pressed {
 				sdl.SetRenderDrawColor(r, 46, 98, 178, 255)
-			} else if h.hovered_id == el.info.id {
+			} else if is_hovered {
 				sdl.SetRenderDrawColor(r, 64, 124, 214, 255)
 			} else {
 				sdl.SetRenderDrawColor(r, 52, 108, 194, 255)
@@ -123,6 +130,15 @@ host_draw :: proc(h: ^Host) {
 			tx := rect.x + max((rect.w - tw) * 0.5, 12)
 			ty := rect.y + (rect.h - px) * 0.5
 			font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{248, 250, 255, 255})
+		}
+
+		// Visible focus ring around the keyboard-focused element.
+		if h.focus.has_focus && h.focus.focused_id == el.info.id {
+			sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+			ring1 := sdl.FRect{x = rect.x - 3, y = rect.y - 3, w = rect.w + 6, h = rect.h + 6}
+			ring2 := sdl.FRect{x = rect.x - 2, y = rect.y - 2, w = rect.w + 4, h = rect.h + 4}
+			sdl.RenderRect(r, &ring1)
+			sdl.RenderRect(r, &ring2)
 		}
 	}
 }
@@ -181,6 +197,43 @@ push_sdl_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
 	return sdl.PushEvent(&up)
 }
 
+push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
+	win_id := sdl.GetWindowID(window)
+	key: sdl.Keycode
+	mod: sdl.Keymod
+	switch name {
+	case "tab":
+		key = sdl.K_TAB
+	case "shift+tab":
+		key = sdl.K_TAB
+		mod = sdl.KMOD_LSHIFT
+	case "enter":
+		key = sdl.K_RETURN
+	case "space":
+		key = sdl.K_SPACE
+	case:
+		return false
+	}
+
+	down: sdl.Event
+	down.type = .KEY_DOWN
+	down.key.windowID = win_id
+	down.key.key = key
+	down.key.mod = mod
+	down.key.down = true
+	if !sdl.PushEvent(&down) {
+		return false
+	}
+
+	up: sdl.Event
+	up.type = .KEY_UP
+	up.key.windowID = win_id
+	up.key.key = key
+	up.key.mod = mod
+	up.key.down = false
+	return sdl.PushEvent(&up)
+}
+
 poll_control_stdin :: proc(
 	h: ^Host,
 	in_buf: ^[dynamic]u8,
@@ -235,6 +288,15 @@ poll_control_stdin :: proc(
 					fmt.println("CONTROL_ERR invalid click")
 					_ = os.flush(os.stdout)
 				}
+			}
+		} else if strings.has_prefix(line, "key ") {
+			name := line[len("key "):]
+			if push_sdl_key(h.window, name) {
+				fmt.printf("CONTROL_OK key %s\n", name)
+				_ = os.flush(os.stdout)
+			} else {
+				fmt.printf("CONTROL_ERR invalid key %s\n", name)
+				_ = os.flush(os.stdout)
 			}
 		} else if strings.has_prefix(line, "screenshot ") {
 			path := line[len("screenshot "):]
@@ -327,14 +389,15 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					}
 				case .MOUSE_MOTION:
 					id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
-					next_hover := hit ? id : 0
-					if next_hover != h.hovered_id {
-						h.hovered_id = next_hover
+					if hit != h.has_hovered || (hit && id != h.hovered_id) {
+						h.has_hovered = hit
+						h.hovered_id = hit ? id : 0
 						h.needs_redraw = true
 					}
 				case .MOUSE_BUTTON_DOWN:
 					if ev.button.button == sdl.BUTTON_LEFT {
 						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
+						h.has_pressed = hit
 						h.pressed_id = hit ? id : 0
 						if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
 							if !host_rebuild_frame(&h) {
@@ -346,9 +409,21 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						}
 					}
 				case .MOUSE_BUTTON_UP:
-					if ev.button.button == sdl.BUTTON_LEFT && h.pressed_id != 0 {
+					if ev.button.button == sdl.BUTTON_LEFT && h.has_pressed {
+						h.has_pressed = false
 						h.pressed_id = 0
 						h.needs_redraw = true
+					}
+				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
+					applied, redraw := focus_handle_event(&h.focus, h.frame, &ev, h.app.handle, h.app.user_data)
+					if redraw {
+						h.needs_redraw = true
+					}
+					if applied {
+						if !host_rebuild_frame(&h) {
+							exit_code = 1
+							running = false
+						}
 					}
 				}
 				if !running || !sdl.PollEvent(&ev) {

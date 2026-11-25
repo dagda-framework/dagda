@@ -128,7 +128,54 @@ def main() -> int:
         send_control(win_proc, "quit")
         win_proc.wait(timeout=5)
         assert win_proc.returncode == 0 and not sock.exists()
-        print("[8] Clean shutdown & socket cleanup verified.")
+        print("[8] Clean shutdown & socket cleanup verified (pointer + invoke path).")
+
+        # Keyboard focus & activation path in a fresh counter window:
+        # 0 -> Tab to Increment -> Enter -> 1 -> client invoke -> 2 -> Space (no re-tab/click) -> 3.
+        kb_proc = subprocess.Popen(
+            [str(counter_bin), "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=ROOT,
+        )
+        try:
+            assert kb_proc.stdout is not None
+            kb_ready = kb_proc.stdout.readline().strip()
+            assert kb_ready == f"Listening {sock}", f"unexpected kb startup line: {kb_ready!r}"
+
+            code, kb0 = run_client(client_bin, sock, "inspect", "counter.value")
+            assert code == 0 and kb0["elements"][0]["text"] == "0", (code, kb0)
+
+            send_control(kb_proc, "key tab")
+            # Enter activates once -> 1 (capture after Enter so focus ring + value 1 are both visible).
+            send_control(kb_proc, "key enter")
+            kb1 = wait_for_counter_value(client_bin, sock, "1")
+            send_control(kb_proc, f"screenshot {capture_dir / '03-keyboard-focus-enter.png'}")
+            print("[9] Keyboard Tab + Enter -> client inspect counter.value:", kb1["elements"][0]["text"])
+
+            # External driver invoke -> 2, preserving keyboard focus on Increment.
+            code, inv2 = run_client(client_bin, sock, "invoke", str(btn_id), "activate")
+            assert code == 0 and inv2 == {"ok": True, "id": btn_id, "action": "activate"}, (code, inv2)
+            kb2 = wait_for_counter_value(client_bin, sock, "2")
+            print("[10] External client invoke -> client inspect counter.value:", kb2["elements"][0]["text"])
+
+            # Space without clicking or tabbing again -> 3 (proves focus survived external driver rebuild).
+            send_control(kb_proc, "key space")
+            kb3 = wait_for_counter_value(client_bin, sock, "3")
+            send_control(kb_proc, f"screenshot {capture_dir / '04-keyboard-focus-space.png'}")
+            print("[11] Keyboard Space (focus preserved) -> client inspect counter.value:", kb3["elements"][0]["text"])
+
+            send_control(kb_proc, "quit")
+            kb_proc.wait(timeout=5)
+            assert kb_proc.returncode == 0 and not sock.exists()
+            print("[12] Keyboard focus path clean shutdown & socket cleanup verified.")
+        finally:
+            if kb_proc.poll() is None:
+                kb_proc.terminate()
+                kb_proc.wait(timeout=5)
+
         return 0
     finally:
         if win_proc is not None and win_proc.poll() is None:
