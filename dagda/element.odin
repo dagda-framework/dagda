@@ -1,0 +1,191 @@
+package dagda
+
+import "core:mem"
+
+// A reusable element: the smallest unit an app can show, hit-test,
+// and act on. Elements reuse Object_Id / Object_Info for their
+// stable identity and semantic role.
+
+Element_Kind :: enum {
+	Label,
+	Button,
+}
+
+// Actions an element can offer. Only Activate exists in this slice.
+Action :: enum {
+	Activate,
+}
+
+Action_Set :: bit_set[Action]
+
+// An app-supplied element definition. The view borrows the text
+// and role strings; the app keeps them alive while the view and
+// any frame resolved from it are in use.
+Element :: struct {
+	info: Object_Info, // stable id + semantic role
+	kind: Element_Kind,
+	text: string,
+}
+
+// A view is a borrowed slice of element definitions owned by the app.
+View :: struct {
+	elements: []Element,
+}
+
+Size :: struct {
+	width:  f32,
+	height: f32,
+}
+
+Point :: struct {
+	x: f32,
+	y: f32,
+}
+
+// Bounds in logical window coordinates: x/y is the top-left
+// corner, and the covered range is [x, x+width) x [y, y+height).
+Rect :: struct {
+	x:      f32,
+	y:      f32,
+	width:  f32,
+	height: f32,
+}
+
+contains :: proc(r: Rect, p: Point) -> bool {
+	return p.x >= r.x && p.x < r.x + r.width && p.y >= r.y && p.y < r.y + r.height
+}
+
+// One element after layout: everything an inspector, hit-tester,
+// or agent needs without touching the app's definitions again.
+Resolved_Element :: struct {
+	info:    Object_Info,
+	kind:    Element_Kind,
+	text:    string, // borrowed from the view definition
+	bounds:  Rect,
+	actions: Action_Set,
+}
+
+// A resolved frame. Element IDs are unique within a frame and
+// stable across rebuilds of the same view; roles may repeat.
+// The frame owns its resolved-element storage
+// (release it with frame_destroy); the text and role strings it
+// points at stay owned by the app's view definitions, so a frame
+// must not outlive them or a rebuild of the view.
+Frame :: struct {
+	elements:  []Resolved_Element,
+	allocator: mem.Allocator,
+}
+
+actions_for :: proc(kind: Element_Kind) -> Action_Set {
+	switch kind {
+	case .Label:
+		return {}
+	case .Button:
+		return {.Activate}
+	}
+	return {}
+}
+
+// resolve lays the view out for a viewport. This first slice
+// stacks elements vertically with a fixed margin and row height:
+// enough to place a label above a button, nothing more.
+//
+// Element IDs must be unique within a view (roles may repeat):
+// an ID names one element in the frame and is meant to stay
+// stable for that element across rebuilds, so a duplicate is
+// rejected here rather than resolved ambiguously downstream.
+resolve :: proc(view: View, viewport: Size, allocator := context.allocator) -> (Frame, bool) {
+	elements, err := make([]Resolved_Element, len(view.elements), allocator)
+	if err != nil {
+		return {}, false
+	}
+	for element, i in view.elements {
+		for prev in view.elements[:i] {
+			if prev.info.id == element.info.id {
+				delete(elements, allocator)
+				return {}, false
+			}
+		}
+	}
+	margin: f32 = 16
+	row_height: f32 = 40
+	gap: f32 = 8
+	width := viewport.width - 2 * margin
+	if width < 0 {
+		width = 0
+	}
+	for element, i in view.elements {
+		elements[i] = {
+			info = element.info,
+			kind = element.kind,
+			text = element.text,
+			bounds = {x = margin, y = margin + f32(i) * (row_height + gap), width = width, height = row_height},
+			actions = actions_for(element.kind),
+		}
+	}
+	return {elements = elements, allocator = allocator}, true
+}
+
+frame_destroy :: proc(frame: ^Frame) {
+	delete(frame.elements, frame.allocator)
+	frame^ = {}
+}
+
+// find returns the resolved element with the given stable ID.
+find :: proc(frame: Frame, id: Object_Id) -> (Resolved_Element, bool) {
+	for element in frame.elements {
+		if element.info.id == id {
+			return element, true
+		}
+	}
+	return {}, false
+}
+
+// hit_test returns the topmost (last-drawn) element whose
+// resolved bounds contain p.
+hit_test :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
+	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
+		if contains(frame.elements[i].bounds, p) {
+			return frame.elements[i].info.id, true
+		}
+	}
+	return 0, false
+}
+
+// The app's action handler. Pointer clicks and agent invocations
+// reach this same procedure. Return true when the action applied.
+Action_Handler :: #type proc(user_data: rawptr, id: Object_Id, action: Action) -> bool
+
+Invoke_Result :: enum {
+	Applied,
+	Unknown_Object,
+	Unsupported_Action,
+	Not_Handled,
+}
+
+// invoke dispatches an action by stable element ID: this is the
+// agent path. It changes nothing when the ID is unknown or the
+// element does not offer the action.
+invoke :: proc(frame: Frame, id: Object_Id, action: Action, handler: Action_Handler, user_data: rawptr = nil) -> Invoke_Result {
+	element, found := find(frame, id)
+	if !found {
+		return .Unknown_Object
+	}
+	if action not_in element.actions {
+		return .Unsupported_Action
+	}
+	if handler == nil || !handler(user_data, id, action) {
+		return .Not_Handled
+	}
+	return .Applied
+}
+
+// click dispatches a pointer press at p: this is the pointer
+// path, and it resolves through the very same handler as invoke.
+click :: proc(frame: Frame, p: Point, handler: Action_Handler, user_data: rawptr = nil) -> Invoke_Result {
+	id, found := hit_test(frame, p)
+	if !found {
+		return .Unknown_Object
+	}
+	return invoke(frame, id, .Activate, handler, user_data)
+}
