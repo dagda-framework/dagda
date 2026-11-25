@@ -632,3 +632,51 @@ test_driver_dispatch_during_composition_and_nonblocking_partial_client :: proc(t
 	testing.expect(t, ok1)
 	testing.expect_value(t, rep1, `{"ok":true,"id":1,"revision":2,"text":"Revenue grew 12%","role":"slide.title"}`)
 }
+
+@(test)
+test_busy_status_uses_guard_outcome_not_reply_text :: proc(t: ^testing.T) {
+	model := make_test_model(t, "Busy_Composing")
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	state.needs_redraw = false
+
+	// Successful inspect whose title text equals "Busy_Composing" must preserve UI status.
+	insp := dispatch_window_line(&model, &state, adapter, `{"op":"inspect","role":"slide.title"}`)
+	defer delete(insp)
+	testing.expect_value(t, insp, `{"ok":true,"id":1,"revision":0,"text":"Busy_Composing","role":"slide.title"}`)
+	testing.expect_value(t, state.last_status, "Ready")
+	testing.expect_value(t, state.needs_redraw, false)
+
+	// Successful preview whose text equals "Busy_Composing" must also preserve UI status.
+	prev := dispatch_window_line(&model, &state, adapter, `{"op":"preview","id":1,"base_revision":0,"text":"Busy_Composing"}`)
+	defer delete(prev)
+	testing.expect_value(t, prev, `{"ok":true,"id":1,"revision":0,"text":"Busy_Composing"}`)
+	testing.expect_value(t, state.last_status, "Ready")
+	testing.expect_value(t, state.needs_redraw, false)
+
+	// During composition, successful reads still preserve the composing status.
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 2
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	state.needs_redraw = false
+
+	insp2 := dispatch_window_line(&model, &state, adapter, `{"op":"inspect","role":"slide.title"}`)
+	defer delete(insp2)
+	testing.expect_value(t, state.last_status, "Composing (uncommitted preedit)")
+	testing.expect_value(t, state.needs_redraw, false)
+
+	// A genuine composition rejection sets the busy status and requests a redraw.
+	busy := dispatch_window_line(&model, &state, adapter, `{"op":"commit","id":1,"base_revision":0,"text":"Other"}`)
+	defer delete(busy)
+	testing.expect_value(t, busy, `{"ok":false,"error":"Busy_Composing"}`)
+	testing.expect_value(t, state.last_status, "Driver blocked: Busy_Composing (retry after preedit)")
+	testing.expect_value(t, state.needs_redraw, true)
+}

@@ -172,6 +172,59 @@ def main() -> int:
         assert win_proc.returncode == 0, f"window exited {win_proc.returncode}"
         assert not sock.exists(), "socket file was not cleaned up on shutdown"
         print("[14] Clean shutdown & socket cleanup verified.")
+
+        # Failed screenshot must exit nonzero AND clean up its owned socket so
+        # a new window can immediately bind the same socket path.
+        win_fail = subprocess.Popen(
+            [str(win_bin), "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=ROOT,
+        )
+        try:
+            assert win_fail.stdout is not None and win_fail.stdin is not None
+            ready2 = win_fail.stdout.readline().strip()
+            assert ready2 == f"Listening {sock}", f"unexpected restart line: {ready2!r}"
+            missing_shot = sock_dir / "missing-subdir" / "fail.png"
+            win_fail.stdin.write(f"screenshot {missing_shot}\n")
+            win_fail.stdin.flush()
+            err_line = win_fail.stdout.readline().strip()
+            assert err_line.startswith("CONTROL_ERR"), f"expected CONTROL_ERR, got {err_line!r}"
+            win_fail.wait(timeout=5)
+            assert win_fail.returncode != 0, f"expected nonzero exit on screenshot failure, got {win_fail.returncode}"
+            assert not sock.exists(), "socket file was NOT removed after failed screenshot"
+            print(f"[15] Failed screenshot exited {win_fail.returncode} and removed socket.")
+        finally:
+            if win_fail.poll() is None:
+                win_fail.terminate()
+                win_fail.wait(timeout=5)
+
+        # Start a fresh window on the exact same socket path to prove cleanup succeeded.
+        win_reuse = subprocess.Popen(
+            [str(win_bin), "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=ROOT,
+        )
+        try:
+            assert win_reuse.stdout is not None
+            ready3 = win_reuse.stdout.readline().strip()
+            assert ready3 == f"Listening {sock}", f"could not reuse socket path: {ready3!r}"
+            code, resp = run_client(client_bin, sock, "inspect", "slide.title")
+            assert code == 0 and resp["revision"] == 0 and resp["text"] == "Quarterly results", (code, resp)
+            send_control(win_reuse, "quit")
+            win_reuse.wait(timeout=5)
+            assert win_reuse.returncode == 0 and not sock.exists()
+            print("[16] Reused same socket path on fresh window and cleaned up.")
+        finally:
+            if win_reuse.poll() is None:
+                win_reuse.terminate()
+                win_reuse.wait(timeout=5)
+
         return 0
     finally:
         if partial_sock is not None:

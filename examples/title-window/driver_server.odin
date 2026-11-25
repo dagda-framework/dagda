@@ -35,9 +35,15 @@ set_fd_nonblocking :: proc(fd: posix.FD) -> bool {
 	return posix.fcntl(fd, .SETFL, flags | c.int(posix.O_NONBLOCK)) >= 0
 }
 
+Window_Guard_State :: struct {
+	editor:       ^Editor_State,
+	busy_blocked: bool,
+}
+
 window_mutation_guard :: proc(ctx: rawptr) -> string {
-	state := (^Editor_State)(ctx)
-	if editor_external_commit_gate(state) == .Busy_Composing {
+	g := (^Window_Guard_State)(ctx)
+	if editor_external_commit_gate(g.editor) == .Busy_Composing {
+		g.busy_blocked = true
 		return "Busy_Composing"
 	}
 	return ""
@@ -52,10 +58,11 @@ dispatch_window_line :: proc(
 	adapter: Model_Adapter,
 	line: string,
 ) -> string {
-	reply := driver.dispatch_guarded(model, line, editor, window_mutation_guard)
+	guard_state := Window_Guard_State{editor = editor}
+	reply := driver.dispatch_guarded(model, line, &guard_state, window_mutation_guard)
 	if editor_sync_from_model(editor, adapter) {
 		editor_set_status(editor, fmt.tprintf("Driver updated -> rev %d (focus preserved)", editor.snapshot_revision))
-	} else if strings.contains(reply, "\"Busy_Composing\"") {
+	} else if guard_state.busy_blocked {
 		editor_set_status(editor, "Driver blocked: Busy_Composing (retry after preedit)")
 		editor.needs_redraw = true
 	}

@@ -421,6 +421,7 @@ poll_control_stdin :: proc(
 	adapter: Model_Adapter,
 	in_buf: ^[dynamic]u8,
 	running: ^bool,
+	exit_code: ^int,
 ) {
 	pfd := posix.pollfd{fd = posix.STDIN_FILENO, events = {.IN}}
 	if posix.poll(&pfd, 1, 0) <= 0 {
@@ -523,8 +524,9 @@ poll_control_stdin :: proc(
 			if !ok {
 				fmt.printf("CONTROL_ERR screenshot failed: %s\n", path)
 				_ = os.flush(os.stdout)
+				exit_code^ = 1
 				running^ = false
-				os.exit(1)
+				break
 			}
 			fmt.printf("CONTROL_OK screenshot=%s rev=%d text=%q focused=%v composing=%v\n",
 				path, win.editor.snapshot_revision, win.editor.committed_text, win.editor.focused, win.editor.composing)
@@ -542,7 +544,7 @@ poll_control_stdin :: proc(
 	}
 }
 
-main :: proc() {
+run_main :: proc() -> int {
 	demo_capture_dir := ""
 	socket_path := ""
 	control_stdin := false
@@ -559,7 +561,7 @@ main :: proc() {
 			control_stdin = true
 		} else {
 			fmt.eprintln("usage: title-window [--socket <socket-path>] [--demo-capture <dir>]")
-			os.exit(2)
+			return 2
 		}
 	}
 
@@ -574,7 +576,7 @@ main :: proc() {
 	model: title_model.Model
 	if err := title_model.init(&model, {id = 1, role = "slide.title"}, "Quarterly results"); err != .None {
 		fmt.eprintf("title_model.init failed: %v\n", err)
-		os.exit(1)
+		return 1
 	}
 	defer title_model.destroy(&model)
 	adapter := title_model_adapter(&model)
@@ -582,19 +584,19 @@ main :: proc() {
 	win: Title_Window
 	win.control_stdin = control_stdin
 	if !window_init(&win, adapter) {
-		os.exit(1)
+		return 1
 	}
 	defer window_destroy(&win)
 
 	if len(demo_capture_dir) > 0 {
 		run_demo_capture(&win, adapter, demo_capture_dir)
-		return
+		return 0
 	}
 
 	server: Window_Driver_Server
 	if len(socket_path) > 0 {
 		if !driver_server_start(&server, socket_path) {
-			os.exit(1)
+			return 1
 		}
 	}
 	defer driver_server_stop(&server)
@@ -605,6 +607,7 @@ main :: proc() {
 	_ = window_render(&win)
 	external_step := 0
 	running := true
+	exit_code := 0
 	wait_ms: c.int = (server.active || control_stdin) ? 16 : 100
 
 	for running && !signal_stopped {
@@ -637,12 +640,19 @@ main :: proc() {
 			driver_server_poll(&server, &model, &win.editor, adapter)
 		}
 		if control_stdin {
-			poll_control_stdin(&win, adapter, &control_buf, &running)
+			poll_control_stdin(&win, adapter, &control_buf, &running, &exit_code)
 		}
 
 		window_sync_text_input(&win)
 		if win.editor.needs_redraw {
 			_ = window_render(&win)
 		}
+	}
+	return exit_code
+}
+
+main :: proc() {
+	if code := run_main(); code != 0 {
+		os.exit(code)
 	}
 }
