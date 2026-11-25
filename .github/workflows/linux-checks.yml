@@ -27,14 +27,17 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: |
           ./scripts/odin.sh test dagda -collection:dagda=.
+          ./scripts/odin.sh test dagda/driver -collection:dagda=.
           ./scripts/odin.sh test examples/title-model -collection:dagda=.
           ./scripts/odin.sh test examples/title-driver -collection:dagda=.
           ./scripts/odin.sh test examples/title-window -collection:dagda=.
 
-      - name: Build the title window
+      - name: Build the title window and counter example
         run: |
           mkdir -p build
           ./scripts/odin.sh build examples/title-window -collection:dagda=. -out:build/title-window
+          ./scripts/odin.sh build examples/counter -collection:dagda=. -out:build/counter
+          ./scripts/odin.sh build examples/dagda-client -collection:dagda=. -out:build/dagda-client
 
       - name: Check the shared-title example output
         run: |
