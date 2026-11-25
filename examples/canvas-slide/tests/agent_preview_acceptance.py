@@ -63,7 +63,16 @@ def composing_geometry(png_path, bounds):
     # the underline is only a few rows high.
     tall = [x for x, n in amber_cols.items() if n >= 8]
     assert tall, f"no caret column in {png_path}: {amber_cols}"
-    return bbox, max(tall)
+    # Report field-relative positions so measurements at
+    # different window scales can be compared directly.
+    rel = tuple(round(v, 4) for v in (
+        (bbox[0] - bounds["x"]) / bounds["width"],
+        (bbox[1] - bounds["y"]) / bounds["height"],
+        (bbox[2] - bounds["x"]) / bounds["width"],
+        (bbox[3] - bounds["y"]) / bounds["height"],
+        (max(tall) - bounds["x"]) / bounds["width"],
+    ))
+    return rel
 
 
 def capture_current(proc, reader, client_bin, sock, png_path):
@@ -73,14 +82,16 @@ def capture_current(proc, reader, client_bin, sock, png_path):
     and the capture, so the bounds and pixels always describe
     the same frame geometry.
     """
-    for _ in range(3):
+    deadline = time.monotonic() + 3.0
+    while True:
         before = headline(client_bin, sock)
         base.send_control(proc, reader, f"screenshot {png_path}")
         after = headline(client_bin, sock)
         if before["bounds"] == after["bounds"]:
             return before
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"window kept resizing; screenshot {png_path} has no verified bounds")
         time.sleep(0.05)
-    return headline(client_bin, sock)
 
 
 def headline_ink(png_path, bounds):
@@ -119,7 +130,7 @@ def verify_single_line_regression(canvas_bin, client_bin, tmp):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, cwd=ROOT)
         reader = base.DeadlineLineReader(proc.stdout)
         assert reader.read_line("single-line startup", timeout=5.0) == f"Listening {sock}"
-        base.send_control(proc, reader, f"screenshot {tmp}/single-line-init.png")
+        capture_current(proc, reader, client_bin, sock, tmp / "single-line-init.png")
         first = headline(client_bin, sock)
         hid = first["id"]
         _, edits = client(client_bin, sock, "edits", str(hid))
@@ -165,7 +176,7 @@ def main():
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, cwd=ROOT)
         reader = base.DeadlineLineReader(proc.stdout)
         assert reader.read_line("canvas startup", timeout=5.0) == f"Listening {sock}"
-        base.send_control(proc, reader, f"screenshot {tmp}/init.png")
+        capture_current(proc, reader, client_bin, sock, tmp / "init.png")
 
         # Discover the headline ID and revision through the client.
         first = headline(client_bin, sock)
@@ -185,9 +196,21 @@ def main():
         base.send_control(proc, reader, "preedit e")
         base.wait_for_headline_composing(proc, reader, client_bin, sock, tmp / "composing-before.png",
                                          "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
-        geo_before = composing_geometry(tmp / "composing-before.png", hb)
+        paired_before = capture_current(proc, reader, client_bin, sock, tmp / "composing-before.png")
+        geo_before = composing_geometry(tmp / "composing-before.png", paired_before["bounds"])
         orig_ink, orig_crop, _ = headline_ink(tmp / "init.png", hb)
-        print(f"[2] visible preedit over selected 'Canvas': highlight={geo_before[0]} caret_x={geo_before[1]} ink={orig_ink}")
+        print(f"[2] visible preedit over selected 'Canvas': relative highlight/caret={geo_before} ink={orig_ink}")
+
+        # Resize the live window at preedit (800x540 -> 800x900):
+        # the composition survives and field-relative highlight
+        # and caret positions repeat after the resize.
+        base.send_control(proc, reader, "resize 800x900")
+        base.wait_for_headline_composing(proc, reader, client_bin, sock, tmp / "composing-resized.png",
+                                         "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
+        paired_resized = capture_current(proc, reader, client_bin, sock, tmp / "composing-resized.png")
+        geo_resized = composing_geometry(tmp / "composing-resized.png", paired_resized["bounds"])
+        assert all(abs(a - b) <= 0.02 for a, b in zip(geo_before, geo_resized)), (geo_before, geo_resized)
+        print(f"[2b] resize at preedit to 800x900: relative geometry repeated {geo_resized}")
 
         # The agent previews its replacement at R.
         _, preview = client(client_bin, sock, "preview", str(headline_id), "replace_text", str(R), "text", "Agent draft")
@@ -199,7 +222,8 @@ def main():
         # this capture after the agent preview.
         base.wait_for_headline_composing(proc, reader, client_bin, sock, composing_capture,
                                          "Slide Canvas", f"selected=false, clicks=0, rev={R}, undo=0")
-        geo_after = composing_geometry(composing_capture, hb)
+        paired_after = capture_current(proc, reader, client_bin, sock, composing_capture)
+        geo_after = composing_geometry(composing_capture, paired_after["bounds"])
         assert geo_after == geo_before, f"composing highlight/caret moved across preview: {geo_before} -> {geo_after}"
         print(f"[3] agent preview received; inspection unchanged at R={R}; composing highlight/caret identical ({composing_capture})")
 
@@ -237,7 +261,10 @@ def main():
         undone_el = capture_current(proc, reader, client_bin, sock, tmp / "undone.png")
         undone_ink, undone_crop, _ = headline_ink(tmp / "undone.png", undone_el["bounds"])
         mask_diff = sum(1 for a, b in zip(orig_crop, undone_crop) if a != b) / max(1, len(orig_crop))
-        assert undone_ink == orig_ink and mask_diff < 0.01, (orig_ink, undone_ink, mask_diff)
+        def rel_ink(ink, bounds):
+            return tuple(round(v, 3) for v in ((ink[0] - bounds["x"]) / bounds["width"], (ink[1] - bounds["y"]) / bounds["height"],
+                                               (ink[2] - bounds["x"]) / bounds["width"], (ink[3] - bounds["y"]) / bounds["height"]))
+        assert rel_ink(undone_ink, undone_el["bounds"]) == rel_ink(orig_ink, hb) and mask_diff < 0.01, (orig_ink, undone_ink, mask_diff)
         print(f"[6] Ctrl+Z: exact 'Slide Canvas' bytes and painted pixels in both views at R+2={R + 2}, undo consumed")
 
         # Glyph reference: paint ASCII "Slide e" through the same

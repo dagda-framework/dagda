@@ -194,12 +194,15 @@ slide_commit_headline :: proc(s: ^Slide_Canvas, new_text: string) -> dagda.Edit_
 	if err != nil || len(cloned) != len(new_text) {
 		return .Alloc_Failed
 	}
-	s.undo_stack.allocator = context.allocator
-	if reserve(&s.undo_stack, len(s.undo_stack) + 1) != nil {
+	// Keep the undo stack's own allocator. Publish the new
+	// headline and revision only after exactly one history
+	// entry has actually been added.
+	before := len(s.undo_stack)
+	append(&s.undo_stack, Undo_Entry{kind = .Headline_Text, text = s.headline})
+	if len(s.undo_stack) != before + 1 {
 		delete(cloned)
 		return .Alloc_Failed
 	}
-	append(&s.undo_stack, Undo_Entry{kind = .Headline_Text, text = s.headline})
 	s.headline = cloned
 	s.headline_rev += 1
 	return .Applied

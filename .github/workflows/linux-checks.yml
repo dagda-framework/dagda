@@ -21,6 +21,9 @@ jobs:
       - name: Install the pinned Odin compiler
         run: bash scripts/setup-odin.sh
 
+      - name: Run the canvas slide unit tests
+        run: ./scripts/odin.sh test examples/canvas-slide -collection:dagda=.
+
       - name: Run the Odin test suites
         env:
           SDL_VIDEODRIVER: dummy

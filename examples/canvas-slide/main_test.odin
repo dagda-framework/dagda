@@ -56,16 +56,15 @@ test_headline_commit_history_alloc_failure :: proc(t: ^testing.T) {
 	delete(slide.undo_stack)
 	slide.undo_stack = make([dynamic]Undo_Entry, 0, 1)
 	append(&slide.undo_stack, Undo_Entry{kind = .Card_Rect, rect = slide.card})
-	// The text clone (first allocation) succeeds; growing the
-	// undo history (second) fails, the clone is released, and
-	// the original text, revision, and history are preserved.
-	state := Budget_State{backing = context.allocator, allowed = 1}
-	saved := context.allocator
-	context.allocator = mem.Allocator{procedure = budget_alloc_proc, data = &state}
+	// Configure the failure on the stack itself: its allocator
+	// refuses growth, while the text clone uses the working
+	// context allocator and must be released again.
+	state := Budget_State{backing = context.allocator, allowed = 0}
+	slide.undo_stack.allocator = mem.Allocator{procedure = budget_alloc_proc, data = &state}
 	result := slide_commit_headline(&slide, "New title")
-	context.allocator = saved
 	testing.expect_value(t, result, dagda.Edit_Result.Alloc_Failed)
 	assert_preserved(t, &slide)
+	slide.undo_stack.allocator = context.allocator
 
 	// The same commit succeeds with a working allocator.
 	testing.expect_value(t, slide_commit_headline(&slide, "New title"), dagda.Edit_Result.Applied)
