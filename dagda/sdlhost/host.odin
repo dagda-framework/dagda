@@ -516,6 +516,7 @@ poll_control_stdin :: proc(
 			w, ht, ok_size := parse_size_arg(line[len("resize "):])
 			if ok_size {
 				sdl.SetWindowSize(h.window, w, ht)
+				_ = sdl.SyncWindow(h.window)
 				if !host_rebuild_frame(h) {
 					fmt.println("CONTROL_ERR resize rebuild failed")
 					_ = os.flush(os.stdout)
