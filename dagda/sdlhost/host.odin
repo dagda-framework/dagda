@@ -319,6 +319,9 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	case "ctrl+shift+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT
+	case "ctrl+super+z":
+		key = sdl.K_Z
+		mod = sdl.KMOD_LCTRL | sdl.KMOD_LGUI
 	case "ctrl+z+repeat":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
@@ -551,7 +554,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
-				if ev.type == .KEY_DOWN && !ev.key.repeat && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && (ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT)) == {} && h.app.on_undo != nil {
+				if ev.type == .KEY_DOWN && !ev.key.repeat && ev.key.key == sdl.K_Z && (ev.key.mod & sdl.KMOD_CTRL) != {} && (ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {} && h.app.on_undo != nil {
 					if h.app.on_undo(h.app.user_data) {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1

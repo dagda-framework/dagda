@@ -187,6 +187,7 @@ def main():
         # geometry, revision, and undo history all survive.
         control("key ctrl+shift+z")
         control("key ctrl+z+repeat")
+        control("key ctrl+super+z")
         kept = inspect_rect(client_bin, sock)
         assert kept["canvas_bounds"] == after["canvas_bounds"], kept
         _, edits_kept = client(client_bin, sock, "edits", "7")
