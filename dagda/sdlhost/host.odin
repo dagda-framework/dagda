@@ -2,6 +2,7 @@ package sdlhost
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -11,20 +12,38 @@ import "dagda:dagda/driver"
 import sdl "vendor:sdl3"
 
 View_Proc :: #type proc(user_data: rawptr) -> dagda.View
+Canvas_Proc :: #type proc(user_data: rawptr) -> dagda.Canvas
 
 // App describes a native Dagda application hosted in an SDL3 window.
+// Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
 App :: struct {
 	title:     string,
 	width:     i32,
 	height:    i32,
 	user_data: rawptr,
 	view:      View_Proc,
+	canvas:    Canvas_Proc,
 	handle:    dagda.Action_Handler,
 }
 
 Run_Options :: struct {
 	socket_path:   string,
 	control_stdin: bool,
+	width:         i32,
+	height:        i32,
+}
+
+parse_size_arg :: proc(s: string) -> (w: i32, h: i32, ok: bool) {
+	x := strings.index_byte(s, 'x')
+	if x <= 0 || x + 1 >= len(s) {
+		return 0, 0, false
+	}
+	wv, ok_w := strconv.parse_int(s[:x])
+	hv, ok_h := strconv.parse_int(s[x + 1:])
+	if !ok_w || !ok_h || wv <= 0 || hv <= 0 {
+		return 0, 0, false
+	}
+	return i32(wv), i32(hv), true
 }
 
 parse_cli_args :: proc(args: []string) -> (opts: Run_Options, ok: bool) {
@@ -33,6 +52,14 @@ parse_cli_args :: proc(args: []string) -> (opts: Run_Options, ok: bool) {
 		if arg == "--socket" && i + 1 < len(args) {
 			i += 1
 			opts.socket_path = args[i]
+		} else if arg == "--size" && i + 1 < len(args) {
+			i += 1
+			w, h, ok_size := parse_size_arg(args[i])
+			if !ok_size {
+				return {}, false
+			}
+			opts.width = w
+			opts.height = h
 		} else if arg == "--control-stdin" {
 			opts.control_stdin = true
 		} else {
@@ -67,10 +94,16 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	w, height: c.int
 	sdl.GetWindowSize(h.window, &w, &height)
 	h.viewport = {width = f32(w), height = f32(height)}
-	// Release the previous frame before rebuilding the app view so no frame
-	// outlives borrowed label/role storage.
+	// Release the previous frame before rebuilding the app view/canvas so no
+	// frame outlives borrowed label/role storage.
 	dagda.frame_destroy(&h.frame)
-	frame, ok := dagda.resolve(h.app.view(h.app.user_data), h.viewport)
+	frame: dagda.Frame
+	ok: bool
+	if h.app.canvas != nil {
+		frame, ok = dagda.resolve_canvas(h.app.canvas(h.app.user_data), h.viewport)
+	} else {
+		frame, ok = dagda.resolve(h.app.view(h.app.user_data), h.viewport)
+	}
 	if !ok {
 		fmt.eprintln("dagda.resolve failed")
 		return false
@@ -87,8 +120,37 @@ host_rebuild_cb :: proc(ctx: rawptr) -> bool {
 
 host_draw :: proc(h: ^Host) {
 	r := h.renderer
-	sdl.SetRenderDrawColor(r, 22, 25, 32, 255)
-	sdl.RenderClear(r)
+	if h.frame.has_canvas {
+		// Distinct dark letterbox background outside the fitted canvas.
+		sdl.SetRenderDrawColor(r, 14, 16, 22, 255)
+		sdl.RenderClear(r)
+
+		t := h.frame.transform
+		fitted := sdl.FRect{
+			x = t.offset.x,
+			y = t.offset.y,
+			w = t.canvas.width * t.scale,
+			h = t.canvas.height * t.scale,
+		}
+		if fitted.w > 0 && fitted.h > 0 {
+			sdl.SetRenderDrawColor(r, 26, 31, 42, 255)
+			sdl.RenderFillRect(r, &fitted)
+		}
+
+		// Clip all canvas element painting to the fitted canvas rectangle.
+		clip := sdl.Rect{
+			x = c.int(math.floor(fitted.x)),
+			y = c.int(math.floor(fitted.y)),
+			w = max(c.int(math.ceil(fitted.x + fitted.w)) - c.int(math.floor(fitted.x)), 0),
+			h = max(c.int(math.ceil(fitted.y + fitted.h)) - c.int(math.floor(fitted.y)), 0),
+		}
+		sdl.SetRenderClipRect(r, &clip)
+	} else {
+		sdl.SetRenderDrawColor(r, 22, 25, 32, 255)
+		sdl.RenderClear(r)
+	}
+
+	text_scale: f32 = h.frame.has_canvas ? clamp(h.frame.transform.scale, 0.4, 2.0) : 1.0
 
 	for el in h.frame.elements {
 		rect := sdl.FRect{
@@ -104,7 +166,7 @@ host_draw :: proc(h: ^Host) {
 			sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
 			sdl.RenderRect(r, &rect)
 
-			px: f32 = 24
+			px := max(24 * text_scale, 12)
 			tw := font_measure_width(&h.font, el.text, px)
 			tx := rect.x + max((rect.w - tw) * 0.5, 12)
 			ty := rect.y + (rect.h - px) * 0.5
@@ -125,7 +187,7 @@ host_draw :: proc(h: ^Host) {
 			sdl.SetRenderDrawColor(r, 118, 176, 255, 255)
 			sdl.RenderRect(r, &rect)
 
-			px: f32 = 18
+			px := max(18 * text_scale, 11)
 			tw := font_measure_width(&h.font, el.text, px)
 			tx := rect.x + max((rect.w - tw) * 0.5, 12)
 			ty := rect.y + (rect.h - px) * 0.5
@@ -140,6 +202,10 @@ host_draw :: proc(h: ^Host) {
 			sdl.RenderRect(r, &ring1)
 			sdl.RenderRect(r, &ring2)
 		}
+	}
+
+	if h.frame.has_canvas {
+		sdl.SetRenderClipRect(r, nil)
 	}
 }
 
@@ -343,8 +409,8 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 
 	title_cstr := strings.clone_to_cstring(len(app.title) > 0 ? app.title : "Dagda")
 	defer delete(title_cstr)
-	w := app.width > 0 ? c.int(app.width) : 360
-	ht := app.height > 0 ? c.int(app.height) : 180
+	w := opts.width > 0 ? c.int(opts.width) : (app.width > 0 ? c.int(app.width) : 360)
+	ht := opts.height > 0 ? c.int(opts.height) : (app.height > 0 ? c.int(app.height) : 180)
 	if !sdl.CreateWindowAndRenderer(title_cstr, w, ht, {.RESIZABLE}, &h.window, &h.renderer) {
 		fmt.eprintf("SDL_CreateWindowAndRenderer failed: %s\n", sdl.GetError())
 		return 1

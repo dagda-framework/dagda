@@ -287,3 +287,24 @@ test_failed_rebuild_stops_pipelined_requests_and_surfaces_error :: proc(t: ^test
 	testing.expect_value(t, ok2, false)
 	testing.expect_value(t, os.exists(sock_path), false)
 }
+
+@(test)
+test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
+	elements := [2]dagda.Canvas_Element{
+		{info = {id = 1, role = "slide.headline"}, kind = .Label, text = "Title", bounds = {x = 80, y = 60, width = 800, height = 80}},
+		{info = {id = 2, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = 220, y = 200, width = 520, height = 220}},
+	}
+	canvas := dagda.Canvas{
+		size     = {width = 960, height = 540},
+		elements = elements[:],
+	}
+	// 640x480 fits 960x540 at scale = 640/960 = 2/3, offset = (0, 60).
+	frame, ok := dagda.resolve_canvas(canvas, {width = 640, height = 480})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	rep, applied := dispatch(frame, nil, nil, `{"op":"inspect","role":"slide.card"}`)
+	defer delete(rep)
+	testing.expect_value(t, applied, false)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":146.67,"y":193.33,"width":346.67,"height":146.67},"canvas_bounds":{"x":220.00,"y":200.00,"width":520.00,"height":220.00},"actions":["activate"]}]}`)
+}
