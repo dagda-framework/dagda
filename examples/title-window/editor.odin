@@ -218,8 +218,15 @@ editor_handle_text_editing :: proc(state: ^Editor_State, text: string, start: in
 	if !state.focused {
 		return false
 	}
-	editor_clear_preedit(state)
-	dagda.begin_composition(&state.session, text, start, length)
+	// A failed preedit update keeps the current preedit, selection,
+	// and Busy_Composing gate exactly as they were.
+	editor_sync_session(state)
+	if err := dagda.begin_composition(&state.session, text, start, length); err != .None {
+		editor_sync_from_session(state)
+		editor_set_status(state, "Composition update failed")
+		state.needs_redraw = true
+		return false
+	}
 	editor_sync_from_session(state)
 	if state.composing {
 		editor_set_status(state, "Composing (uncommitted preedit)")
@@ -333,18 +340,32 @@ editor_handle_text_input :: proc(state: ^Editor_State, adapter: Model_Adapter, t
 	if !state.focused {
 		return false
 	}
-	editor_clear_preedit(state)
 	if len(text) == 0 {
 		state.needs_redraw = true
 		return false
 	}
+	// Propose first: on failure nothing is committed and any
+	// active preedit (and its Busy gate) stays in place.
 	editor_sync_session(state)
 	edit := dagda.insert_text(&state.session, state.committed_text, text)
+	if edit.err != .None {
+		editor_sync_from_session(state)
+		dagda.edit_destroy(&state.session, &edit)
+		editor_set_status(state, "Text proposal failed")
+		state.needs_redraw = true
+		return false
+	}
 	editor_sync_from_session(state)
+	committed := true // a no-op proposal needs no document commit
 	if edit.changed {
-		editor_commit_replacement(state, adapter, edit.text, edit.caret)
+		committed = editor_commit_replacement(state, adapter, edit.text, edit.caret) == .None
 	}
 	dagda.edit_destroy(&state.session, &edit)
+	// The preedit ends only once the replacement has succeeded.
+	if committed {
+		editor_clear_preedit(state)
+		editor_sync_session(state)
+	}
 	return true
 }
 
@@ -435,6 +456,11 @@ editor_handle_key_down :: proc(state: ^Editor_State, adapter: Model_Adapter, key
 		editor_sync_session(state)
 		edit := dagda.backspace(&state.session, state.committed_text)
 		editor_sync_from_session(state)
+		if edit.err != .None {
+			dagda.edit_destroy(&state.session, &edit)
+			state.needs_redraw = true
+			return false
+		}
 		if !edit.changed {
 			dagda.edit_destroy(&state.session, &edit)
 			return state.caret != 0 || has_selection(state)
@@ -448,6 +474,11 @@ editor_handle_key_down :: proc(state: ^Editor_State, adapter: Model_Adapter, key
 		editor_sync_session(state)
 		edit := dagda.delete_forward(&state.session, state.committed_text)
 		editor_sync_from_session(state)
+		if edit.err != .None {
+			dagda.edit_destroy(&state.session, &edit)
+			state.needs_redraw = true
+			return false
+		}
 		if !edit.changed {
 			dagda.edit_destroy(&state.session, &edit)
 			return false

@@ -42,6 +42,62 @@ fail_alloc_proc :: proc(
 }
 
 @(test)
+test_failed_preedit_and_text_proposals_preserve_state :: proc(t: ^testing.T) {
+	model := make_test_model(t)
+	defer title_model.destroy(&model)
+	adapter := title_model_adapter(&model)
+
+	state: Editor_State
+	editor_init(&state, adapter)
+	defer editor_destroy(&state)
+
+	// Select "results" and start composing successfully.
+	state.anchor = len("Quarterly ")
+	state.caret = len("Quarterly results")
+	edit_ev: sdl.Event
+	edit_ev.type = .TEXT_EDITING
+	edit_ev.edit.text = "café"
+	edit_ev.edit.start = 0
+	edit_ev.edit.length = 0
+	editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Busy_Composing)
+
+	fail_state := Fail_Alloc_State{backing = context.allocator, fail_allocs = true}
+	state.session.allocator = mem.Allocator{procedure = fail_alloc_proc, data = &fail_state}
+
+	// A failing preedit update keeps the old preedit, the
+	// selection, and the Busy gate; no revision is consumed.
+	edit_ev.edit.text = "nouveau"
+	handled := editor_handle_sdl_event(&state, adapter, &edit_ev, TEST_TITLE_BOX)
+	testing.expect(t, !handled)
+	testing.expect_value(t, state.preedit_text, "café")
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, editor_external_commit_gate(&state), External_Commit_Gate.Busy_Composing)
+	testing.expect_value(t, state.anchor, len("Quarterly "))
+	testing.expect_value(t, state.caret, len("Quarterly results"))
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(0))
+
+	// A failing final text proposal behaves the same way.
+	input_ev: sdl.Event
+	input_ev.type = .TEXT_INPUT
+	input_ev.text.text = "café"
+	handled = editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect(t, !handled)
+	testing.expect_value(t, state.preedit_text, "café")
+	testing.expect(t, editor_is_composing(&state))
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(0))
+
+	// Retrying with a working allocator succeeds exactly once.
+	fail_state.fail_allocs = false
+	handled = editor_handle_sdl_event(&state, adapter, &input_ev, TEST_TITLE_BOX)
+	testing.expect(t, handled)
+	testing.expect_value(t, state.committed_text, "Quarterly café")
+	testing.expect_value(t, title_model.snapshot(&model).revision, dagda.Revision(1))
+	testing.expect(t, !editor_is_composing(&state))
+}
+
+@(test)
 test_rejected_typing_preserves_selection_after_external_commit :: proc(t: ^testing.T) {
 	model := make_test_model(t, "abc")
 	defer title_model.destroy(&model)

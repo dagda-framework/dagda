@@ -120,10 +120,11 @@ test_proposed_edit_safety :: proc(t: ^testing.T) {
 	testing.expect(t, apply(&app, &session, &edit))
 	testing.expect_value(t, session.caret, len("e\xcc\x81"))
 
-	// Identical replacement is a no-op with empty text.
+	// Identical replacement is a no-op with empty text. The
+	// endpoints span the whole formed grapheme (e + U+0301).
 	session.caret = 0
-	session.anchor = 1
-	noop := replace_range(&session, app.text, 0, 1, "e")
+	session.anchor = len("e\xcc\x81")
+	noop := replace_range(&session, app.text, 0, len("e\xcc\x81"), "e\xcc\x81")
 	testing.expect_value(t, noop.err, Edit_Error.None)
 	testing.expect(t, !noop.changed)
 	testing.expect_value(t, noop.text, "")
@@ -135,8 +136,15 @@ test_proposed_edit_safety :: proc(t: ^testing.T) {
 	testing.expect(t, !bad_input.changed && bad_input.text == "")
 	bad_range := replace_range(&session, app.text, 0, 999, "x")
 	testing.expect_value(t, bad_range.err, Edit_Error.Invalid_Range)
+	// Endpoints splitting a grapheme or a UTF-8 code point are
+	// invalid too, including when the edit would be a no-op.
+	split_grapheme := replace_range(&session, app.text, 1, len("e\xcc\x81"), "e")
+	testing.expect_value(t, split_grapheme.err, Edit_Error.Invalid_Range)
+	testing.expect(t, !split_grapheme.changed && split_grapheme.text == "")
+	split_rune := replace_range(&session, "A\xf0\x9f\x91\xa9B", 1, 2, "x")
+	testing.expect_value(t, split_rune.err, Edit_Error.Invalid_Range)
 	testing.expect_value(t, session.caret, 0)
-	testing.expect_value(t, session.anchor, 1)
+	testing.expect_value(t, session.anchor, len("e\xcc\x81"))
 
 	// Allocation failure: explicit error, nothing to commit,
 	// prior caret/selection and prior preedit preserved.
@@ -146,6 +154,15 @@ test_proposed_edit_safety :: proc(t: ^testing.T) {
 	failed := backspace(&session, app.text)
 	testing.expect_value(t, failed.err, Edit_Error.Alloc_Failed)
 	testing.expect(t, !failed.changed && failed.text == "")
+	testing.expect_value(t, begin_composition(&session, "new", 0, 0), Edit_Error.Alloc_Failed)
+	testing.expect_value(t, session.preedit, "old")
+	testing.expect(t, is_composing(&session))
+	// The nil allocator reports no error but supplies no storage:
+	// the same explicit failure, with state preserved.
+	session.allocator = mem.nil_allocator()
+	nil_failed := backspace(&session, app.text)
+	testing.expect_value(t, nil_failed.err, Edit_Error.Alloc_Failed)
+	testing.expect(t, !nil_failed.changed && nil_failed.text == "")
 	testing.expect_value(t, begin_composition(&session, "new", 0, 0), Edit_Error.Alloc_Failed)
 	testing.expect_value(t, session.preedit, "old")
 	testing.expect(t, is_composing(&session))

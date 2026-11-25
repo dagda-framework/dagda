@@ -222,12 +222,15 @@ replace_range :: proc(session: ^Text_Session, committed: string, start, end: int
 	if start < 0 || end < start || end > len(committed) {
 		return {caret = session.caret, err = .Invalid_Range}
 	}
+	if clamp_grapheme_boundary(committed, start) != start || clamp_grapheme_boundary(committed, end) != end {
+		return {caret = session.caret, err = .Invalid_Range}
+	}
 	if start == end && len(inserted) == 0 {
 		return {caret = session.caret}
 	}
 	total := start + len(inserted) + (len(committed) - end)
 	storage, alloc_err := make([]u8, total, session.allocator)
-	if alloc_err != nil {
+	if alloc_err != nil || (total > 0 && (storage == nil || len(storage) != total)) {
 		return {caret = session.caret, err = .Alloc_Failed}
 	}
 	copy(storage, committed[:start])
@@ -298,7 +301,7 @@ begin_composition :: proc(session: ^Text_Session, preedit: string, start: int, l
 		return .None
 	}
 	cloned, clone_err := strings.clone(preedit, session.allocator)
-	if clone_err != nil {
+	if clone_err != nil || len(cloned) != len(preedit) {
 		return .Alloc_Failed
 	}
 	delete(session.preedit, session.allocator)
