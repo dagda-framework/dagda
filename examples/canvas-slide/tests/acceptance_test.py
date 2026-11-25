@@ -35,6 +35,9 @@ LETTERBOX_RGB = (14, 16, 22)
 SHEET_RGB = (26, 31, 42)
 IDLE_CARD_RGB = (52, 108, 194)
 HOVER_CARD_RGB = (64, 124, 214)
+CARET_AMBER_RGB = (255, 206, 84)
+PREEDIT_BG_RGB = (62, 78, 118)
+SEL_BG_RGB = (58, 108, 190)
 
 
 class DeadlineLineReader:
@@ -212,16 +215,107 @@ def send_control(win_proc: subprocess.Popen, reader: DeadlineLineReader, cmd: st
     return resp
 
 
-def wait_for_headline(client_bin: Path, sock: Path, expected: str, timeout: float = 3.0) -> dict:
+def wait_for_role_text(client_bin: Path, sock: Path, role: str, expected: str, timeout: float = 3.0) -> dict:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        code, resp = run_client(client_bin, sock, "inspect", "slide.headline")
+        code, resp = run_client(client_bin, sock, "inspect", role)
         last = (code, resp)
         if code == 0 and resp.get("ok") is True and resp["elements"][0]["text"] == expected:
             return resp
         time.sleep(0.01)
-    raise AssertionError(f"timed out waiting for slide.headline == {expected!r}; last={last}")
+    raise AssertionError(f"timed out waiting for {role} == {expected!r}; last={last}")
+
+
+def inspect_headline_visual_state(png_path: Path, bounds: dict) -> tuple[int, int, int, int, int]:
+    """Inspect composition-specific and selection-specific visual cues inside headline bounds.
+    Returns (png_w, png_h, preedit_bg_hits, sel_bg_hits, max_amber_row_width).
+    - Composing paints PREEDIT_BG_RGB and an amber underline wider than the 2px caret bar,
+      and hides SEL_BG_RGB while composing over the selection.
+    - Ordinary selection paints SEL_BG_RGB, zero PREEDIT_BG_RGB, and only the 2px caret bar.
+    """
+    w, h, rgb = decode_png_rgb(png_path)
+    x0 = max(0, int(math.floor(bounds["x"])))
+    y0 = max(0, int(math.floor(bounds["y"])))
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])))
+    y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])))
+    preedit_bg_hits = 0
+    sel_bg_hits = 0
+    max_amber_row_width = 0
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        row_amber = 0
+        for x in range(x0, x1):
+            px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
+            if rgb_close(px, PREEDIT_BG_RGB):
+                preedit_bg_hits += 1
+            elif rgb_close(px, SEL_BG_RGB):
+                sel_bg_hits += 1
+            elif rgb_close(px, CARET_AMBER_RGB):
+                row_amber += 1
+        if row_amber > max_amber_row_width:
+            max_amber_row_width = row_amber
+    return w, h, preedit_bg_hits, sel_bg_hits, max_amber_row_width
+
+
+def wait_for_headline_composing(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    client_bin: Path,
+    sock: Path,
+    png_path: Path,
+    expected_text: str,
+    expected_status: str,
+    timeout: float = 2.0,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout
+    last = (0, 0, 0, 0, 0)
+    while True:
+        send_control(proc, reader, f"screenshot {png_path}")
+        code, hl_now = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and hl_now["elements"][0]["text"] == expected_text, hl_now
+        hb = hl_now["elements"][0]["bounds"]
+        png_w, png_h, pre_bg, sel_bg, max_amber_w = inspect_headline_visual_state(png_path, hb)
+        last = (png_w, png_h, pre_bg, sel_bg, max_amber_w)
+        if pre_bg >= 50 and max_amber_w >= 6 and sel_bg == 0:
+            wait_for_role_text(client_bin, sock, "slide.status", expected_status)
+            return png_w, png_h, pre_bg, max_amber_w
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"headline not visibly composing in {png_path}: "
+                f"preedit_bg={pre_bg} (need >=50), max_amber_row_width={max_amber_w} (need >=6), "
+                f"sel_bg={sel_bg} (need ==0)"
+            )
+        time.sleep(0.02)
+
+
+def wait_for_headline_ordinary_selection(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    client_bin: Path,
+    sock: Path,
+    png_path: Path,
+    expected_text: str,
+    expected_status: str,
+    timeout: float = 2.0,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        send_control(proc, reader, f"screenshot {png_path}")
+        code, hl_now = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and hl_now["elements"][0]["text"] == expected_text, hl_now
+        hb = hl_now["elements"][0]["bounds"]
+        png_w, png_h, pre_bg, sel_bg, max_amber_w = inspect_headline_visual_state(png_path, hb)
+        if pre_bg == 0 and max_amber_w <= 2 and sel_bg >= 200:
+            wait_for_role_text(client_bin, sock, "slide.status", expected_status)
+            return png_w, png_h, sel_bg, max_amber_w
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"ordinary selection not restored in {png_path}: "
+                f"preedit_bg={pre_bg} (need ==0), max_amber_row_width={max_amber_w} (need <=2), "
+                f"sel_bg={sel_bg} (need >=200)"
+            )
+        time.sleep(0.02)
 
 
 def assert_bbox_matches(bounds: dict, px0: int, py0: int, px1: int, py1: int) -> None:
@@ -370,12 +464,12 @@ def verify_viewport(
 
         # 3. Letterbox click leaves state unchanged.
         send_control(proc, reader, "click 2.00 2.00")
-        code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
-        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0, undo=0)", (code, h0)
+        code, h0 = run_client(client_bin, sock, "inspect", "slide.status")
+        assert code == 0 and h0["elements"][0]["text"] == "selected=false, clicks=0, rev=0, undo=0", (code, h0)
 
         # 4. Card click preserves button activation.
         send_control(proc, reader, f"click {cx:.2f} {cy:.2f}")
-        h1 = wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
+        h1 = wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=0")
         print(f"[{tag}] letterbox click no-op; card click ({cx:.1f},{cy:.1f}) -> {h1['elements'][0]['text']}")
 
         # 5. Drag card with 3 separate motion events -> updates document bounds, produces 1 undo step.
@@ -389,7 +483,7 @@ def verify_viewport(
         expected_drag = {"x": 280.0, "y": 170.0, "width": 520.0, "height": 220.0}
         dragged = wait_for_card_canvas_bounds(client_bin, sock, expected_drag)
         dragged_cb = dragged["canvas_bounds"]
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=1)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=1")
 
         # 6. Resize card from bottom-right corner -> updates document width/height, produces 1 undo step.
         db = dragged["bounds"]
@@ -408,7 +502,7 @@ def verify_viewport(
         }
         resized = wait_for_card_canvas_bounds(client_bin, sock, expected_resize)
         resized_cb = resized["canvas_bounds"]
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=2")
 
         # 7. Second drag: invoke Undo via real dagda-client mid-drag -> rejected without consuming history,
         # then Escape + button-up restores geometry and consumes no undo step.
@@ -433,28 +527,28 @@ def verify_viewport(
         # Real dagda-client Undo during active drag must be rejected without consuming history.
         code_mid, mid_undo = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
         assert code_mid != 0 and mid_undo == {"ok": False, "error": "Not_Handled"}, (code_mid, mid_undo)
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=2")
 
         # Escape cancels the drag, and subsequent button-up is a no-op.
         send_control(proc, reader, "key escape")
         send_control(proc, reader, f"up {end_x:.2f} {end_y:.2f}")
         restored = wait_for_card_canvas_bounds(client_bin, sock, resized_cb, tol=0.001)
         assert restored["canvas_bounds"] == resized_cb, (restored["canvas_bounds"], resized_cb)
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=2)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=2")
 
         # 8. Undo twice via slide.undo button: resize -> dragged -> original (proves 1 undo step per gesture).
         code, u1 = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
         assert code == 0 and u1["ok"] is True, (code, u1)
         after_u1 = wait_for_card_canvas_bounds(client_bin, sock, dragged_cb, tol=0.001)
         assert after_u1["canvas_bounds"] == dragged_cb
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=1)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=1")
 
         code, u2 = run_client(client_bin, sock, "invoke", str(undo_btn["id"]), "activate")
         assert code == 0 and u2["ok"] is True, (code, u2)
         orig = {"x": 220, "y": 200, "width": 520, "height": 220}
         after_u2 = wait_for_card_canvas_bounds(client_bin, sock, orig, tol=0.001)
         assert after_u2["canvas_bounds"] == orig
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=0")
 
         print(
             f"[{tag}] gestures: drag=({dragged_cb['x']:.1f},{dragged_cb['y']:.1f},{dragged_cb['width']:.1f}x{dragged_cb['height']:.1f}) "
@@ -553,14 +647,14 @@ def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, cap
         click_x = sample_x + 0.5
         send_control(proc, reader, f"click {click_x:.2f} {out_top + 0.5:.2f}")
         send_control(proc, reader, f"click {click_x:.2f} {out_bot + 0.5:.2f}")
-        code, h0 = run_client(client_bin, sock, "inspect", "slide.headline")
-        assert code == 0 and h0["elements"][0]["text"] == "Slide Canvas (selected=false, clicks=0, undo=0)", (code, h0)
+        code, h0 = run_client(client_bin, sock, "inspect", "slide.status")
+        assert code == 0 and h0["elements"][0]["text"] == "selected=false, clicks=0, rev=0, undo=0", (code, h0)
 
         send_control(proc, reader, f"click {click_x:.2f} {in_top + 0.5:.2f}")
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=1, undo=0)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=1, rev=0, undo=0")
 
         send_control(proc, reader, f"click {click_x:.2f} {in_bot + 0.5:.2f}")
-        wait_for_headline(client_bin, sock, "Slide Canvas (selected=true, clicks=2, undo=0)")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=true, clicks=2, rev=0, undo=0")
 
         print(
             f"[edge] requested=801x542 captured={png_w}x{png_h} fitted_y=[{y_top:.5f},{y_bot:.5f}): "
@@ -578,8 +672,187 @@ def verify_fractional_edge_and_precision(canvas_bin: Path, client_bin: Path, cap
         shutil.rmtree(sock_dir, ignore_errors=True)
 
 
+def verify_headline_text_editing(
+    canvas_bin: Path,
+    client_bin: Path,
+    capture_dir: Path,
+    size_arg: str = "800x540",
+    tag: str = "text1",
+    save_preedit_name: str = "headline-preedit.png",
+    omit_preedit: bool = False,
+) -> None:
+    """Verify editable single-line headline on canvas:
+    click-to-caret placement (start + interior + end) -> Tab to button -> select 'Canvas'
+    -> live preedit 'e' (visually verified: preedit highlight + underline > caret, no selection bg)
+    -> Escape cancel (visually verified: ordinary selection restored at same revision)
+    -> live preedit 'e' again (visually verified before Enter + TEXT_INPUT 'é')
+    -> commits once (1 rev, 1 undo) -> Ctrl+Z undo to exact original bytes
+    -> Backspace removes decomposed é (e + U+0301) as one grapheme.
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-canvas-{tag}."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "canvas.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(canvas_bin), "--size", size_arg, "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line(f"text-edit canvas startup ({size_arg})", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # Capture once so any initial compositor map/resize settles, then inspect headline.
+        init_png = capture_dir / f"{tag}-{size_arg}-init.png"
+        send_control(proc, reader, f"screenshot {init_png}")
+        code, hl_resp = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code == 0 and hl_resp["ok"] is True and len(hl_resp["elements"]) == 1, (code, hl_resp)
+        hl = hl_resp["elements"][0]
+        assert hl["text"] == "Slide Canvas", hl
+        hb = hl["bounds"]
+        hy = hb["y"] + hb["height"] * 0.5
+        png_w, png_h, _ = decode_png_rgb(init_png)
+        scale = min(png_w / 960.0, png_h / 540.0)
+        text_scale = max(0.4, min(scale, 2.0))
+        px = max(24.0 * text_scale, 12.0)
+        pad_x = max(16.0 * text_scale, 10.0)
+        text_x = hb["x"] + pad_x
+
+        # 1. Click-to-caret placement: click before text origin -> lands at grapheme boundary 0.
+        send_control(proc, reader, f"click {hb['x'] + 2.0:.2f} {hy:.2f}")
+        send_control(proc, reader, "text A")
+        wait_for_role_text(client_bin, sock, "slide.headline", "ASlide Canvas")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=1, undo=1")
+
+        # Tab transfers keyboard focus to the first button (slide.undo), ending the headline's
+        # text-input session so Enter activates Undo and subsequent typing does not edit the headline.
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "key enter")
+        wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=2, undo=0")
+        send_control(proc, reader, "text Q")
+        code_q, hl_q = run_client(client_bin, sock, "inspect", "slide.headline")
+        assert code_q == 0 and hl_q["elements"][0]["text"] == "Slide Canvas", hl_q
+
+        # Click inside the interior of "Slide Canvas" (around the end of "Slide") -> lands at an interior grapheme boundary.
+        interior_x = text_x + 2.6 * px
+        send_control(proc, reader, f"click {interior_x:.2f} {hy:.2f}")
+        send_control(proc, reader, "text X")
+        deadline = time.monotonic() + 3.0
+        interior_text = ""
+        while time.monotonic() < deadline:
+            code, r = run_client(client_bin, sock, "inspect", "slide.headline")
+            if code == 0 and r.get("ok") is True and "X" in r["elements"][0]["text"]:
+                interior_text = r["elements"][0]["text"]
+                break
+            time.sleep(0.01)
+        assert interior_text.startswith("S") and interior_text.endswith("s") and len(interior_text) == len("Slide Canvas") + 1, (
+            f"expected interior caret insertion in 'Slide Canvas', got {interior_text!r}"
+        )
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=4, undo=0")
+
+        # 2. Click past the end of text, select "Canvas" (6 graphemes), show live preedit "e".
+        send_control(proc, reader, f"click {hb['x'] + hb['width'] - 10.0:.2f} {hy:.2f}")
+        for _ in range(6):
+            send_control(proc, reader, "key shift+left")
+        if not omit_preedit:
+            send_control(proc, reader, "preedit e")
+
+        # Prove "e" is visibly composing over selected "Canvas" before Escape:
+        # preedit highlight + underline wider than 2px caret bar + no ordinary selection highlight.
+        preedit_png = capture_dir / save_preedit_name
+        png_w, png_h, pre_bg1, uline_w1 = wait_for_headline_composing(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            preedit_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
+
+        # 3. Cancel preedit with Escape -> restores ordinary selection over "Canvas" at rev=4.
+        send_control(proc, reader, "key escape")
+        cancel_png = capture_dir / f"{tag}-{size_arg}-after-escape.png"
+        _, _, sel_bg_after_esc, caret_w_after_esc = wait_for_headline_ordinary_selection(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            cancel_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
+
+        # 4. Compose "e" again and prove it is visibly composing BEFORE Enter and final TEXT_INPUT "é".
+        send_control(proc, reader, "preedit e")
+        preedit2_png = capture_dir / f"{tag}-{size_arg}-preedit2.png"
+        _, _, pre_bg2, uline_w2 = wait_for_headline_composing(
+            proc,
+            reader,
+            client_bin,
+            sock,
+            preedit2_png,
+            "Slide Canvas",
+            "selected=false, clicks=0, rev=4, undo=0",
+        )
+        send_control(proc, reader, "key enter")
+        send_control(proc, reader, "text é")
+        wait_for_role_text(client_bin, sock, "slide.headline", "Slide é")
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=5, undo=1")
+
+        # 5. Undo via Ctrl+Z -> exact original bytes "Slide Canvas", rev=6, undo=0.
+        send_control(proc, reader, "key ctrl+z")
+        hl_undone = wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
+        assert hl_undone["elements"][0]["text"].encode("utf-8") == b"Slide Canvas"
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=6, undo=0")
+
+        # 6. Insert decomposed é (e + U+0301, 3 UTF-8 bytes), then Backspace removes it as 1 grapheme.
+        decomposed_e = "e\u0301"
+        assert decomposed_e.encode("utf-8") == b"e\xcc\x81"
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, f"text {decomposed_e}")
+        hl_decomposed = wait_for_role_text(client_bin, sock, "slide.headline", f"Slide Canvas{decomposed_e}")
+        assert hl_decomposed["elements"][0]["text"].encode("utf-8") == b"Slide Canvase\xcc\x81"
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=7, undo=1")
+
+        send_control(proc, reader, "key backspace")
+        hl_after_bs = wait_for_role_text(client_bin, sock, "slide.headline", "Slide Canvas")
+        assert hl_after_bs["elements"][0]["text"].encode("utf-8") == b"Slide Canvas"
+        wait_for_role_text(client_bin, sock, "slide.status", "selected=false, clicks=0, rev=8, undo=2")
+
+        print(
+            f"[{tag}] requested={size_arg} captured={png_w}x{png_h} click_caret={interior_text!r} "
+            f"preedit1=(bg={pre_bg1},uline_w={uline_w1}) esc_sel=(bg={sel_bg_after_esc},caret_w={caret_w_after_esc}) "
+            f"preedit2=(bg={pre_bg2},uline_w={uline_w2}) "
+            f"ime(e+Enter+é -> 'Slide é',rev=5,undo=1) -> undo('Slide Canvas',rev=6) -> "
+            f"decomposed_e+backspace('Slide Canvas',rev=8)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
 def main() -> int:
-    capture_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build" / "canvas-capture"
+    args = sys.argv[1:]
+    negative_control = False
+    if "--omit-preedit-negative-control" in args:
+        negative_control = True
+        args = [a for a in args if a != "--omit-preedit-negative-control"]
+
+    capture_dir = Path(args[0]) if len(args) > 0 else ROOT / "build" / "canvas-capture"
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     build_dir = ROOT / "build"
@@ -590,9 +863,23 @@ def main() -> int:
     subprocess.check_call([str(ODIN), "build", "examples/canvas-slide", "-collection:dagda=.", f"-out:{canvas_bin}"], cwd=ROOT)
     subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
 
+    if negative_control:
+        verify_headline_text_editing(
+            canvas_bin,
+            client_bin,
+            capture_dir,
+            "800x540",
+            "neg",
+            "headline-neg.png",
+            omit_preedit=True,
+        )
+        return 0
+
     verify_viewport(canvas_bin, client_bin, capture_dir, "800x540", "vp1")
     verify_viewport(canvas_bin, client_bin, capture_dir, "640x480", "vp2", start_over_card=True)
     verify_fractional_edge_and_precision(canvas_bin, client_bin, capture_dir)
+    verify_headline_text_editing(canvas_bin, client_bin, capture_dir, "800x540", "text1", "headline-preedit.png")
+    verify_headline_text_editing(canvas_bin, client_bin, capture_dir, "640x480", "text2", "headline-preedit-640x480.png")
     print("All canvas acceptance checks passed.")
     return 0
 
