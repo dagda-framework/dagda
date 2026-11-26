@@ -62,8 +62,19 @@ action_dispatch_trampoline :: proc(user_data: rawptr, id: dagda.Object_Id, actio
 // with the previous committed text (a snapshot clone valid
 // only for this call), the new committed text (borrowed; do
 // not retain either slice), and the session's directional
-// committed byte anchor and caret. The app returns one
-// decision through its own document operation:
+// committed byte anchor and caret. When the field supplies
+// an opaque version (App.text_version_of), the
+// callback also receives the source version captured with
+// the snapshot and the destination version belonging to
+// the new frame, and it is invoked when either the bytes
+// or the version changed — different revisions can hold
+// identical bytes, and text alone cannot identify a
+// version. Unversioned fields pass versioned=false and
+// keep the byte-change-only behavior. After a successful
+// map, the snapshot text and version advance together, so
+// a repeated rebuild at the destination version invokes
+// nothing. The app returns one decision through its own
+// document operation:
 //
 //   .Mapped    map anchor and caret directionally; both are
 //              validated as grapheme boundaries in the new
@@ -113,7 +124,7 @@ Composition_Remap_Decision :: struct {
 	caret:  int, // mapped caret for .Mapped; collapsed caret for .Cancel_At
 }
 
-Composition_Remap_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id, old_text: string, new_text: string, anchor: int, caret: int) -> Composition_Remap_Decision
+Composition_Remap_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id, old_text: string, new_text: string, anchor: int, caret: int, source_version: u64, destination_version: u64, versioned: bool) -> Composition_Remap_Decision
 
 // App describes a native Dagda application hosted in an SDL3 window.
 // Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
@@ -195,6 +206,15 @@ App :: struct {
 	// final input ends the composition first, so only a
 	// still-composing rebuild can be an external replacement.
 	on_composition_remap: Composition_Remap_Handler,
+	// Optional opaque version source for editable fields,
+	// used only with on_composition_remap. The host captures
+	// the version belonging to the snapshotted text when a
+	// composition starts, reads the version belonging to
+	// each rebuilt frame, and invokes the mapper when either
+	// changed. Returning ok=false for a field leaves it
+	// unversioned (byte changes only); version zero is valid
+	// when ok is true.
+	text_version_of: Text_Version_Handler,
 	// Optional out-storage for this window's rebuild handle.
 	// The host fills it before on_ready and before the event
 	// loop; copy the value to a worker if needed. It stops
@@ -303,6 +323,16 @@ Host :: struct {
 @(private="package")
 host_report_composition :: proc(h: ^Host, current: Active_Composition) {
 	previous := h.reported_composition
+	if !previous.active && current.active && h.app.text_version_of != nil &&
+		h.text_edit.has_composition_snapshot && !h.text_edit.has_snapshot_version {
+		// Capture the version belonging to the snapshotted
+		// text at composition start, while the app model
+		// still holds that text.
+		if version, version_ok := h.app.text_version_of(h.app.user_data, current.field_id); version_ok {
+			h.text_edit.snapshot_version = version
+			h.text_edit.has_snapshot_version = true
+		}
+	}
 	if previous.active && !current.active {
 		// The snapshot's lifetime ends with the composition,
 		// whether or not the app observes the transition.
@@ -321,14 +351,15 @@ host_report_composition :: proc(h: ^Host, current: Active_Composition) {
 }
 
 @(private="package")
-host_apply_composition_remap :: proc(h: ^Host, field_id: dagda.Object_Id, old_text: string, new_text: string) {
+host_apply_composition_remap :: proc(h: ^Host, field_id: dagda.Object_Id, old_text: string, new_text: string, source_version: u64, destination_version: u64, versioned: bool) {
 	// Documented plain-Cancel caret: the old selection's
 	// start, clamped to a grapheme boundary in the new text.
 	selection_start, _ := dagda.selection_bounds(&h.text_edit.session)
 	collapse_at := dagda.clamp_grapheme_boundary(new_text, selection_start)
 	if h.app.on_composition_remap != nil {
 		decision := h.app.on_composition_remap(
-			h.app.user_data, field_id, old_text, new_text, h.text_edit.session.anchor, h.text_edit.session.caret)
+			h.app.user_data, field_id, old_text, new_text, h.text_edit.session.anchor, h.text_edit.session.caret,
+			source_version, destination_version, versioned)
 		boundary :: proc(text: string, offset: int) -> bool {
 			return offset >= 0 && offset <= len(text) && dagda.clamp_grapheme_boundary(text, offset) == offset
 		}
@@ -340,6 +371,12 @@ host_apply_composition_remap :: proc(h: ^Host, field_id: dagda.Object_Id, old_te
 				// fails, fall through to cancellation: a final
 				// edit must never run against stale offsets.
 				if text_edit_snapshot_set(&h.text_edit, new_text) {
+					// Advance the version together with the
+					// snapshot text, then move the endpoints.
+					if versioned {
+						h.text_edit.snapshot_version = destination_version
+						h.text_edit.has_snapshot_version = true
+					}
 					// Keep the live preedit and its rune-relative
 					// cursor; only the committed endpoints move.
 					h.text_edit.session.anchor = decision.anchor
@@ -418,8 +455,23 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	// before focus/session reconciliation, painting, or any
 	// queued final input that follows this rebuild.
 	if remap_pending && dagda.is_composing(&h.text_edit.session) {
-		if el, found := dagda.find(h.frame, remap_field); found && el.text != h.text_edit.composition_snapshot {
-			host_apply_composition_remap(h, remap_field, h.text_edit.composition_snapshot, el.text)
+		if el, found := dagda.find(h.frame, remap_field); found {
+			// The destination version belongs to the frame
+			// just resolved. Identical bytes at a different
+			// version still count as a change; an
+			// unversioned field keeps byte-only behavior.
+			destination_version: u64
+			destination_ok := false
+			if h.app.text_version_of != nil {
+				destination_version, destination_ok = h.app.text_version_of(h.app.user_data, remap_field)
+			}
+			versioned := h.text_edit.has_snapshot_version && destination_ok
+			bytes_changed := el.text != h.text_edit.composition_snapshot
+			version_changed := versioned && destination_version != h.text_edit.snapshot_version
+			if bytes_changed || version_changed {
+				host_apply_composition_remap(h, remap_field, h.text_edit.composition_snapshot, el.text,
+					h.text_edit.snapshot_version, destination_version, versioned)
+			}
 		}
 	}
 	_ = focus_reconcile(&h.focus, h.frame)

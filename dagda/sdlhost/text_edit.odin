@@ -16,6 +16,18 @@ Text_Commit_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id, new_te
 // and not composing. Return true if the app applied an undo step.
 Text_Undo_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> bool
 
+// Text_Version_Handler (App.text_version_of) supplies an
+// optional opaque version
+// for an editable field's committed text. The version is
+// app-owned bookkeeping (a document revision is the obvious
+// choice): the host only stores the value captured with a
+// composition snapshot, compares it with the value belonging
+// to a later frame, and hands both to the remap callback.
+// ok=false means the field is unversioned, in which case
+// only byte changes invoke the mapper. Version zero is a
+// valid version whenever ok is true.
+Text_Version_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id) -> (version: u64, ok: bool)
+
 // Editable_Text_Config opts a single-line text element into host-managed
 // grapheme movement, selection, and IME composition backed by dagda.Text_Session.
 // The app owns committed text, revision, and undo history.
@@ -44,6 +56,11 @@ Text_Edit_State :: struct {
 	composition_snapshot:     string,
 	has_composition_snapshot: bool,
 	snapshot_allocator:       mem.Allocator,
+	// Opaque app version captured with the snapshot, when
+	// the field is versioned. Advanced together with the
+	// snapshot text after a successful remap.
+	snapshot_version:     u64,
+	has_snapshot_version: bool,
 }
 
 text_edit_snapshot_clear :: proc(te: ^Text_Edit_State) {
@@ -51,6 +68,8 @@ text_edit_snapshot_clear :: proc(te: ^Text_Edit_State) {
 		delete(te.composition_snapshot, te.snapshot_allocator)
 		te.composition_snapshot = ""
 		te.has_composition_snapshot = false
+		te.snapshot_version = 0
+		te.has_snapshot_version = false
 	}
 }
 
