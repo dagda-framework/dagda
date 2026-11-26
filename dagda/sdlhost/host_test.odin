@@ -4147,6 +4147,7 @@ test_host_draw_scales_to_2x_output_surface :: proc(t: ^testing.T) {
 	ren2 := sdl.CreateSoftwareRenderer(surf2)
 	testing.expect(t, ren2 != nil)
 	defer sdl.DestroyRenderer(ren2)
+	defer font_destroy_textures(&h.font)
 
 	h.renderer = ren2
 	h.viewport = {width = 640, height = 480}
@@ -4172,4 +4173,116 @@ test_host_draw_scales_to_2x_output_surface :: proc(t: ^testing.T) {
 	if found_caret2 {
 		testing.expect(t, math.abs(f32(caret_col2) / 2.0 - expected_caret2) <= 2.0)
 	}
+}
+
+@(test)
+test_host_draw_2x_canvas_clip_pixel_centers :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		testing.fail_now(t, "SDL_Init failed")
+	}
+	defer sdl.Quit()
+
+	Edge_State :: struct {
+		elements: [2]dagda.Canvas_Element,
+	}
+	edge_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Edge_State)(user_data)
+		// Editable field comes first so text_edit_draw installs and restores its
+		// nested clip before the overflowing button paints.
+		s.elements = {
+			{
+				info   = {id = 2, role = "canvas.title"},
+				kind   = .Label,
+				text   = "Editable Title",
+				bounds = {x = 360, y = 200, width = 320, height = 80},
+			},
+			{
+				info   = {id = 4, role = "canvas.overflow"},
+				kind   = .Button,
+				text   = "Overflow",
+				bounds = {x = 70, y = -40, width = 240, height = 620},
+			},
+		}
+		return {
+			size     = {width = 960, height = 540},
+			elements = s.elements[:],
+		}
+	}
+
+	read_rgb :: proc(surf: ^sdl.Surface, x, y: i32) -> [3]u8 {
+		r, g, b, a: u8
+		ok := sdl.ReadSurfacePixel(surf, c.int(x), c.int(y), &r, &g, &b, &a)
+		assert(ok)
+		return {r, g, b}
+	}
+
+	state: Edge_State
+	editable_ids := [1]dagda.Object_Id{2}
+
+	surf := sdl.CreateSurface(1602, 1084, .ABGR8888)
+	testing.expect(t, surf != nil)
+	defer sdl.DestroySurface(surf)
+	ren := sdl.CreateSoftwareRenderer(surf)
+	testing.expect(t, ren != nil)
+	defer sdl.DestroyRenderer(ren)
+
+	h: Host
+	h.app = {
+		user_data             = &state,
+		canvas                = edge_canvas,
+		text_edit             = {enabled = true, target_id = 2},
+		editable_text_targets = editable_ids[:],
+	}
+	h.renderer = ren
+	h.viewport = {width = 801, height = 542}
+	testing.expect(t, font_init(&h.font))
+	defer font_destroy(&h.font)
+	defer font_destroy_textures(&h.font)
+	defer text_edit_destroy(&h.text_edit)
+	defer dagda.frame_destroy(&h.frame)
+
+	testing.expect(t, host_rebuild_frame(&h))
+	// Focus the editable field so text_edit_draw exercises its focused nested clip path.
+	_ = text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 2, editable_ids[:])
+
+	// Verify hit-test agreement at physical pixel centers converted to logical points:
+	// fitted canvas y = [45.71875, 496.28125) pt = [91.4375, 992.5625) px.
+	// Rows 91 and 992 are inside; rows 90 and 993 are outside.
+	_, hit90 := dagda.hit_test(h.frame, {x = 200.5 / 2.0, y = 90.5 / 2.0})
+	id91, hit91 := dagda.hit_test(h.frame, {x = 200.5 / 2.0, y = 91.5 / 2.0})
+	id992, hit992 := dagda.hit_test(h.frame, {x = 200.5 / 2.0, y = 992.5 / 2.0})
+	_, hit993 := dagda.hit_test(h.frame, {x = 200.5 / 2.0, y = 993.5 / 2.0})
+	testing.expect(t, !hit90)
+	testing.expect(t, hit91 && id91 == 4)
+	testing.expect(t, hit992 && id992 == 4)
+	testing.expect(t, !hit993)
+
+	host_draw(&h)
+
+	cap := sdl.RenderReadPixels(h.renderer, nil)
+	testing.expect(t, cap != nil)
+	defer sdl.DestroySurface(cap)
+	testing.expect_value(t, cap.w, c.int(1602))
+	testing.expect_value(t, cap.h, c.int(1084))
+
+	letterbox := [3]u8{14, 16, 22}
+	sheet := [3]u8{26, 31, 42}
+	button_fill := [3]u8{52, 108, 194}
+
+	// Overflowing button at physical x=200 (after editable field restored its nested clip):
+	testing.expect_value(t, read_rgb(cap, 200, 90), letterbox)
+	testing.expect_value(t, read_rgb(cap, 200, 91), button_fill)
+	testing.expect_value(t, read_rgb(cap, 200, 92), button_fill)
+	testing.expect_value(t, read_rgb(cap, 200, 991), button_fill)
+	testing.expect_value(t, read_rgb(cap, 200, 992), button_fill)
+	testing.expect_value(t, read_rgb(cap, 200, 993), letterbox)
+
+	// Uncovered canvas sheet at physical x=1400:
+	testing.expect_value(t, read_rgb(cap, 1400, 90), letterbox)
+	testing.expect_value(t, read_rgb(cap, 1400, 91), sheet)
+	testing.expect_value(t, read_rgb(cap, 1400, 92), sheet)
+	testing.expect_value(t, read_rgb(cap, 1400, 991), sheet)
+	testing.expect_value(t, read_rgb(cap, 1400, 992), sheet)
+	testing.expect_value(t, read_rgb(cap, 1400, 993), letterbox)
 }

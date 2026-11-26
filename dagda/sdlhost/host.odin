@@ -294,32 +294,45 @@ host_render_scale :: proc(h: ^Host) -> (scale_x: f32, scale_y: f32) {
 	return f32(out_w) / h.viewport.width, f32(out_h) / h.viewport.height
 }
 
+scale_frect :: proc(rect: sdl.FRect, scale_x, scale_y: f32) -> sdl.FRect {
+	return {
+		x = rect.x * scale_x,
+		y = rect.y * scale_y,
+		w = rect.w * scale_x,
+		h = rect.h * scale_y,
+	}
+}
+
 host_draw :: proc(h: ^Host) {
 	r := h.renderer
 	scale_x, scale_y := host_render_scale(h)
-	_ = sdl.SetRenderScale(r, scale_x, scale_y)
+	// Keep SDL's render scale at (1, 1) and scale geometry explicitly into
+	// physical output pixels so SDL_SetRenderClipRect / SDL_GetRenderClipRect
+	// preserve exact physical pixel edges (including odd rows/columns at 2x).
+	_ = sdl.SetRenderScale(r, 1, 1)
 	if h.frame.has_canvas {
 		// Distinct dark letterbox background outside the fitted canvas.
 		sdl.SetRenderDrawColor(r, 14, 16, 22, 255)
 		sdl.RenderClear(r)
 
 		t := h.frame.transform
-		fitted := sdl.FRect{
-			x = t.offset.x,
-			y = t.offset.y,
-			w = t.canvas.width * t.scale,
-			h = t.canvas.height * t.scale,
+		fitted_px := sdl.FRect{
+			x = t.offset.x * scale_x,
+			y = t.offset.y * scale_y,
+			w = t.canvas.width * t.scale * scale_x,
+			h = t.canvas.height * t.scale * scale_y,
 		}
-		// Clip canvas sheet and element painting to the exact pixel rows/columns
-		// whose centers lie inside the fitted canvas, matching dagda.hit_test.
-		clip := canvas_clip_rect(fitted)
-		sdl.SetRenderClipRect(r, &clip)
-		if clip.w > 0 && clip.h > 0 {
+		// Clip canvas sheet and element painting to the exact physical pixel
+		// rows/columns whose centers lie inside the fitted canvas, matching
+		// dagda.hit_test when pixel centers are mapped back to window points.
+		clip_px := canvas_clip_rect(fitted_px)
+		sdl.SetRenderClipRect(r, &clip_px)
+		if clip_px.w > 0 && clip_px.h > 0 {
 			sheet := sdl.FRect{
-				x = f32(clip.x),
-				y = f32(clip.y),
-				w = f32(clip.w),
-				h = f32(clip.h),
+				x = f32(clip_px.x),
+				y = f32(clip_px.y),
+				w = f32(clip_px.w),
+				h = f32(clip_px.h),
 			}
 			sdl.SetRenderDrawColor(r, 26, 31, 42, 255)
 			sdl.RenderFillRect(r, &sheet)
@@ -338,21 +351,22 @@ host_draw :: proc(h: ^Host) {
 			w = el.bounds.width,
 			h = el.bounds.height,
 		}
+		rect_px := scale_frect(rect, scale_x, scale_y)
 		switch el.kind {
 		case .Label:
 			if text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, el.info.id) {
-				text_edit_draw(h, el.info.id, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id)
+				text_edit_draw(h, el.info.id, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id, scale_x, scale_y)
 			} else {
 				px := max(24 * text_scale, 12)
 				sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
-				sdl.RenderFillRect(r, &rect)
+				sdl.RenderFillRect(r, &rect_px)
 				sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
-				sdl.RenderRect(r, &rect)
+				sdl.RenderRect(r, &rect_px)
 
 				tw := font_measure_width(&h.font, el.text, px)
 				tx := rect.x + max((rect.w - tw) * 0.5, 12)
 				ty := rect.y + (rect.h - px) * 0.5
-				font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{240, 244, 250, 255})
+				font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
 			}
 
 		case .Button:
@@ -366,22 +380,22 @@ host_draw :: proc(h: ^Host) {
 			} else {
 				sdl.SetRenderDrawColor(r, 52, 108, 194, 255)
 			}
-			sdl.RenderFillRect(r, &rect)
+			sdl.RenderFillRect(r, &rect_px)
 			sdl.SetRenderDrawColor(r, 118, 176, 255, 255)
-			sdl.RenderRect(r, &rect)
+			sdl.RenderRect(r, &rect_px)
 
 			px := max(18 * text_scale, 11)
 			tw := font_measure_width(&h.font, el.text, px)
 			tx := rect.x + max((rect.w - tw) * 0.5, 12)
 			ty := rect.y + (rect.h - px) * 0.5
-			font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{248, 250, 255, 255})
+			font_draw_text(&h.font, r, el.text, tx, ty, px, sdl.Color{248, 250, 255, 255}, scale_x, scale_y)
 		}
 
 		// Visible focus ring around the keyboard-focused element.
 		if h.focus.has_focus && h.focus.focused_id == el.info.id {
 			sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-			ring1 := sdl.FRect{x = rect.x - 3, y = rect.y - 3, w = rect.w + 6, h = rect.h + 6}
-			ring2 := sdl.FRect{x = rect.x - 2, y = rect.y - 2, w = rect.w + 4, h = rect.h + 4}
+			ring1 := scale_frect(sdl.FRect{x = rect.x - 3, y = rect.y - 3, w = rect.w + 6, h = rect.h + 6}, scale_x, scale_y)
+			ring2 := scale_frect(sdl.FRect{x = rect.x - 2, y = rect.y - 2, w = rect.w + 4, h = rect.h + 4}, scale_x, scale_y)
 			sdl.RenderRect(r, &ring1)
 			sdl.RenderRect(r, &ring2)
 		}
