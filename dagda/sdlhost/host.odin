@@ -104,6 +104,8 @@ Host :: struct {
 	pointer:       Pointer_State,
 	focus:         Focus_State,
 	text_edit:     Text_Edit_State,
+	clipboard:     Clipboard,
+	mem_clipboard: Memory_Clipboard,
 	edit_cstr_buf: [256]u8,
 	text_cstr_buf: [256]u8,
 	needs_redraw:  bool,
@@ -353,6 +355,12 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	case "ctrl+a":
 		key = sdl.K_A
 		mod = sdl.KMOD_LCTRL
+	case "ctrl+c":
+		key = sdl.K_C
+		mod = sdl.KMOD_LCTRL
+	case "ctrl+v":
+		key = sdl.K_V
+		mod = sdl.KMOD_LCTRL
 	case "ctrl+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
@@ -388,6 +396,30 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	up.key.mod = mod
 	up.key.down = false
 	return sdl.PushEvent(&up)
+}
+
+decode_control_escapes :: proc(s: string, allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	for i := 0; i < len(s); i += 1 {
+		if s[i] == '\\' && i + 1 < len(s) {
+			switch s[i + 1] {
+			case 'n':
+				strings.write_byte(&b, '\n')
+				i += 1
+				continue
+			case 'r':
+				strings.write_byte(&b, '\r')
+				i += 1
+				continue
+			case '\\':
+				strings.write_byte(&b, '\\')
+				i += 1
+				continue
+			}
+		}
+		strings.write_byte(&b, s[i])
+	}
+	return strings.to_string(b)
 }
 
 poll_control_stdin :: proc(
@@ -495,6 +527,16 @@ poll_control_stdin :: proc(
 				_ = os.flush(os.stdout)
 			} else {
 				fmt.println("CONTROL_ERR preedit failed")
+				_ = os.flush(os.stdout)
+			}
+		} else if strings.has_prefix(line, "clipboard ") {
+			decoded := decode_control_escapes(line[len("clipboard "):])
+			defer delete(decoded)
+			if clipboard_set(h.clipboard, decoded) {
+				fmt.println("CONTROL_OK clipboard")
+				_ = os.flush(os.stdout)
+			} else {
+				fmt.println("CONTROL_ERR clipboard failed")
 				_ = os.flush(os.stdout)
 			}
 		} else if strings.has_prefix(line, "text ") {
@@ -666,7 +708,7 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
-	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets)
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard)
 	if tres.needs_redraw {
 		h.needs_redraw = true
 	}
@@ -742,6 +784,10 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		return 1
 	}
 	h.ime_window = opts.control_stdin ? nil : h.window
+	if opts.control_stdin {
+		h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
+	}
+	defer memory_clipboard_destroy(&h.mem_clipboard)
 	defer sdl.DestroyWindow(h.window)
 	defer sdl.DestroyRenderer(h.renderer)
 	// Release cached glyph textures before DestroyRenderer frees the renderer.

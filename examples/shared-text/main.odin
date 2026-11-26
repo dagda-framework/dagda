@@ -103,7 +103,7 @@ shared_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Acti
 
 shared_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
 	s := (^Shared_Text_App)(user_data)
-	if (id != OUTLINE_TITLE_ID && id != CANVAS_TITLE_ID) || new_text == s.title {
+	if (id != OUTLINE_TITLE_ID && id != CANVAS_TITLE_ID) || !dagda.valid_single_line(new_text) || new_text == s.title {
 		return false
 	}
 	alloc := s.allocator.procedure != nil ? s.allocator : context.allocator

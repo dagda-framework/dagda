@@ -412,6 +412,7 @@ def main() -> int:
         proc = None
 
         verify_keyboard_tab_traversal(app_bin, client_bin, capture_dir)
+        verify_clipboard_copy_paste(app_bin, client_bin, capture_dir)
         print("All shared-text checks passed.")
         return 0
     finally:
@@ -496,6 +497,147 @@ def verify_keyboard_tab_traversal(app_bin: Path, client_bin: Path, capture_dir: 
             f"[shared-tab] requested=800x540 captured={tw}x{th}: "
             f"Tab(A->B->btn:actions=1) -> Shift+Tab(B->A->wrap_btn:actions=2) -> "
             f"preedit_blocks_tab -> Escape+Tab->B('Slide TitleABCDZ',rev=5,id=2)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_clipboard_copy_paste(app_bin: Path, client_bin: Path, capture_dir: Path) -> None:
+    """Two-view plain-text Ctrl+C / Ctrl+V sequence using the isolated host clipboard:
+    copy combining sequence, paste over selection in other view, undo once,
+    reject multiline paste preserving selection/history, and keep IME preedit intact on Ctrl+V.
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-shared-clip."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared-clip.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line("shared-text clip startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # Settle initial map and inspect bounds of both views.
+        send_control(proc, reader, f"screenshot {capture_dir / '06-clip-init.png'}")
+        c1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        c2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        assert c1 == 0 and c2 == 0
+        b1, b2 = el1_resp["elements"][0]["bounds"], el2_resp["elements"][0]["bounds"]
+
+        # 1. Replace title in view 1 (id=1) with combining-character text "Cafe\u0301 Title".
+        combining_title = "Cafe\u0301 Title"
+        assert combining_title.encode("utf-8") == b"Cafe\xcc\x81 Title"
+        y1 = b1["y"] + b1["height"] * 0.5
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key ctrl+a")
+        send_control(proc, reader, f"text {combining_title}")
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "canvas.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # 2. Select "fe\u0301" (2 graphemes, 4 UTF-8 bytes) in view 1 and Ctrl+C -> revision untouched.
+        send_control(proc, reader, "key home")
+        send_control(proc, reader, "key right")
+        send_control(proc, reader, "key right")
+        send_control(proc, reader, "key shift+right")
+        send_control(proc, reader, "key shift+right")
+        send_control(proc, reader, "key ctrl+c")
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "canvas.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # 3. Click view 2 (id=2), select "Title", Ctrl+V -> both views show exact UTF-8 bytes "Cafe\u0301 fe\u0301".
+        expected_pasted = "Cafe\u0301 fe\u0301"
+        assert expected_pasted.encode("utf-8") == b"Cafe\xcc\x81 fe\xcc\x81"
+        y2 = b2["y"] + b2["height"] * 0.5
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        for _ in range(5):
+            send_control(proc, reader, "key shift+left")
+        send_control(proc, reader, "key ctrl+v")
+        r_out = wait_for_role_text(client_bin, sock, "outline.title", expected_pasted)
+        r_can = wait_for_role_text(client_bin, sock, "canvas.title", expected_pasted)
+        assert r_out["elements"][0]["text"].encode("utf-8") == b"Cafe\xcc\x81 fe\xcc\x81"
+        assert r_can["elements"][0]["text"].encode("utf-8") == b"Cafe\xcc\x81 fe\xcc\x81"
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=0")
+
+        # 4. One Ctrl+Z restores "Cafe\u0301 Title" in both views.
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "canvas.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # 5. Multiline paste over selected "Title" preserves text, selection, and history.
+        send_control(proc, reader, "key end")
+        for _ in range(5):
+            send_control(proc, reader, "key shift+left")
+        send_control(proc, reader, r"clipboard Line1\nLine2")
+        send_control(proc, reader, "key ctrl+v")
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "canvas.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # Prove selection ("Title") survived the rejected multiline paste by typing "X" -> replaces "Title".
+        send_control(proc, reader, "text X")
+        wait_for_role_text(client_bin, sock, "outline.title", "Cafe\u0301 X")
+        wait_for_role_text(client_bin, sock, "canvas.title", "Cafe\u0301 X")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=2, last_id=2, actions=0")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=5, undo=1, last_id=2, actions=0")
+
+        # 6. During active IME composition in view 2, Ctrl+V leaves preedit intact.
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, "preedit e")
+        send_control(proc, reader, "clipboard PASTE")
+        send_control(proc, reader, "key ctrl+v")
+
+        clip_preedit_png = capture_dir / "07-clip-preedit-intact.png"
+        deadline = time.monotonic() + 2.0
+        pre2_bg = uline2_w = 0
+        while True:
+            send_control(proc, reader, f"screenshot {clip_preedit_png}")
+            wp, hp, rgbp = decode_png_rgb(clip_preedit_png)
+            pre1_bg, sel1_bg, amber1_w = inspect_visual_state(wp, hp, rgbp, b1)
+            pre2_bg, sel2_bg, amber2_w = inspect_visual_state(wp, hp, rgbp, b2)
+            if pre2_bg >= 50 and amber2_w >= 6 and pre1_bg == 0 and amber1_w == 0:
+                uline2_w = amber2_w
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"preedit did not survive Ctrl+V in {clip_preedit_png}: "
+                    f"el1=(pre={pre1_bg},sel={sel1_bg},amber_w={amber1_w}) "
+                    f"el2=(pre={pre2_bg},sel={sel2_bg},amber_w={amber2_w})"
+                )
+            time.sleep(0.02)
+
+        wait_for_role_text(client_bin, sock, "outline.title", combining_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=5, undo=1, last_id=2, actions=0")
+
+        # Finish composition -> commits once without any pasted text.
+        send_control(proc, reader, "key enter")
+        send_control(proc, reader, "text é")
+        wait_for_role_text(client_bin, sock, "outline.title", f"{combining_title}é")
+        wait_for_role_text(client_bin, sock, "canvas.title", f"{combining_title}é")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=6, undo=2, last_id=2, actions=0")
+
+        print(
+            f"[shared-clip] copy('fe\\u0301',rev=1) -> paste_v2('Cafe\\u0301 fe\\u0301',rev=2,id=2) -> "
+            f"undo('Cafe\\u0301 Title',rev=3) -> multiline_reject(sel_kept->'Cafe\\u0301 X',rev=4->undo rev=5) -> "
+            f"preedit_ctrl_v_intact(bg={pre2_bg},uline_w={uline2_w}->'Cafe\\u0301 Titleé',rev=6)"
         )
 
         send_control(proc, reader, "quit")

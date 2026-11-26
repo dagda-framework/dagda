@@ -1,10 +1,13 @@
 package sdlhost
 
+import "core:sync"
 import "core:testing"
 import sdl "vendor:sdl3"
 
 @(test)
 test_font_hit_test_caret :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
 	surface := sdl.CreateSurface(256, 96, .RGBA8888)
 	if !testing.expect(t, surface != nil) { return }
 	defer sdl.DestroySurface(surface)
