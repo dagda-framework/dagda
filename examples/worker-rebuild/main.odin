@@ -45,6 +45,11 @@ State :: struct {
 	stale_path:    string,
 	mode:          string,
 	worker:        ^thread.Thread,
+	present_count: int,
+	posted_count:  int,
+	gate_armed:    bool,
+	snap_armed:    bool,
+	gate_dir:      string,
 	runs:          int,
 	first_handle:  sdlhost.Rebuild_Handle,
 }
@@ -62,12 +67,30 @@ write_file :: proc(path, text: string) {
 	}
 }
 
+wait_for_file :: proc(s: ^State, path: string) {
+	stage := path
+	for i in 0 ..< 1000 {
+		if os.exists(path) {
+			return
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	write_file(s.result_path, fmt.tprintf("gate timeout stage=%s\n", stage))
+}
+
 app_view :: proc(user_data: rawptr) -> dagda.View {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
 	label := fmt.bprintf(s.built_label[:], "%s", s.label)
 	s.built_len = len(label)
 	s.builder_tid = u64(sdl.GetCurrentThreadID())
+	if s.snap_armed {
+		s.snap_armed = false
+		sync.mutex_unlock(&s.mu)
+		write_file(fmt.tprintf("%s/snap_started", s.gate_dir), "1")
+		wait_for_file(s, fmt.tprintf("%s/snap_release", s.gate_dir))
+		sync.mutex_lock(&s.mu)
+	}
 	other_text := fmt.bprintf(s.other_buf[:], "%s", s.other)
 	s.other_len = len(other_text)
 	field := s.field
@@ -83,7 +106,8 @@ app_view :: proc(user_data: rawptr) -> dagda.View {
 app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
-	text := fmt.tprintf("present label=%q other=%q builder=%d host=%d\n", string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
+	s.present_count += 1
+	text := fmt.tprintf("present count=%d label=%q other=%q builder=%d host=%d\n", s.present_count, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -104,6 +128,29 @@ publish :: proc(s: ^State, trigger: string) {
 
 worker_main :: proc(data: rawptr) {
 	s := (^State)(data)
+	if s.mode == "burst-hold" {
+		// Dedicated burst mode: publish 100 updates, each with
+		// its own request, while on_ready holds the host before
+		// it can consume any wake.
+		for n in 1 ..= 100 {
+			sync.mutex_lock(&s.mu)
+			delete(s.label)
+			s.label = strings.clone(fmt.tprintf("tick %d", n))
+			s.tick = n
+			sync.mutex_unlock(&s.mu)
+			if sdlhost.request_rebuild(s.handle) == .Posted {
+				sync.mutex_lock(&s.mu)
+				s.posted_count += 1
+				sync.mutex_unlock(&s.mu)
+			}
+		}
+		sync.mutex_lock(&s.mu)
+		posted := s.posted_count
+		sync.mutex_unlock(&s.mu)
+		write_file(s.result_path, fmt.tprintf("burst posted=%d\n", posted))
+		write_file(fmt.tprintf("%s/burst_done", s.gate_dir), "1")
+		// fall through to the trigger loop for later phases
+	}
 	// Wait for the trigger file so the test controls timing.
 	for i in 0 ..< 500 {
 		sync.mutex_lock(&s.mu)
@@ -145,6 +192,17 @@ worker_main :: proc(data: rawptr) {
 			trigger := string(data_bytes)
 			if trigger != last {
 				last = trigger
+				if trigger == "snap" {
+					sync.mutex_lock(&s.mu)
+					s.snap_armed = true
+					sync.mutex_unlock(&s.mu)
+					_ = sdlhost.request_rebuild(s.handle)
+					wait_for_file(s, fmt.tprintf("%s/snap_started", s.gate_dir))
+					publish(s, "go")
+					_ = sdlhost.request_rebuild(s.handle)
+					write_file(fmt.tprintf("%s/snap_release", s.gate_dir), "1")
+					continue
+				}
 				publish(s, trigger)
 				if s.mode == "request" {
 					result := sdlhost.request_rebuild(s.handle)
@@ -186,6 +244,33 @@ app_ready :: proc(user_data: rawptr, handle: sdlhost.Rebuild_Handle) {
 	if s.mode != "idle" && s.mode != "" {
 		s.worker = thread.create_and_start_with_data(s, worker_main)
 	}
+	if s.mode == "burst-hold" {
+		// Hold the host here, before the event loop can consume
+		// any worker wake, until the burst has finished. A
+		// bounded wait names the missing stage on timeout.
+		done_path := fmt.tprintf("%s/burst_done", s.gate_dir)
+		seen := false
+		for i in 0 ..< 1000 {
+			if os.exists(done_path) {
+				seen = true
+				break
+			}
+			time.sleep(10 * time.Millisecond)
+		}
+		if !seen {
+			write_file(s.result_path, "gate timeout stage=burst_publish\n")
+		} else {
+			// Count only this handle's registered event type,
+			// without consuming any of it, while the host is
+			// still held here.
+			et := sdl.EventType(handle.event_type)
+			queue := sdl.PeepEvents(nil, 0, .PEEKEVENT, et, et)
+			sync.mutex_lock(&s.mu)
+			posted := s.posted_count
+			sync.mutex_unlock(&s.mu)
+			write_file(s.result_path, fmt.tprintf("burst posted=%d queue=%d\n", posted, queue))
+		}
+	}
 }
 
 field_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
@@ -226,6 +311,7 @@ main :: proc() {
 	state.result_path = env_or("RESULT_FILE", "")
 	state.trigger_path = env_or("TRIGGER_FILE", "")
 	state.stale_path = env_or("STALE_FILE", "")
+	state.gate_dir = env_or("GATE_DIR", "")
 	defer {
 		delete(state.label)
 		delete(state.other)

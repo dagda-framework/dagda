@@ -225,6 +225,41 @@ def main():
         app.quit()
         apps.remove(app)
 
+        # 1b. One-wake burst: on_ready holds the host before it
+        # can consume any worker wake while the worker publishes
+        # 100 updates, each with its own request. Exactly one
+        # wake then presents value 100.
+        burst = App(app_bin, client_bin, tmp, "burst", {"WORKER_MODE": "burst-hold", "GATE_DIR": str(tmp / "burst")})
+        apps.append(burst)
+
+        def present_count(app):
+            text = app.present.read_text()
+            return int(text.split("count=", 1)[1].split()[0])
+
+        burst.wait_present("tick 100")
+        assert burst.inspect("worker.label")["text"] == "tick 100"
+        burst_result = burst.result.read_text()
+        queue_count = int(burst_result.split("queue=", 1)[1].split()[0])
+        assert "posted=100" in burst_result and queue_count == 1, burst_result
+        burst_count = present_count(burst)
+        print(f"[1b] burst of 100 -> one queued worker wake ({burst_result.strip()}); all requests Posted; tick 100 presented")
+
+        # Snapshot ordering on the same window: a rebuild takes
+        # its snapshot of 100, then 101 is published and
+        # requested before the builder returns; 101 is
+        # presented without another input or request.
+        burst.fire("snap")
+        try:
+            burst.wait_present("tick 101")
+        except AssertionError as e:
+            stage = burst.result.read_text() if burst.result.exists() else ""
+            raise AssertionError(f"{e}; fixture stage report: {stage}") from e
+        assert burst.inspect("worker.label")["text"] == "tick 101"
+        assert present_count(burst) >= burst_count + 2, present_count(burst)
+        print(f"[1c] snapshot ordering presented 101 (present count {present_count(burst)})")
+        burst.quit()
+        apps.remove(burst)
+
         # 3. Negative control: publish without requesting stays stale.
         neg = App(app_bin, client_bin, tmp, "negative", {"WORKER_MODE": "publish"})
         apps.append(neg)

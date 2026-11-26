@@ -36,6 +36,7 @@ Rebuild_Entry :: struct {
 	id:         u64,
 	event_type: u32,
 	closing:    bool,
+	pending:    bool, // one wake is already queued for this window
 }
 
 @(private)
@@ -121,6 +122,18 @@ request_rebuild :: proc(handle: Rebuild_Handle) -> Rebuild_Result {
 		sync.mutex_unlock(&rebuild_registry_mutex)
 		return result
 	}
+	if entry.pending {
+		// Covered by the wake already queued: still Posted,
+		// and the host will present the latest published state.
+		sync.mutex_unlock(&rebuild_registry_mutex)
+		return .Posted
+	}
+	// find the live entry and mark its wake pending before posting
+	for &live in rebuild_live[:rebuild_live_count] {
+		if live.id == handle.id {
+			live.pending = true
+		}
+	}
 	// The registry mutex is held across the post, synchronizing
 	// with teardown: a request cannot validate against the old
 	// lifetime, wait, and then post into a later one.
@@ -131,6 +144,28 @@ request_rebuild :: proc(handle: Rebuild_Handle) -> Rebuild_Result {
 	ev.user.data1 = rawptr(uintptr(handle.id))
 	ev.user.data2 = nil
 	posted := sdl.PushEvent(&ev)
+	if !posted {
+		// Leave no pending wake behind, so a later request can retry.
+		for &live in rebuild_live[:rebuild_live_count] {
+			if live.id == handle.id {
+				live.pending = false
+			}
+		}
+	}
 	sync.mutex_unlock(&rebuild_registry_mutex)
 	return posted ? .Posted : .Closed
+}
+
+// rebuild_consume_pending clears the pending wake as the host
+// starts handling it, before the frame is built: a request
+// that arrives during that rebuild queues a fresh wake.
+@(private)
+rebuild_consume_pending :: proc(handle: Rebuild_Handle) {
+	sync.mutex_lock(&rebuild_registry_mutex)
+	for &entry in rebuild_live[:rebuild_live_count] {
+		if entry.id == handle.id {
+			entry.pending = false
+		}
+	}
+	sync.mutex_unlock(&rebuild_registry_mutex)
 }
