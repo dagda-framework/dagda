@@ -163,10 +163,19 @@ def check(w, cond, message):
 
 
 def case_dismiss(w):
+    # Ordinary primary presses drive the app's selection.
+    w.click_role("slide.b")
+    check(w, "selected=11" in w.status(), f"clicking B did not select B: {w.status()!r}")
+    w.click_role("slide.a")
+    check(w, "selected=10" in w.status(), f"clicking A did not reselect A: {w.status()!r}")
     w.caret_ab_cd()
+    check(w, not w.popup_open("slide.b.cmd.mark"), "slide B popup was open before the secondary click")
     w.click_role("slide.b", button="right-click")
     check(w, w.popup_open("slide.b.cmd.mark"), "popup never opened for slide B after secondary click")
+    check(w, "selected=10" in w.status(), f"secondary click changed the selection: {w.status()!r}")
     w.send("key escape")
+    check(w, not w.popup_open("slide.b.cmd.mark"), "slide B popup did not close on Escape")
+    check(w, "selected=10" in w.status(), f"selection after dismissal: {w.status()!r}")
     w.send("text X")
     check(w, w.events == [("COMMIT", "id=10 text=abXcd")], f"events {w.events}")
     check(w, w.text_of("slide.a") == "abXcd", f"A text {w.text_of('slide.a')!r}")

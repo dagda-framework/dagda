@@ -40,6 +40,16 @@ VIEW_ID :: dagda.Object_Id(21)
 
 ROLE_MENU_TITLE :: "menu.title"
 
+when MENUS {
+	Menu_Storage :: struct {
+		file_items: [3]sdlhost.Menu_Item,
+		view_items: [1]sdlhost.Menu_Item,
+		menus:      [2]sdlhost.Menu,
+	}
+} else {
+	Menu_Storage :: struct {}
+}
+
 Note_App :: struct {
 	text:     string,
 	buf:      [256]u8,
@@ -52,6 +62,7 @@ Note_App :: struct {
 	open:     dagda.Object_Id,
 	elements: [10]dagda.Canvas_Element,
 	editable: [1]dagda.Object_Id,
+	menus:    Menu_Storage,
 }
 
 SIZE :: dagda.Size{width = 960, height = 540}
@@ -160,6 +171,15 @@ main :: proc() {
 	n := copy(state.buf[:], "abcd")
 	state.text = string(state.buf[:n])
 	state.editable = {TITLE_ID}
+	when MENUS {
+		state.menus.file_items = {
+			{info = {id = STAMP_ID, role = "cmd.stamp"}, text = "Stamp", enabled = true},
+			{info = {id = LOCKED_ID, role = "cmd.locked"}, text = "Locked", enabled = false},
+			{info = {id = MARK_ID, role = "cmd.mark"}, text = "Mark", enabled = true},
+		}
+		state.menus.view_items = {{info = {id = FLIP_ID, role = "cmd.flip"}, text = "Flip", enabled = true}}
+		state.menus.menus = {{text = "File", items = state.menus.file_items[:]}, {text = "View", items = state.menus.view_items[:]}}
+	}
 	opts, ok := sdlhost.parse_cli_args(os.args[1:])
 	if !ok {
 		fmt.eprintln("usage: menu-bar [--size WxH] [--control-stdin] [--socket PATH]")
@@ -179,15 +199,10 @@ main :: proc() {
 	when MENUS {
 		// The whole opt-in. The host draws the bar, opens and closes the
 		// menus, moves through them, and reports each item to a driver.
-		// An item reaches `handle` like any other activation.
-		file := [3]sdlhost.Menu_Item {
-			{info = {id = STAMP_ID, role = "cmd.stamp"}, text = "Stamp", enabled = true},
-			{info = {id = LOCKED_ID, role = "cmd.locked"}, text = "Locked", enabled = false},
-			{info = {id = MARK_ID, role = "cmd.mark"}, text = "Mark", enabled = true},
-		}
-		view := [1]sdlhost.Menu_Item{{info = {id = FLIP_ID, role = "cmd.flip"}, text = "Flip", enabled = true}}
-		menus := [2]sdlhost.Menu{{text = "File", items = file[:]}, {text = "View", items = view[:]}}
-		app.menus = menus[:]
+		// An item reaches `handle` like any other activation. The
+		// backing arrays live in app state (initialized above), so
+		// they stay alive for the whole sdlhost.run below.
+		app.menus = state.menus.menus[:]
 	} else {
 		app.on_pointer = pointer
 	}

@@ -116,6 +116,26 @@ commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool
 	return true
 }
 
+// Ordinary primary row presses select the slide. A secondary
+// press is the host's context-menu gesture and never reaches
+// this handler as a left-button press, so it cannot select.
+pointer :: proc(user_data: rawptr, ev: sdlhost.Pointer_Event) -> bool {
+	app := (^Slide_App)(user_data)
+	if ev.phase != .Press || !ev.has_target {
+		return false
+	}
+	if ev.target_id != A_ID && ev.target_id != B_ID {
+		return false
+	}
+	if app.selected == ev.target_id {
+		return false
+	}
+	app.selected = ev.target_id
+	fmt.printf("SELECTED id=%d\n", u64(ev.target_id))
+	_ = os.flush(os.stdout)
+	return true
+}
+
 composition :: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool) {
 	fmt.printf("COMPOSITION id=%d composing=%v\n", u64(field_id), composing)
 	_ = os.flush(os.stdout)
@@ -157,6 +177,7 @@ main :: proc() {
 		user_data             = &state,
 		canvas                = canvas,
 		handle                = handle,
+		on_pointer            = pointer,
 		on_ready              = ready,
 		on_composition        = composition,
 		text_edit             = {enabled = true, on_commit = commit},
