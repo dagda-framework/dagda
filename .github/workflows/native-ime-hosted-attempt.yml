@@ -1,0 +1,21 @@
+name: Native IME hosted attempt (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hosted-attempt:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install sdl3 freetype
+      - run: bash scripts/setup-odin.sh
+      - name: Attempt native IME probe without an operator
+        run: |
+          set +e
+          python3 examples/composition-conflict/tests/macos_native_ime_probe.py \
+            --input-source "Japanese - Romaji" \
+            --stage-timeout 20 --update-seconds 1 \
+            --output-dir "$RUNNER_TEMP/native-ime-attempt"
+          echo "probe exit: $?"
+          cat "$RUNNER_TEMP/native-ime-attempt/transcript.txt" || true
