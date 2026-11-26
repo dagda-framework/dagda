@@ -429,6 +429,13 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	case "ctrl+c":
 		key = sdl.K_C
 		mod = sdl.KMOD_LCTRL
+	case "ctrl+x":
+		key = sdl.K_X
+		mod = sdl.KMOD_LCTRL
+	case "ctrl+x+repeat":
+		key = sdl.K_X
+		mod = sdl.KMOD_LCTRL
+		repeat_key = true
 	case "ctrl+v":
 		key = sdl.K_V
 		mod = sdl.KMOD_LCTRL

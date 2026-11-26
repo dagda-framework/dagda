@@ -842,6 +842,31 @@ text_edit_handle_event :: proc(
 			return res
 		}
 
+		if ctrl && !shift && !alt_or_gui && key == sdl.K_X {
+			if !ev.key.repeat {
+				start, end := dagda.selection_bounds(&te.session)
+				start = clamp(start, 0, len(el.text))
+				end = clamp(end, start, len(el.text))
+				if start < end {
+					edit := dagda.replace_range(&te.session, el.text, start, end, "")
+					if edit.err == .None && edit.changed {
+						if clipboard_set(clipboard, el.text[start:end]) {
+							commit_proposal(te, cfg, user_data, &edit, false, &res)
+							if !res.needs_rebuild {
+								text_edit_update_ime_area(te, window, font, frame, cfg)
+							}
+						} else {
+							dagda.edit_destroy(&te.session, &edit)
+						}
+					} else {
+						dagda.edit_destroy(&te.session, &edit)
+					}
+				}
+			}
+			res.consumed = true
+			return res
+		}
+
 		if ctrl && !shift && !alt_or_gui && key == sdl.K_V {
 			clip_alloc := te.session.allocator.procedure != nil ? te.session.allocator : context.allocator
 			if pasted, ok := clipboard_get(clipboard, clip_alloc); ok {
