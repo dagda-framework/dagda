@@ -217,6 +217,36 @@ def inspect_visual_state(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[
     return preedit_bg_hits, sel_bg_hits, max_amber_row_width
 
 
+def find_caret_x(w: int, h: int, rgb: bytearray, bounds: dict) -> float:
+    """Find the window-pixel X coordinate of the painted vertical amber caret bar
+    in the upper half of bounds (excluding any horizontal preedit underline near the bottom).
+    """
+    x0 = max(0, int(math.floor(bounds["x"])) + 2)
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])) - 2)
+    y0 = max(0, int(math.floor(bounds["y"])) + 4)
+    y1 = min(h, int(math.floor(bounds["y"] + bounds["height"] * 0.55)))
+    col_hits: dict[int, int] = {}
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        for x in range(x0, x1):
+            px = (rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2])
+            if rgb_close(px, CARET_AMBER_RGB):
+                col_hits[x] = col_hits.get(x, 0) + 1
+    caret_cols = sorted(x for x, cnt in col_hits.items() if cnt >= 6)
+    assert caret_cols, f"no vertical amber caret found inside upper half of {bounds} (col_hits={col_hits})"
+    return float(caret_cols[0])
+
+
+def query_ime_area(win_proc: subprocess.Popen, reader: DeadlineLineReader) -> dict[str, int]:
+    resp = send_control(win_proc, reader, "ime-area")
+    parts = resp.split()
+    out: dict[str, int] = {}
+    for part in parts[2:]:
+        k, v = part.split("=", 1)
+        out[k] = int(v)
+    return out
+
+
 def run_client(client_bin: Path, sock: Path, *args: str) -> tuple[int, dict]:
     proc = subprocess.run(
         [str(client_bin), str(sock), *args],
@@ -438,6 +468,9 @@ def main() -> int:
         for sz in drag_sizes:
             verify_mouse_drag_selection(app_bin, client_bin, capture_dir, sz)
         verify_shift_click_selection(app_bin, client_bin, capture_dir)
+        scroll_sizes = ("800x540", "640x480") if os.environ.get("SDL_VIDEODRIVER") == "dummy" else ("800x540",)
+        for sz in scroll_sizes:
+            verify_horizontal_scroll(app_bin, client_bin, capture_dir, sz)
         print("All shared-text checks passed.")
         return 0
     finally:
@@ -936,6 +969,145 @@ def verify_shift_click_selection(app_bin: Path, client_bin: Path, capture_dir: P
             f"[shared-shift] requested=800x540 captured={png_w}x{png_h}: "
             f"fwd_copy('e\\u0301',rev_kept=1) -> cross_anchor_rev('AXBC'->undo 'Ae\\u0301BC') -> "
             f"preedit_cross_field_blocked(bg={pre2_bg},uline_w={uline2_w}->'Ae\\u0301BCé',rev=8,id=2)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_horizontal_scroll(app_bin: Path, client_bin: Path, capture_dir: Path, req_size: str) -> None:
+    """Long single-line title horizontal scrolling in a narrow editable field:
+    End reveals the caret at the end while the second field keeps its own view,
+    Home returns to the start, clicking beside a decomposed é while scrolled
+    inserts at the exact UTF-8 byte boundary, and IME composition near the right
+    edge keeps the painted caret and SDL_GetTextInputArea candidate anchor aligned.
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-shared-scroll-{req_size}."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared-scroll.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", req_size, "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line(f"shared-text scroll ({req_size}) startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        send_control(proc, reader, f"screenshot {capture_dir / f'13-scroll-{req_size}-init.png'}")
+        c1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        c2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        cb, btn_resp = run_client(client_bin, sock, "inspect", "shared.action")
+        assert c1 == 0 and c2 == 0 and cb == 0
+        b1, b2, b_btn = (
+            el1_resp["elements"][0]["bounds"],
+            el2_resp["elements"][0]["bounds"],
+            btn_resp["elements"][0]["bounds"],
+        )
+        y1 = b1["y"] + b1["height"] * 0.5
+
+        long_title = "0123456789 Long Narrow Editable Title With Many Words Before Cafe\u0301X"
+        assert long_title.encode("utf-8").endswith(b"Cafe\xcc\x81X")
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key ctrl+a")
+        send_control(proc, reader, f"text {long_title}")
+        wait_for_role_text(client_bin, sock, "outline.title", long_title)
+        wait_for_role_text(client_bin, sock, "canvas.title", long_title)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Capture unfocused baseline of field 2 (canvas.title) and neighboring Apply button.
+        send_control(proc, reader, "click 4.00 4.00")
+        base_png = capture_dir / f"14-scroll-{req_size}-base.png"
+        send_control(proc, reader, f"screenshot {base_png}")
+        png_w, png_h, rgb_base = decode_png_rgb(base_png)
+        el2_base_crop = rect_crop_bytes(png_w, png_h, rgb_base, b2)
+        btn_base_crop = rect_crop_bytes(png_w, png_h, rgb_base, b_btn)
+        gap_bounds = {
+            "x": b1["x"] + b1["width"] + 2.0,
+            "y": b1["y"],
+            "width": max(b_btn["x"] - (b1["x"] + b1["width"]) - 4.0, 2.0),
+            "height": b1["height"],
+        }
+
+        # 1. Focus field 1 and press End -> caret revealed near right edge without editing document;
+        #    field 2 keeps its own view, text stays clipped inside field 1, and Apply button still paints.
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key end")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+        end_png = capture_dir / f"15-scroll-{req_size}-end.png"
+        send_control(proc, reader, f"screenshot {end_png}")
+        w_end, h_end, rgb_end = decode_png_rgb(end_png)
+        caret_end_x = find_caret_x(w_end, h_end, rgb_end, b1)
+        assert caret_end_x > b1["x"] + b1["width"] * 0.85, (caret_end_x, b1)
+        assert caret_end_x < b1["x"] + b1["width"], (caret_end_x, b1)
+        assert rect_crop_bytes(w_end, h_end, rgb_end, b2) == el2_base_crop, "field 2 view scrolled with field 1"
+        assert rect_crop_bytes(w_end, h_end, rgb_end, b_btn) == btn_base_crop, "neighboring Apply button corrupted"
+        gap_glyphs, _ = glyph_mask(w_end, h_end, rgb_end, gap_bounds)
+        assert len(gap_glyphs) == 0, f"text bled outside field 1 into gap: {len(gap_glyphs)} pixels"
+
+        # 2. Press Home -> brings start back into view (caret near left edge) without editing document.
+        send_control(proc, reader, "key home")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+        home_png = capture_dir / f"16-scroll-{req_size}-home.png"
+        send_control(proc, reader, f"screenshot {home_png}")
+        w_home, h_home, rgb_home = decode_png_rgb(home_png)
+        caret_home_x = find_caret_x(w_home, h_home, rgb_home, b1)
+        assert caret_home_x < b1["x"] + b1["width"] * 0.15, (caret_home_x, b1)
+        assert rect_crop_bytes(w_home, h_home, rgb_home, b_btn) == btn_base_crop, "neighboring Apply button corrupted on Home"
+
+        # 3. Scroll back to end, locate exact painted caret beside decomposed é ("Cafe\u0301|X"),
+        #    move away while staying scrolled, click beside é, type "!", and verify exact UTF-8 bytes.
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, "key left")
+        beside_png = capture_dir / f"17-scroll-{req_size}-beside.png"
+        send_control(proc, reader, f"screenshot {beside_png}")
+        wb, hb, rgb_b = decode_png_rgb(beside_png)
+        beside_e_x = find_caret_x(wb, hb, rgb_b, b1)
+
+        for _ in range(4):
+            send_control(proc, reader, "key left")
+        send_control(proc, reader, f"click {beside_e_x:.2f} {y1:.2f}")
+        send_control(proc, reader, "text !")
+        expected_after = "0123456789 Long Narrow Editable Title With Many Words Before Cafe\u0301!X"
+        r1 = wait_for_role_text(client_bin, sock, "outline.title", expected_after)
+        r2 = wait_for_role_text(client_bin, sock, "canvas.title", expected_after)
+        assert r1["elements"][0]["text"].encode("utf-8").endswith(b"Cafe\xcc\x81!X")
+        assert r2["elements"][0]["text"].encode("utf-8").endswith(b"Cafe\xcc\x81!X")
+
+        # 4. Start composition near the right edge and verify painted caret and SDL candidate anchor agree.
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, "preedit abcdef")
+        ime_png = capture_dir / f"18-scroll-{req_size}-ime.png"
+        send_control(proc, reader, f"screenshot {ime_png}")
+        wi, hi, rgb_i = decode_png_rgb(ime_png)
+        painted_caret_x = find_caret_x(wi, hi, rgb_i, b1)
+        ime_area = query_ime_area(proc, reader)
+        sdl_anchor_x = ime_area["x"] + ime_area["cursor"]
+        assert b1["x"] <= painted_caret_x <= b1["x"] + b1["width"], (painted_caret_x, b1)
+        assert abs(painted_caret_x - sdl_anchor_x) <= 1.0, (painted_caret_x, sdl_anchor_x, ime_area)
+
+        pre2_bg, _, amber2_w = inspect_visual_state(wi, hi, rgb_i, b2)
+        assert pre2_bg == 0 and amber2_w == 0, (pre2_bg, amber2_w)
+
+        send_control(proc, reader, "key escape")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", long_title)
+
+        print(
+            f"[shared-scroll] requested={req_size} captured={png_w}x{png_h}: "
+            f"end_x={caret_end_x:.0f} home_x={caret_home_x:.0f} field2_isolated=true "
+            f"scrolled_click_e_insert='...Cafe\\u0301!X' ime_caret={painted_caret_x:.0f} sdl_anchor={sdl_anchor_x}"
         )
 
         send_control(proc, reader, "quit")

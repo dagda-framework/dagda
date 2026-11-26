@@ -240,7 +240,7 @@ host_draw :: proc(h: ^Host) {
 		switch el.kind {
 		case .Label:
 			if text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, el.info.id) {
-				text_edit_draw(h, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id)
+				text_edit_draw(h, el.info.id, el.bounds, el.text, h.text_edit.focused && h.text_edit.active_id == el.info.id)
 			} else {
 				px := max(24 * text_scale, 12)
 				sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
@@ -317,6 +317,7 @@ host_save_screenshot :: proc(h: ^Host, path: string) -> bool {
 
 host_render :: proc(h: ^Host, screenshot_path := "") -> bool {
 	host_draw(h)
+	text_edit_update_ime_area(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit)
 	ok := true
 	if len(screenshot_path) > 0 {
 		ok = host_save_screenshot(h, screenshot_path)
@@ -670,6 +671,16 @@ poll_control_stdin :: proc(
 				break
 			}
 			fmt.printf("CONTROL_OK screenshot=%s\n", path)
+			_ = os.flush(os.stdout)
+		} else if line == "ime-area" {
+			text_edit_update_ime_area(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit)
+			area: sdl.Rect
+			cursor: c.int
+			if sdl.GetTextInputArea(h.window, &area, &cursor) {
+				fmt.printf("CONTROL_OK ime-area x=%d y=%d w=%d h=%d cursor=%d\n", area.x, area.y, area.w, area.h, cursor)
+			} else {
+				fmt.println("CONTROL_ERR ime-area failed")
+			}
 			_ = os.flush(os.stdout)
 		} else if line == "quit" {
 			fmt.println("CONTROL_OK quit")

@@ -3096,6 +3096,185 @@ test_shift_click_uses_event_stream_order_when_sdl_mod_state_is_ahead :: proc(t: 
 	testing.expect_value(t, host_shift_down(&h), false)
 }
 
+@(test)
+test_narrow_field_horizontal_scroll_home_end_click_drag_ime_and_independent_views :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		return
+	}
+	defer sdl.Quit()
+
+	window := sdl.CreateWindow("scroll-test", 800, 540, {})
+	if window == nil {
+		return
+	}
+	defer sdl.DestroyWindow(window)
+
+	Scroll_App :: struct {
+		title:    string,
+		editable: [2]dagda.Object_Id,
+		elements: [2]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Scroll_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "narrow.a"}, kind = .Label, text = s.title, bounds = {x = 40, y = 60, width = 220, height = 60}},
+			{info = {id = 2, role = "narrow.b"}, kind = .Label, text = s.title, bounds = {x = 40, y = 160, width = 220, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Scroll_App)(user_data)
+		if id != 1 && id != 2 {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.title)
+		s.title = cloned
+		return true
+	}
+
+	viewports := [2]dagda.Size{{width = 800, height = 540}, {width = 640, height = 480}}
+	for vp in viewports {
+		base_title := "0123456789 Long Narrow Editable Title Before Cafe\u0301X"
+		s := Scroll_App{
+			title    = strings.clone(base_title),
+			editable = {1, 2},
+		}
+		defer delete(s.title)
+
+		h: Host
+		if !font_init(&h.font) {
+			return
+		}
+		defer font_destroy(&h.font)
+		h.ime_window = window
+		h.viewport = vp
+		h.app = App{
+			user_data             = &s,
+			canvas                = make_canvas,
+			text_edit             = {enabled = true, on_commit = on_commit},
+			editable_text_targets = s.editable[:],
+		}
+		testing.expect(t, host_rebuild_frame(&h))
+		defer {
+			text_edit_destroy(&h.text_edit)
+			dagda.frame_destroy(&h.frame)
+		}
+
+		el1, ok1 := dagda.find(h.frame, 1)
+		testing.expect(t, ok1)
+		tx, _, px := text_edit_layout(h.frame, el1.bounds)
+		view_w := text_edit_view_width(h.frame, el1.bounds)
+		y1 := el1.bounds.y + el1.bounds.height * 0.5
+
+		// Focus field 1 and press End -> scrolls right, caret visible at right edge, field 2 stays at 0.
+		testing.expect(t, text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 1, s.editable[:]))
+		end_ev: sdl.Event
+		end_ev.type = .KEY_DOWN
+		end_ev.key.key = sdl.K_END
+		_, _, _ = host_dispatch_key_event(&h, &end_ev)
+		scroll_end := text_edit_scroll_x(&h.text_edit, 1)
+		testing.expect(t, scroll_end > 50)
+		testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 2), f32(0))
+		cx_end := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+		testing.expect(t, cx_end >= tx && cx_end + TEXT_EDIT_CARET_WIDTH <= tx + view_w + 0.5)
+
+		// Home brings start back into view; field 2 still unaffected.
+		home_ev: sdl.Event
+		home_ev.type = .KEY_DOWN
+		home_ev.key.key = sdl.K_HOME
+		_, _, _ = host_dispatch_key_event(&h, &home_ev)
+		testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 1), f32(0))
+		testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 2), f32(0))
+		cx_home := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+		testing.expect(t, math.abs(cx_home - tx) < 0.5)
+
+		// Press End again, then while scrolled click right beside decomposed "e\u0301" (before "X") and type "!".
+		_, _, _ = host_dispatch_key_event(&h, &end_ev)
+		cur_scroll := text_edit_scroll_x(&h.text_edit, 1)
+		prefix_before_x := s.title[:len(s.title) - 1]
+		click_x_beside_e := tx - cur_scroll + font_measure_width(&h.font, prefix_before_x, px)
+
+		d: sdl.Event
+		d.type = .MOUSE_BUTTON_DOWN
+		d.button.button = sdl.BUTTON_LEFT
+		d.button.down = true
+		d.button.x = click_x_beside_e
+		d.button.y = y1
+		u := d
+		u.type = .MOUSE_BUTTON_UP
+		u.button.down = false
+		testing.expect(t, host_dispatch_mouse_event(&h, &d))
+		testing.expect(t, host_dispatch_mouse_event(&h, &u))
+		testing.expect_value(t, h.text_edit.session.caret, len(s.title) - 1)
+
+		ti: sdl.Event
+		ti.type = .TEXT_INPUT
+		ti.text.text = "!"
+		tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &ti, s.editable[:])
+		testing.expect_value(t, tres.needs_rebuild, true)
+		testing.expect(t, host_rebuild_frame(&h))
+		text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+		testing.expect_value(t, s.title, "0123456789 Long Narrow Editable Title Before Cafe\u0301!X")
+		testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 2), f32(0))
+
+		// Start composition near the right edge and verify painted caret X agrees with SDL_GetTextInputArea.
+		_, _, _ = host_dispatch_key_event(&h, &end_ev)
+		pre: sdl.Event
+		pre.type = .TEXT_EDITING
+		pre.edit.text = "abcdef"
+		pre.edit.start = 6
+		pre.edit.length = 0
+		_ = text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:])
+		painted_x := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+		testing.expect(t, painted_x >= el1.bounds.x && painted_x <= el1.bounds.x + el1.bounds.width)
+
+		area: sdl.Rect
+		cursor: c.int
+		testing.expect(t, sdl.GetTextInputArea(window, &area, &cursor))
+		sdl_anchor_x := area.x + cursor
+		testing.expect(t, abs(sdl_anchor_x - c.int(math.round(painted_x))) <= 1)
+
+		// Cancel preedit, then verify window resize while caret is at End keeps caret & IME anchor visible.
+		esc: sdl.Event
+		esc.type = .KEY_DOWN
+		esc.key.key = sdl.K_ESCAPE
+		_, _, _ = host_dispatch_key_event(&h, &esc)
+		_, _, _ = host_dispatch_key_event(&h, &end_ev)
+		h.viewport = {width = 500, height = 380}
+		testing.expect(t, host_rebuild_frame(&h))
+		el1_resized, ok_r := dagda.find(h.frame, 1)
+		testing.expect(t, ok_r)
+		tx_r, _, _ := text_edit_layout(h.frame, el1_resized.bounds)
+		vw_r := text_edit_view_width(h.frame, el1_resized.bounds)
+		cx_r := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1_resized.bounds, s.title)
+		testing.expect(t, cx_r >= tx_r && cx_r + TEXT_EDIT_CARET_WIDTH <= tx_r + vw_r + 0.5)
+		testing.expect(t, sdl.GetTextInputArea(window, &area, &cursor))
+		testing.expect(t, abs((area.x + cursor) - c.int(math.round(cx_r))) <= 1)
+
+		// Restore viewport, then verify dragging past left edge while scrolled clamps to 0 and scrolls to 0.
+		h.viewport = vp
+		testing.expect(t, host_rebuild_frame(&h))
+		el1, _ = dagda.find(h.frame, 1)
+		d.button.x = tx + view_w - 4
+		m: sdl.Event
+		m.type = .MOUSE_MOTION
+		m.motion.x = el1.bounds.x - 40
+		m.motion.y = y1
+		u.button.x = el1.bounds.x - 40
+		testing.expect(t, host_dispatch_mouse_event(&h, &d))
+		testing.expect(t, host_dispatch_mouse_event(&h, &m))
+		testing.expect(t, host_dispatch_mouse_event(&h, &u))
+		testing.expect_value(t, h.text_edit.session.caret, 0)
+		testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 1), f32(0))
+	}
+}
+
 Failed_Start_State :: struct {
 	ready_calls:   int,
 	second_result: Rebuild_Result,
