@@ -134,6 +134,9 @@ DEFAULT_FONT_PATHS :: [?]string{
 	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 	"/usr/share/fonts/noto/NotoSans-Regular.ttf",
 	"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+	"/System/Library/Fonts/Supplemental/Arial.ttf",
+	"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	"/Library/Fonts/LiberationSans-Regular.ttf",
 }
 
 font_init :: proc(font: ^Font) -> bool {

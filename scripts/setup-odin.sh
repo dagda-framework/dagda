@@ -2,17 +2,25 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
-  echo 'The current compiler pin supports Linux x86_64 only.' >&2
-  exit 1
-fi
-for dependency in python3 curl tar sha256sum; do
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) platform_key="linux-amd64" ;;
+  Darwin-arm64) platform_key="macos-arm64" ;;
+  *)
+    echo "The current compiler pin supports Linux x86_64 and macOS ARM64 only." >&2
+    exit 1
+    ;;
+esac
+for dependency in python3 curl tar; do
   command -v "$dependency" >/dev/null || { echo "Missing dependency: $dependency" >&2; exit 1; }
 done
 
-mapfile -t pin < <(python3 - <<'PY'
-import json
-p = json.load(open('dagda.lock'))['odin']
+pin=()
+while IFS= read -r line; do
+  pin+=("$line")
+done < <(PLATFORM_KEY="$platform_key" python3 - <<'PY'
+import json, os
+data = json.load(open('dagda.lock'))
+p = data.get('platforms', {}).get(os.environ['PLATFORM_KEY'], data['odin'])
 print(p['version'])
 print(p['url'])
 print(p['sha256'])
@@ -35,8 +43,13 @@ else
   echo 'Usage: bash scripts/setup-odin.sh [existing-release-archive]' >&2
   exit 1
 fi
-printf '%s  %s\n' "${pin[2]}" "$archive" | sha256sum --check --status || {
-  echo 'Odin release checksum mismatch; nothing installed.' >&2
+ARCHIVE_PATH="$archive" EXPECTED_SHA="${pin[2]}" python3 - <<'PY' || {
+import hashlib, os, sys
+actual = hashlib.sha256(open(os.environ['ARCHIVE_PATH'], 'rb').read()).hexdigest()
+if actual != os.environ['EXPECTED_SHA']:
+    print('Odin release checksum mismatch; nothing installed.', file=sys.stderr)
+    sys.exit(1)
+PY
   exit 1
 }
 mkdir "$stage/unpacked"

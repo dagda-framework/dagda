@@ -6,5 +6,21 @@
     "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-linux-amd64-dev-2026-11a.tar.gz",
     "sha256": "65c9f6e97d6f8a30930e151f270ce5aeaa98fe8b2ba49fe067394e2af04f7618",
     "compiler_version": "dev-2026-11-nightly:9a69916"
+  },
+  "platforms": {
+    "linux-amd64": {
+      "version": "dev-2026-11a",
+      "platform": "linux-amd64",
+      "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-linux-amd64-dev-2026-11a.tar.gz",
+      "sha256": "65c9f6e97d6f8a30930e151f270ce5aeaa98fe8b2ba49fe067394e2af04f7618",
+      "compiler_version": "dev-2026-11-nightly:9a69916"
+    },
+    "macos-arm64": {
+      "version": "dev-2026-11a",
+      "platform": "macos-arm64",
+      "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-macos-arm64-dev-2026-11a.tar.gz",
+      "sha256": "fa10eee280c8786758e3ff0b8fdd9355e1c9447b1f0b8c72764e25ee4ebc3e22",
+      "compiler_version": "dev-2026-11-nightly:9a69916"
+    }
   }
 }
