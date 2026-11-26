@@ -2,6 +2,8 @@ package sdlhost
 
 import "core:c"
 import "core:math"
+import "core:mem"
+import "core:strings"
 import "core:unicode/utf8"
 import "dagda:dagda"
 import sdl "vendor:sdl3"
@@ -342,6 +344,111 @@ rune_offset_to_bytes :: proc(s: string, rune_count: int) -> int {
 	return len(s)
 }
 
+@(private="package")
+Clipboard_Get_Proc :: #type proc(ctx: rawptr, allocator := context.allocator) -> (text: string, ok: bool)
+
+@(private="package")
+Clipboard_Set_Proc :: #type proc(ctx: rawptr, text: string) -> bool
+
+@(private="package")
+Clipboard :: struct {
+	ctx: rawptr,
+	get: Clipboard_Get_Proc,
+	set: Clipboard_Set_Proc,
+}
+
+@(private="package")
+Memory_Clipboard :: struct {
+	text:      string,
+	allocator: mem.Allocator,
+}
+
+@(private="package")
+memory_clipboard_set :: proc(ctx: rawptr, text: string) -> bool {
+	mc := (^Memory_Clipboard)(ctx)
+	if mc == nil {
+		return false
+	}
+	alloc := mc.allocator.procedure != nil ? mc.allocator : context.allocator
+	cloned, err := strings.clone(text, alloc)
+	if err != nil {
+		return false
+	}
+	delete(mc.text, alloc)
+	mc.text = cloned
+	mc.allocator = alloc
+	return true
+}
+
+@(private="package")
+memory_clipboard_get :: proc(ctx: rawptr, allocator := context.allocator) -> (string, bool) {
+	mc := (^Memory_Clipboard)(ctx)
+	if mc == nil || len(mc.text) == 0 {
+		return "", false
+	}
+	cloned, err := strings.clone(mc.text, allocator)
+	if err != nil {
+		return "", false
+	}
+	return cloned, true
+}
+
+@(private="package")
+memory_clipboard_destroy :: proc(mc: ^Memory_Clipboard) {
+	if mc == nil {
+		return
+	}
+	alloc := mc.allocator.procedure != nil ? mc.allocator : context.allocator
+	delete(mc.text, alloc)
+	mc^ = {}
+}
+
+@(private="package")
+memory_clipboard_interface :: proc(mc: ^Memory_Clipboard) -> Clipboard {
+	return {
+		ctx = mc,
+		get = memory_clipboard_get,
+		set = memory_clipboard_set,
+	}
+}
+
+@(private="package")
+clipboard_set :: proc(cb: Clipboard, text: string) -> bool {
+	if cb.set != nil {
+		return cb.set(cb.ctx, text)
+	}
+	cstr, err := strings.clone_to_cstring(text)
+	if err != nil {
+		return false
+	}
+	defer delete(cstr)
+	return sdl.SetClipboardText(cstr)
+}
+
+@(private="package")
+clipboard_get :: proc(cb: Clipboard, allocator := context.allocator) -> (string, bool) {
+	if cb.get != nil {
+		return cb.get(cb.ctx, allocator)
+	}
+	if !sdl.HasClipboardText() {
+		return "", false
+	}
+	raw := sdl.GetClipboardText()
+	if raw == nil {
+		return "", false
+	}
+	defer sdl.free(raw)
+	s := string(cstring(raw))
+	if len(s) == 0 {
+		return "", false
+	}
+	cloned, err := strings.clone(s, allocator)
+	if err != nil {
+		return "", false
+	}
+	return cloned, true
+}
+
 text_edit_handle_event :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
@@ -351,6 +458,7 @@ text_edit_handle_event :: proc(
 	user_data: rawptr,
 	ev: ^sdl.Event,
 	targets: []dagda.Object_Id = nil,
+	clipboard: Clipboard = {},
 ) -> (res: Text_Edit_Result) {
 	if !cfg.enabled || !te.focused {
 		return {}
@@ -458,6 +566,33 @@ text_edit_handle_event :: proc(
 			text_edit_update_ime_area(te, window, font, frame, cfg)
 			res.consumed = true
 			res.needs_redraw = true
+			return res
+		}
+
+		if ctrl && !shift && !alt_or_gui && key == sdl.K_C {
+			start, end := dagda.selection_bounds(&te.session)
+			start = clamp(start, 0, len(el.text))
+			end = clamp(end, start, len(el.text))
+			if start < end {
+				_ = clipboard_set(clipboard, el.text[start:end])
+			}
+			res.consumed = true
+			return res
+		}
+
+		if ctrl && !shift && !alt_or_gui && key == sdl.K_V {
+			clip_alloc := te.session.allocator.procedure != nil ? te.session.allocator : context.allocator
+			if pasted, ok := clipboard_get(clipboard, clip_alloc); ok {
+				defer delete(pasted, clip_alloc)
+				if len(pasted) > 0 {
+					edit := dagda.insert_text(&te.session, el.text, pasted)
+					commit_proposal(te, cfg, user_data, &edit, false, &res)
+					if !res.needs_rebuild {
+						text_edit_update_ime_area(te, window, font, frame, cfg)
+					}
+				}
+			}
+			res.consumed = true
 			return res
 		}
 
