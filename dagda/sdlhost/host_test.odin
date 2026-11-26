@@ -3594,6 +3594,219 @@ test_scroll_offsets_bounded_on_empty_frame_blur_ineligible_and_replacements :: p
 	}
 }
 
+@(test)
+test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t: ^testing.T) {
+	Cut_App :: struct {
+		title:          string,
+		rev:            u64,
+		commit_calls:   int,
+		reject_commits: bool,
+		last_id:        dagda.Object_Id,
+		undo_stack:     [dynamic]string,
+		editable:       [2]dagda.Object_Id,
+		elements:       [2]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Cut_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 40, y = 40, width = 500, height = 60}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 40, y = 140, width = 500, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Cut_App)(user_data)
+		s.commit_calls += 1
+		if s.reject_commits || new_text == s.title {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		append(&s.undo_stack, s.title)
+		s.title = cloned
+		s.rev += 1
+		s.last_id = id
+		return true
+	}
+	on_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
+		s := (^Cut_App)(user_data)
+		if len(s.undo_stack) == 0 {
+			return false
+		}
+		delete(s.title)
+		s.title = pop(&s.undo_stack)
+		s.rev += 1
+		s.last_id = id
+		return true
+	}
+
+	Fail_Clipboard :: struct {
+		mc:       Memory_Clipboard,
+		fail_set: bool,
+	}
+	fail_cb_set :: proc(ctx: rawptr, text: string) -> bool {
+		fc := (^Fail_Clipboard)(ctx)
+		if fc.fail_set {
+			return false
+		}
+		return memory_clipboard_set(&fc.mc, text)
+	}
+	fail_cb_get :: proc(ctx: rawptr, allocator := context.allocator) -> (string, bool) {
+		fc := (^Fail_Clipboard)(ctx)
+		return memory_clipboard_get(&fc.mc, allocator)
+	}
+
+	// "Ae\u0301B": 'A'(0..1), 'e'+U+0301(1..4 -> 0x65 0xCC 0x81), 'B'(4..5).
+	s := Cut_App{
+		title    = strings.clone("Ae\u0301B"),
+		editable = {1, 2},
+	}
+	defer {
+		delete(s.title)
+		for prev in s.undo_stack {
+			delete(prev)
+		}
+		delete(s.undo_stack)
+	}
+
+	fc: Fail_Clipboard
+	defer memory_clipboard_destroy(&fc.mc)
+	cb := Clipboard{ctx = &fc, get = fail_cb_get, set = fail_cb_set}
+
+	h: Host
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		text_edit             = {enabled = true, on_commit = on_commit, on_undo = on_undo},
+		editable_text_targets = s.editable[:],
+	}
+	h.clipboard = cb
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	dispatch_key :: proc(h: ^Host, key: sdl.Keycode, mod: sdl.Keymod = {}, repeat := false) {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = key
+		ev.key.mod = mod
+		ev.key.repeat = repeat
+		rebuild, has_pending, pending := host_dispatch_key_event(h, &ev)
+		if rebuild {
+			_ = host_rebuild_frame(h)
+			if has_pending {
+				text_edit_apply_committed(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &pending)
+			}
+		}
+	}
+
+	// Focus field 1 (id=1). Seed clipboard with a known value.
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, nil, h.frame, h.app.text_edit, 1, s.editable[:]))
+	testing.expect(t, clipboard_set(cb, "seeded"))
+
+	// 1. Empty selection: Ctrl+X leaves document and seeded clipboard untouched.
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.commit_calls, 0)
+	testing.expect_value(t, fc.mc.text, "seeded")
+
+	// Select decomposed "e\u0301" (bytes 1..4).
+	h.text_edit.session.anchor = 1
+	h.text_edit.session.caret = 4
+
+	// 2. Repeated Ctrl+X keydown leaves document, selection, and clipboard untouched.
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL, repeat = true)
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.commit_calls, 0)
+	testing.expect_value(t, fc.mc.text, "seeded")
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+
+	// 3. Failing clipboard setter: zero edit proposals to app, selection & clipboard survive.
+	fc.fail_set = true
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.commit_calls, 0)
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, len(s.undo_stack), 0)
+	testing.expect_value(t, fc.mc.text, "seeded")
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	fc.fail_set = false
+
+	// 4. Active IME composition: Ctrl+X leaves preedit, selection, document, and seeded clipboard intact.
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "pre"
+	pre.edit.start = 3
+	pre.edit.length = 0
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &s, &pre, s.editable[:], cb)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "pre")
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.commit_calls, 0)
+	testing.expect_value(t, fc.mc.text, "seeded")
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	dispatch_key(&h, sdl.K_ESCAPE)
+
+	// 5. App rejection: document, rev, undo, and selection survive; clipboard may retain copied text.
+	s.reject_commits = true
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.commit_calls, 1)
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, len(s.undo_stack), 0)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, fc.mc.text, "e\u0301")
+	s.reject_commits = false
+
+	// 6. Accepted Ctrl+X: exact bytes 65 CC 81 copied, title becomes "AB", caret collapses to 1,
+	//    focus stays in field 1, 1 revision & 1 undo entry; one undo restores exact "Ae\u0301B".
+	testing.expect(t, clipboard_set(cb, "seeded2"))
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, len(fc.mc.text), 3)
+	testing.expect_value(t, fc.mc.text[0], u8(0x65))
+	testing.expect_value(t, fc.mc.text[1], u8(0xCC))
+	testing.expect_value(t, fc.mc.text[2], u8(0x81))
+	testing.expect_value(t, s.title, "AB")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, len(s.undo_stack), 1)
+	testing.expect_value(t, s.last_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 1)
+
+	dispatch_key(&h, sdl.K_Z, sdl.KMOD_LCTRL)
+	testing.expect_value(t, s.title, "Ae\u0301B")
+	testing.expect_value(t, s.rev, u64(2))
+	testing.expect_value(t, len(s.undo_stack), 0)
+
+	// 7. Embedded NUL in selection: declined before on_commit, preserving seeded clipboard and selection.
+	delete(s.title)
+	s.title = strings.clone("a\x00b")
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect(t, clipboard_set(cb, "keep-nul"))
+	h.text_edit.session.anchor = 0
+	h.text_edit.session.caret = 3
+	commits_before := s.commit_calls
+	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	testing.expect_value(t, s.commit_calls, commits_before)
+	testing.expect_value(t, s.title, "a\x00b")
+	testing.expect_value(t, fc.mc.text, "keep-nul")
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, 3)
+}
+
 Failed_Start_State :: struct {
 	ready_calls:   int,
 	second_result: Rebuild_Result,

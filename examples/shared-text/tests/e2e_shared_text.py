@@ -700,10 +700,54 @@ def verify_clipboard_copy_paste(app_bin: Path, client_bin: Path, capture_dir: Pa
         wait_for_role_text(client_bin, sock, "canvas.title", f"{combining_title}é")
         wait_for_role_text(client_bin, sock, "shared.status", "rev=6, undo=2, last_id=2, actions=0")
 
+        # 7. Plain Ctrl+X cut of decomposed é (U+0065 + U+0301) in "Ae\u0301B":
+        #    cut produces "AB" (+1 rev, +1 undo), undo restores exact b"Ae\xcc\x81B",
+        #    and pasting in view 2 proves clipboard contains exact bytes 65 CC 81.
+        decomposed = "Ae\u0301B"
+        assert decomposed.encode("utf-8") == b"Ae\xcc\x81B"
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key ctrl+a")
+        send_control(proc, reader, f"text {decomposed}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=7, undo=3, last_id=1, actions=0")
+
+        # Select decomposed "e\u0301" (home -> right -> shift+right), seed clipboard, test repeat no-op, then cut.
+        send_control(proc, reader, "key home")
+        send_control(proc, reader, "key right")
+        send_control(proc, reader, "key shift+right")
+        send_control(proc, reader, "clipboard seeded")
+        send_control(proc, reader, "key ctrl+x+repeat")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=7, undo=3, last_id=1, actions=0")
+
+        send_control(proc, reader, "key ctrl+x")
+        wait_for_role_text(client_bin, sock, "outline.title", "AB")
+        wait_for_role_text(client_bin, sock, "canvas.title", "AB")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=8, undo=4, last_id=1, actions=0")
+
+        # Undo once -> both views restore exact original bytes b"Ae\xcc\x81B".
+        send_control(proc, reader, "key ctrl+z")
+        r_u1 = wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        r_u2 = wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        assert r_u1["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81B"
+        assert r_u2["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81B"
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=9, undo=3, last_id=1, actions=0")
+
+        # Paste in view 2 -> proves clipboard holds exact bytes 65 CC 81 ("e\u0301").
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        send_control(proc, reader, "key ctrl+v")
+        r_p1 = wait_for_role_text(client_bin, sock, "outline.title", "Ae\u0301Be\u0301")
+        r_p2 = wait_for_role_text(client_bin, sock, "canvas.title", "Ae\u0301Be\u0301")
+        assert r_p1["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81Be\xcc\x81"
+        assert r_p2["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81Be\xcc\x81"
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=10, undo=4, last_id=2, actions=0")
+
         print(
             f"[shared-clip] copy('fe\\u0301',rev=1) -> paste_v2('Cafe\\u0301 fe\\u0301',rev=2,id=2) -> "
             f"undo('Cafe\\u0301 Title',rev=3) -> multiline_reject(sel_kept->'Cafe\\u0301 X',rev=4->undo rev=5) -> "
-            f"preedit_ctrl_v_intact(bg={pre2_bg},uline_w={uline2_w}->'Cafe\\u0301 Titleé',rev=6)"
+            f"preedit_ctrl_v_intact(bg={pre2_bg},uline_w={uline2_w}->'Cafe\\u0301 Titleé',rev=6) -> "
+            f"cut('Ae\\u0301B'->'AB',rev=8,undo=4->undo 'Ae\\u0301B',rev=9->paste 'Ae\\u0301Be\\u0301',rev=10)"
         )
 
         send_control(proc, reader, "quit")
