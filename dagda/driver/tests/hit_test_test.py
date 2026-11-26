@@ -104,9 +104,17 @@ def main():
             sock = tmp / f"sock-{width}" / "app.sock"
             proc = start(host, sock, width, height)
             try:
-                over = inspect(client_bin, sock, "over")
-                b = over["bounds"]
-                centre = (b["x"] + b["width"] / 2, b["y"] + b["height"] / 2)
+                over = inspect(client_bin, sock, "over")["bounds"]
+                under_b = inspect(client_bin, sock, "under")["bounds"]
+                # Midpoint of the positive-area intersection of
+                # the two reported rectangles: strictly inside
+                # both, not on either exclusive edge.
+                ix = max(over["x"], under_b["x"])
+                iy = max(over["y"], under_b["y"])
+                ir = min(over["x"] + over["width"], under_b["x"] + under_b["width"])
+                ib = min(over["y"] + over["height"], under_b["y"] + under_b["height"])
+                assert ir > ix and ib > iy, (over, under_b)
+                centre = ((ix + ir) / 2, (iy + ib) / 2)
                 _, hit = client(client_bin, sock, "hit-test", str(centre[0]), str(centre[1]))
                 assert hit == {"ok": True, "id": 2}, hit  # overlap: topmost, same as a pointer
                 # A point only in the under element (ID 0 is valid):
@@ -144,6 +152,25 @@ def main():
                 assert code == 2 or bad.get("ok") is False, (code, bad)
             finally:
                 cleanup(proc)
+        # Unit-scale tiny button: centre derived only from the
+        # JSON reply must hit it; its exact right edge must miss.
+        sock = tmp / "sock-tiny" / "app.sock"
+        proc = start(host, sock, 960, 540)
+        try:
+            tiny = inspect(client_bin, sock, "tiny")
+            assert tiny["id"] == 5, tiny
+            all_els = client(client_bin, sock, "inspect")[1]["elements"]
+            unfiltered = [e for e in all_els if e["id"] == 5][0]
+            assert unfiltered["bounds"] == tiny["bounds"], (unfiltered, tiny)
+            b = tiny["bounds"]
+            cx, cy = b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
+            _, hit = client(client_bin, sock, "hit-test", str(cx), str(cy))
+            assert hit == {"ok": True, "id": 5}, (b, hit)
+            _, edge = client(client_bin, sock, "hit-test", str(b["x"] + b["width"]), str(cy))
+            assert edge == {"ok": True, "id": None}, edge
+            print(f"tiny bounds {b} centre ({cx}, {cy}) -> id 5; right edge -> null")
+        finally:
+            cleanup(proc)
         print("hit-test client checks passed at two viewport sizes")
         return 0
     finally:

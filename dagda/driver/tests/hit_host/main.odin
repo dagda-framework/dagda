@@ -23,9 +23,10 @@ main :: proc() {
 	canvas := dagda.Canvas{
 		size = {width = 960, height = 540},
 		elements = {
-			{info = {id = 0, role = "under"}, kind = .Button, text = "Under", bounds = {x = 0, y = 0, width = 200, height = 200}},
-			{info = {id = 2, role = "over"}, kind = .Button, text = "Over", bounds = {x = 100, y = 100, width = 200, height = 200}},
+			{info = {id = 0, role = "under"}, kind = .Button, text = "Under", bounds = {x = 0, y = 300, width = 200, height = 200}},
+			{info = {id = 2, role = "over"}, kind = .Button, text = "Over", bounds = {x = 100, y = 350, width = 200, height = 200}},
 			{info = {id = 3, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}},
+			{info = {id = 5, role = "tiny"}, kind = .Button, text = "Tiny", bounds = {x = 32.001953125, y = 10, width = 0.001953125, height = 50}},
 		},
 	}
 	frame, ok := dagda.resolve_canvas(canvas, {width = width, height = height})
