@@ -3,7 +3,9 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "dagda:dagda"
+import sdl "vendor:sdl3"
 import "dagda:dagda/driver"
 import "dagda:dagda/sdlhost"
 
@@ -33,6 +35,15 @@ Conflict_App :: struct {
 	editable_ids:           [3]dagda.Object_Id,
 	status_buf:             [128]u8,
 	elements:               [4]dagda.Canvas_Element,
+	// Observation log for the native-IME desktop probe: when
+	// COMPOSITION_OBS_LOG names a file, composition start/end
+	// and commit callbacks append ordered records (sequence,
+	// field, host-thread id, exact text bytes as hex, and the
+	// resulting revision/undo depth) and rewrite that file.
+	obs_path:               string,
+	obs_buf:                [dynamic]u8,
+	obs_seq:                int,
+	main_thread:            int,
 }
 
 doc_destroy :: proc(d: ^Title_Doc) {
@@ -141,6 +152,56 @@ conflict_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: s
 	return doc_commit_text(doc_ptr(app, which), new_text)
 }
 
+obs_hex :: proc(text: string) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< len(text) {
+		fmt.sbprintf(&b, "%02x", text[i])
+	}
+	return strings.to_string(b)
+}
+
+obs_record :: proc(app: ^Conflict_App, line: string) {
+	if len(app.obs_path) == 0 {
+		return
+	}
+	append(&app.obs_buf, line)
+	append(&app.obs_buf, '\n')
+	_ = os.write_entire_file(app.obs_path, app.obs_buf[:])
+}
+
+conflict_observe_composition :: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool) {
+	app := (^Conflict_App)(user_data)
+	if len(app.obs_path) == 0 {
+		return
+	}
+	app.obs_seq += 1
+	obs_record(app, fmt.tprintf(
+		"seq=%d kind=composition_%s field=%d tid=%d main_tid=%d video=%s a_text_hex=%s a_rev=%d a_undo=%d",
+		app.obs_seq, composing ? "start" : "end", u64(field_id), sync.current_thread_id(), app.main_thread, sdl.GetCurrentVideoDriver(),
+		obs_hex(app.doc_a.text), u64(app.doc_a.rev), len(app.doc_a.undo),
+	))
+}
+
+conflict_observe_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+	app := (^Conflict_App)(user_data)
+	accepted := conflict_text_commit(user_data, id, new_text)
+	if len(app.obs_path) == 0 {
+		return accepted
+	}
+	app.obs_seq += 1
+	rev, undo: int
+	if which, ok := doc_for_field(id); ok {
+		d := doc_ptr(app, which)
+		rev, undo = int(d.rev), len(d.undo)
+	}
+	obs_record(app, fmt.tprintf(
+		"seq=%d kind=commit field=%d tid=%d main_tid=%d video=%s accepted=%v text_hex=%s rev=%d undo=%d",
+		app.obs_seq, u64(id), sync.current_thread_id(), app.main_thread, sdl.GetCurrentVideoDriver(), accepted,
+		obs_hex(new_text), rev, undo,
+	))
+	return accepted
+}
+
 conflict_text_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
 	app := (^Conflict_App)(user_data)
 	which, ok := doc_for_field(id)
@@ -203,9 +264,18 @@ main :: proc() {
 		doc_b        = {text = strings.clone("Beta Title"), rev = 1},
 		editable_ids = {A_OUTLINE_ID, A_CANVAS_ID, B_CANVAS_ID},
 	}
+	state.main_thread = sync.current_thread_id()
+	if obs_path, has_obs := os.lookup_env("COMPOSITION_OBS_LOG", context.allocator); has_obs {
+		state.obs_path = obs_path
+		obs_record(&state, fmt.tprintf(
+			"seq=0 kind=ready tid=%d main_tid=%d a_text_hex=%s a_rev=%d a_undo=%d",
+			state.main_thread, state.main_thread, obs_hex(state.doc_a.text), u64(state.doc_a.rev), len(state.doc_a.undo),
+		))
+	}
 	defer {
 		doc_destroy(&state.doc_a)
 		doc_destroy(&state.doc_b)
+		delete(state.obs_buf)
 	}
 
 	host_args := make([dynamic]string, 0, len(os.args))
@@ -238,9 +308,10 @@ main :: proc() {
 		},
 		text_edit             = {
 			enabled   = true,
-			on_commit = conflict_text_commit,
+			on_commit = conflict_observe_commit,
 			on_undo   = conflict_text_undo,
 		},
+		on_composition        = conflict_observe_composition,
 		editable_text_targets = state.editable_ids[:],
 	}
 	if code := sdlhost.run(app, opts); code != 0 {
