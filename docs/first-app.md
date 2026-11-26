@@ -195,6 +195,8 @@ file, and `rmdir "$SOCK_DIR"` in terminal 1 cleans up.
   [examples/shared-text](../examples/shared-text/), and the
   headless advertised-edit workflow in
   [examples/advertised-edit-app](../examples/advertised-edit-app/).
+- For an editable field that accepts hard line breaks, see
+  [Editable multiline text](multiline-text.md).
 - For fixed-aspect canvas layouts, advertised edits, and IME
   text editing, see the examples under `examples/` and the
   framework packages under `dagda/` in the checkout.
