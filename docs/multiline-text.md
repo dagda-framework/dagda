@@ -42,10 +42,12 @@ Note_App :: struct {
 
 replace :: proc(f: ^Field, new_text: string) -> bool {
 	cloned, clone_err := strings.clone(new_text)
-	if clone_err != nil {
+	if clone_err != nil || (len(new_text) > 0 && len(cloned) != len(new_text)) {
+		delete(cloned)
 		return false
 	}
-	if _, push_err := append(&f.undo, f.text); push_err != nil {
+	prev_len := len(f.undo)
+	if _, push_err := append(&f.undo, f.text); push_err != nil || len(f.undo) != prev_len + 1 {
 		delete(cloned)
 		return false
 	}
@@ -131,28 +133,39 @@ variable to a new slice after startup changes nothing.
 
 ## What `on_commit` must do
 
-The host never hands the app a keystroke. For every accepted
-gesture it builds the **full proposed replacement** for the
-field's text — caret moves, selections and any preedit already
-folded in — and calls `on_commit(user_data, id, new_text)`.
+The host never hands the app a keystroke. When an action
+would change the committed text, it builds the **full
+proposed replacement** for the field's text — the selection
+and any preedit already folded in — and calls
+`on_commit(user_data, id, new_text)` with that proposed
+change to the committed text. Caret moves, selection changes
+and preedit updates alone produce no document edit and no
+`on_commit` call; they only shape the next proposal.
+
 Before returning `true`, the app must:
 
 1. Validate the whole proposal under its own rules (the
    example accepts a body only as valid UTF-8 with LF-only
    line breaks and at most a configured line count; the title
    must satisfy `dagda.valid_single_line`).
-2. Clone the bytes it will keep. The proposal borrows host
-   storage; do not retain the slice itself.
-3. Append the field's previous text to its undo history
-   exactly once, then install the clone and advance that
-   field's revision by exactly one.
+2. Clone the bytes it will keep, and check the clone really
+   holds them: the example's `replace` compares the cloned
+   length with the requested length whenever the proposal is
+   non-empty, because an allocator can report success with
+   empty storage. The proposal borrows host storage; do not
+   retain the slice itself.
+3. Append the field's previous text to its undo history and
+   verify the history actually grew by one entry before
+   publishing anything.
 
-Only then return `true`: one accepted edit is one revision
-and one undo entry, however many lines it touched. If cloning
-or growing the history can fail, do both before publishing
-anything, so a failure can still return `false` with the
-document untouched — the example's `replace` clones first,
-appends second, and only then swaps the text in.
+Only then install the clone, advance the revision, and
+return `true`. In this app's policy, one accepted edit is
+one revision and one undo entry, however many lines it
+touched; other apps may version differently, but this guide
+and its example follow that rule throughout. Because both
+fallible steps are checked before the swap, a failed clone or
+history append returns `false` with text, revision and undo
+depth exactly as they were.
 
 Returning `false` refuses the edit. The committed text,
 revision and undo history stay exactly as they were, and the
@@ -180,8 +193,9 @@ sees those two complete proposals in order, never fragments.
 - **Paste.** The host normalizes clipboard CRLF and lone CR
   to LF before proposing, so pasting `one\r\ntwo\rthree`
   reaches the app as the single proposal `one\ntwo\nthree`.
-  One accepted paste is one edit — one revision and one undo
-  entry for the whole pasted text, not one per line.
+  Under this app's policy, one accepted paste is one edit —
+  one revision and one undo entry for the whole pasted text,
+  not one per line.
 - **Refusals.** If the app returns `false` — say the body
   already has the maximum line count a new break would
   exceed — the proposal is discarded whole: text, revision,
@@ -206,18 +220,23 @@ while that same field is composing (`Busy_Composing`), and
 only then applies the same acceptance rule and one-step
 replacement as a keyboard commit.
 
-## Run the example
+## Run the example (Linux acceptance run)
 
-From a clean checkout, with the pinned compiler installed
-(`bash scripts/setup-odin.sh` if needed):
+From a clean Linux checkout, with the pinned compiler
+installed (`bash scripts/setup-odin.sh` if needed):
 
 ```sh
 MULTILINE=1 python3 examples/multiline-text/tests/e2e_multiline_text.py
 ```
 
-This builds the fixture and the driver client in a temporary
-directory under SDL's dummy video driver and drives the real
-window process through the scenarios above — hard breaks,
+This is the Linux acceptance run for the example. It builds
+the fixture and the driver client in a temporary directory
+under SDL's dummy video driver and drives the real window
+process through the scenarios above — hard breaks,
 LF-normalized pastes, refusals, compositions and driver
-edits. A passing run ends with every scenario marked `PASS`.
+edits — injecting the Control shortcuts the scenarios name
+(`ctrl+a`, `ctrl+v`, `ctrl+z`, …). On a Darwin host those
+same actions use the Command modifier instead; this script's
+injected Control chords are its Linux form. A passing run
+ends with all 25 scenarios marked `PASS`.
 
