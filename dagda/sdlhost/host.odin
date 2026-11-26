@@ -30,6 +30,26 @@ App :: struct {
 	// dispatch through it; when omitted, the endpoint keeps its
 	// existing inspect / invoke behavior only. The app owns its
 	// revisions, mutation policy, and undo history.
+	//
+	// Slice-borrowing contract (also for editable_text_targets):
+	// run takes App by value, so it borrows the slice descriptors
+	// supplied at startup — the caller gives each slice's base
+	// address and length once and keeps its backing array valid
+	// until run returns, including the strings the declarations
+	// in edits.edits reference. Refresh existing entries in the
+	// host-thread view or canvas builder before returning the
+	// matching elements; the host thread is the only writer of
+	// the arrays. Reassigning or reslicing the caller's own copy
+	// after startup does not update the host's descriptor, and
+	// only slots within the supplied length are ever visible.
+	// Object ID 0 is a valid ID in both lists. Workers publish
+	// synchronized model state and request a rebuild; that
+	// request is asynchronous, and after a successful rebuild
+	// focus reconciliation plus later input and driver dispatch
+	// see the refreshed entries. When a target's identity, edit
+	// eligibility, and committed text stay the same across a
+	// rebuild, its focused text session (caret, selection, and
+	// any active preedit) is preserved.
 	edits: driver.Edit_Source,
 	// Optional Ctrl+Z undo hook, called on the host thread. It
 	// returns true when the app actually undid something.
@@ -37,6 +57,12 @@ App :: struct {
 	text_edit:             Editable_Text_Config,
 	// Optional list of editable element IDs when multiple distinct single-line
 	// elements share text_edit; when empty, text_edit.target_id is used.
+	// Borrowed as described on edits above: pass the slice once,
+	// keep its backing array valid until run returns, and refresh
+	// entries only from the host-thread builder. Discovery of an
+	// element by role (inspect) is separate from discovery of
+	// its advertised edits (the edits operation, which also
+	// requires the app to recognize the ID in revision_of).
 	editable_text_targets: []dagda.Object_Id,
 	// Called on the host thread with the visual field ID (which may be zero).
 	// true marks the first active preedit. Updates keep the same start. false

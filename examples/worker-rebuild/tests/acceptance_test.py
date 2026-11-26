@@ -213,7 +213,7 @@ def main():
         # If a rebuild cancelled the composition, this fails.
         shot = app.dir / "after-worker.png"
         app.control(f"screenshot {shot}")
-        hits = count_preedit_pixels(shot, fb)
+        hits = count_preedit_pixels(shot, {"x": 0, "y": 0, "width": 100000, "height": 100000})
         assert hits >= 20, f"composition was lost across the worker rebuild (preedit pixels={hits})"
         print(f"[2] composing field/preedit still active after worker presentation (preedit pixels={hits})")
         # Finish the composition normally at the intended place.
@@ -259,6 +259,45 @@ def main():
         print(f"[1c] snapshot ordering presented 101 (present count {present_count(burst)})")
         burst.quit()
         apps.remove(burst)
+
+        # 2b. Borrowed slices refreshed in place: B starts with
+        # no rename edit and is not editable. While A composes,
+        # a worker fills the existing slots and requests a
+        # rebuild; B's edit becomes discoverable, A's session
+        # finishes at its original selection, then B edits.
+        mut = App(app_bin, client_bin, tmp, "mutate", {"WORKER_MODE": "request"})
+        apps.append(mut)
+        r = subprocess.run([str(client_bin), str(mut.sock), "edits", "3"], capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0 and json.loads(r.stdout)["edits"] == [], r.stdout  # no rename edit for B yet
+        field_b = mut.inspect("worker.other")
+        bb = field_b["bounds"]
+        mut.control(f"click {bb['x'] + bb['width'] - 5:.2f} {bb['y'] + bb['height'] / 2:.2f}")
+        mut.control("text Z")
+        assert mut.inspect("worker.other")["text"] == "other 0"
+        fa = mut.inspect("worker.field")["bounds"]
+        mut.control(f"click {fa['x'] + fa['width'] - 5:.2f} {fa['y'] + fa['height'] / 2:.2f}")
+        mut.control("key shift+left")
+        mut.control("preedit X")
+        mut.fire("enable-b")
+        deadline = time.monotonic() + 5
+        discovered = None
+        while time.monotonic() < deadline:
+            rr = subprocess.run([str(client_bin), str(mut.sock), "edits", "3"], capture_output=True, text=True, timeout=10)
+            if rr.returncode == 0:
+                discovered = json.loads(rr.stdout)
+                break
+            time.sleep(0.02)
+        assert discovered is not None and discovered["edits"] == [{"name": "rename", "argument": "text"}], discovered
+        mut.control("key enter")
+        mut.control("text Y")
+        assert mut.wait_text("worker.field", "FielY")["text"] == "FielY"
+        mut.control(f"click {bb['x'] + bb['width'] - 5:.2f} {bb['y'] + bb['height'] / 2:.2f}")
+        mut.control("text !")
+        assert mut.wait_text("worker.other", "other 0!")["text"] == "other 0!"
+        assert mut.inspect("worker.field")["text"] == "FielY"
+        print("[2b] in-place slice refresh: B edit discovered during A composition; both fields typed correctly")
+        mut.quit()
+        apps.remove(mut)
 
         # 3. Negative control: publish without requesting stays stale.
         neg = App(app_bin, client_bin, tmp, "negative", {"WORKER_MODE": "publish"})

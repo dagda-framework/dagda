@@ -13,6 +13,11 @@ import "dagda:dagda"
 Edit_Revision_Proc :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool)
 
 Edit_Source :: struct {
+	// Advertised edit declarations, borrowed under the slice
+	// contract documented on sdlhost.App.edits: the descriptor
+	// is supplied once, its backing array (and the strings its
+	// entries reference) stays valid and is refreshed only by
+	// the host thread, and only the supplied length is visible.
 	edits:       []dagda.Advertised_Edit,
 	handler:     dagda.Edit_Handler,
 	user_data:   rawptr,
