@@ -280,7 +280,7 @@ def main() -> int:
         send_control(proc, reader, "text A")
         wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
-        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
 
         # Verify BOTH elements redrew visually with the edit ("ASlide Title") and record glyph masks.
         after_first_png = capture_dir / "01-after-first-edit.png"
@@ -335,14 +335,14 @@ def main() -> int:
         # Revision and committed text are still untouched during preedit.
         wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
-        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
 
         # 3. Commit once (Enter swallowed + TEXT_INPUT "é") -> both elements show "ASlide é", last_id=2.
         send_control(proc, reader, "key enter")
         send_control(proc, reader, "text é")
         wait_for_role_text(client_bin, sock, "outline.title", "ASlide é")
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide é")
-        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=0")
 
         # Verify BOTH fields actually painted the shorter "ASlide é" glyphs (not stale "ASlide Title").
         after_commit_png = capture_dir / "03-after-commit.png"
@@ -372,7 +372,7 @@ def main() -> int:
         send_control(proc, reader, "key ctrl+z")
         wait_for_role_text(client_bin, sock, "outline.title", "ASlide Title")
         wait_for_role_text(client_bin, sock, "canvas.title", "ASlide Title")
-        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
 
         # Verify BOTH fields repainted the restored "ASlide Title" glyphs matching 01-after-first-edit.
         after_undo_png = capture_dir / "04-after-undo.png"
@@ -410,8 +410,98 @@ def main() -> int:
         proc.wait(timeout=5)
         assert proc.returncode == 0 and not sock.exists()
         proc = None
+
+        verify_keyboard_tab_traversal(app_bin, client_bin, capture_dir)
         print("All shared-text checks passed.")
         return 0
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_keyboard_tab_traversal(app_bin: Path, client_bin: Path, capture_dir: Path) -> None:
+    """Keyboard-only traversal with two editable fields, a passive label, and a button
+    (starting without any mouse click).
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-shared-tab."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared-tab.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line("shared-text tab startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # No mouse click: Tab -> field A (id=1), type "A".
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "text A")
+        wait_for_role_text(client_bin, sock, "outline.title", "Slide TitleA")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Tab -> field B (id=2), type "B".
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "text B")
+        wait_for_role_text(client_bin, sock, "canvas.title", "Slide TitleAB")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=0")
+
+        # Tab skips passive status label (id=3) -> button (id=4), Enter activates once.
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "key enter")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=1")
+
+        # Reverse traversal: Shift+Tab -> field B (id=2) -> type "C", Shift+Tab -> field A (id=1) -> type "D".
+        send_control(proc, reader, "key shift+tab")
+        send_control(proc, reader, "text C")
+        wait_for_role_text(client_bin, sock, "outline.title", "Slide TitleABC")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=3, last_id=2, actions=1")
+
+        send_control(proc, reader, "key shift+tab")
+        send_control(proc, reader, "text D")
+        wait_for_role_text(client_bin, sock, "outline.title", "Slide TitleABCD")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=4, last_id=1, actions=1")
+
+        # Shift+Tab wraps backward from field A (id=1) -> button (id=4), Enter activates once.
+        send_control(proc, reader, "key shift+tab")
+        send_control(proc, reader, "key enter")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=4, last_id=1, actions=2")
+
+        # Tab wraps forward to field A (id=1); during preedit, Tab and Shift+Tab leave composition in A.
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "preedit e")
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "key shift+tab")
+        wait_for_role_text(client_bin, sock, "outline.title", "Slide TitleABCD")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=4, last_id=1, actions=2")
+
+        # Escape cancels preedit -> Tab moves to field B (id=2), text "Z" commits under id=2.
+        send_control(proc, reader, "key escape")
+        send_control(proc, reader, "key tab")
+        send_control(proc, reader, "text Z")
+        wait_for_role_text(client_bin, sock, "canvas.title", "Slide TitleABCDZ")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=5, undo=5, last_id=2, actions=2")
+
+        tab_png = capture_dir / "05-tab-traversal-final.png"
+        send_control(proc, reader, f"screenshot {tab_png}")
+        tw, th, _ = decode_png_rgb(tab_png)
+        print(
+            f"[shared-tab] requested=800x540 captured={tw}x{th}: "
+            f"Tab(A->B->btn:actions=1) -> Shift+Tab(B->A->wrap_btn:actions=2) -> "
+            f"preedit_blocks_tab -> Escape+Tab->B('Slide TitleABCDZ',rev=5,id=2)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
     finally:
         stop_process(proc)
         shutil.rmtree(sock_dir, ignore_errors=True)

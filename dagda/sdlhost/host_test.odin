@@ -1411,6 +1411,219 @@ test_click_field_b_during_field_a_preedit_escape_then_click_b_and_text_input :: 
 }
 
 @(test)
+test_tab_traverses_editable_fields_and_buttons_skips_passive_and_preserves_id_and_preedit :: proc(t: ^testing.T) {
+	Tab_App :: struct {
+		field_a:      string,
+		field_b:      string,
+		last_edit_id: dagda.Object_Id,
+		edit_count:   int,
+		btn_hits:     int,
+		reordered:    bool,
+		editable:     [2]dagda.Object_Id,
+		elements:     [4]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Tab_App) -> dagda.Frame {
+		if !s.reordered {
+			// Declaration order: passive(99), field A(0), passive? no: field A(0), passive(99), field B(2), button(3).
+			s.elements = {
+				{info = {id = 0, role = "field.a"}, kind = .Label, text = s.field_a, bounds = {x = 40, y = 40, width = 300, height = 50}},
+				{info = {id = 99, role = "passive.lbl"}, kind = .Label, text = "Passive", bounds = {x = 40, y = 110, width = 300, height = 40}},
+				{info = {id = 2, role = "field.b"}, kind = .Label, text = s.field_b, bounds = {x = 40, y = 170, width = 300, height = 50}},
+				{info = {id = 3, role = "btn.go"}, kind = .Button, text = "Go", bounds = {x = 40, y = 240, width = 140, height = 50}},
+			}
+		} else {
+			// Reordered frame: button(3), field B(2), passive(99), field A(0) — stable ID must stay focused!
+			s.elements = {
+				{info = {id = 3, role = "btn.go"}, kind = .Button, text = "Go", bounds = {x = 40, y = 240, width = 140, height = 50}},
+				{info = {id = 2, role = "field.b"}, kind = .Label, text = s.field_b, bounds = {x = 40, y = 170, width = 300, height = 50}},
+				{info = {id = 99, role = "passive.lbl"}, kind = .Label, text = "Passive", bounds = {x = 40, y = 110, width = 300, height = 40}},
+				{info = {id = 0, role = "field.a"}, kind = .Label, text = s.field_a, bounds = {x = 40, y = 40, width = 300, height = 50}},
+			}
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Tab_App)(user_data)
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		if id == 0 {
+			delete(s.field_a)
+			s.field_a = cloned
+		} else if id == 2 {
+			delete(s.field_b)
+			s.field_b = cloned
+		} else {
+			delete(cloned)
+			return false
+		}
+		s.last_edit_id = id
+		s.edit_count += 1
+		return true
+	}
+	on_action :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^Tab_App)(user_data)
+		if id == 3 && action == .Activate {
+			s.btn_hits += 1
+			return true
+		}
+		return false
+	}
+
+	s := Tab_App{
+		field_a  = strings.clone("Alpha"),
+		field_b  = strings.clone("Beta"),
+		editable = {0, 2}, // includes Object_Id(0)!
+	}
+	defer {
+		delete(s.field_a)
+		delete(s.field_b)
+	}
+
+	h: Host
+	h.frame = make_frame(&s)
+	h.app = App{
+		user_data = &s,
+		handle    = on_action,
+		text_edit = {
+			enabled   = true,
+			on_commit = on_commit,
+		},
+		editable_text_targets = s.editable[:],
+	}
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	key_ev :: proc(key: sdl.Keycode, mod: sdl.Keymod = {}) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = key
+		ev.key.mod = mod
+		return ev
+	}
+	send_text :: proc(h: ^Host, s: ^Tab_App, text: cstring) {
+		ev: sdl.Event
+		ev.type = .TEXT_INPUT
+		ev.text.text = text
+		tres := text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, s, &ev, h.app.editable_text_targets)
+		if tres.needs_rebuild {
+			dagda.frame_destroy(&h.frame)
+			h.frame = make_frame(s)
+			text_edit_apply_committed(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &tres.pending_edit)
+		}
+	}
+
+	// Start without any mouse click: Tab -> field A (id=0), type "1".
+	tab := key_ev(sdl.K_TAB)
+	shift_tab := key_ev(sdl.K_TAB, sdl.KMOD_LSHIFT)
+	enter := key_ev(sdl.K_RETURN)
+	esc := key_ev(sdl.K_ESCAPE)
+
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(0))
+	testing.expect_value(t, h.focus.has_focus, false)
+	send_text(&h, &s, "1")
+	testing.expect_value(t, s.field_a, "Alpha1")
+	testing.expect_value(t, s.last_edit_id, dagda.Object_Id(0))
+
+	// Tab skips passive label(99) -> field B (id=2), type "2".
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.focus.has_focus, false)
+	send_text(&h, &s, "2")
+	testing.expect_value(t, s.field_b, "Beta2")
+	testing.expect_value(t, s.last_edit_id, dagda.Object_Id(2))
+
+	// Tab -> button(3), Enter activates button once.
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, h.focus.has_focus, true)
+	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(3))
+	rebuild, _, _ := host_dispatch_key_event(&h, &enter)
+	testing.expect_value(t, rebuild, true)
+	testing.expect_value(t, s.btn_hits, 1)
+
+	// Tab wraps forward back to field A (id=0).
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(0))
+	testing.expect_value(t, h.focus.has_focus, false)
+
+	// Reverse traversal: Shift+Tab wraps backward from field A(0) -> button(3) -> field B(2) -> field A(0).
+	_, _, _ = host_dispatch_key_event(&h, &shift_tab)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, h.focus.has_focus, true)
+	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(3))
+
+	_, _, _ = host_dispatch_key_event(&h, &shift_tab)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.focus.has_focus, false)
+
+	// Frame rebuild with reordered elements preserves stable active_id (2).
+	s.reordered = true
+	dagda.frame_destroy(&h.frame)
+	h.frame = make_frame(&s)
+	_ = focus_reconcile(&h.focus, h.frame)
+	text_edit_reconcile(&h.text_edit, nil, nil, h.frame, h.app.text_edit, h.app.editable_text_targets)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.focus.has_focus, false)
+	s.reordered = false
+	dagda.frame_destroy(&h.frame)
+	h.frame = make_frame(&s)
+	text_edit_reconcile(&h.text_edit, nil, nil, h.frame, h.app.text_edit, h.app.editable_text_targets)
+
+	// Active preedit in field B(2) with selection: Tab and Shift+Tab leave focus, selection, and preedit in B.
+	h.text_edit.session.anchor = 0
+	h.text_edit.session.caret = 4
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "café"
+	pre.edit.start = 0
+	pre.edit.length = 4
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &s, &pre, h.app.editable_text_targets)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	_, _, _ = host_dispatch_key_event(&h, &shift_tab)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "café")
+
+	// Escape cancels preedit -> Tab traversal works again (B(2) -> button(3)).
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), false)
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, h.focus.has_focus, true)
+	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(3))
+
+	// Commit also re-enables traversal: Shift+Tab -> B(2), compose "e", commit "é", then Tab -> button(3).
+	_, _, _ = host_dispatch_key_event(&h, &shift_tab)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	pre.edit.text = "e"
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &s, &pre, h.app.editable_text_targets)
+	send_text(&h, &s, "é")
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), false)
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, h.focus.has_focus, true)
+	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(3))
+}
+
+@(test)
 test_canvas_editable_text_click_places_caret_at_two_viewports :: proc(t: ^testing.T) {
 	font: Font
 	if !font_init(&font) {

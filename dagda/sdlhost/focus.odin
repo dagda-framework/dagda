@@ -16,6 +16,10 @@ is_focusable :: proc(el: dagda.Resolved_Element) -> bool {
 	return .Activate in el.actions
 }
 
+is_tab_target :: proc(el: dagda.Resolved_Element, cfg: Editable_Text_Config, targets: []dagda.Object_Id) -> bool {
+	return is_focusable(el) || text_edit_is_target(cfg, targets, el.info.id)
+}
+
 focus_cancel_pending_space :: proc(f: ^Focus_State) -> bool {
 	if !f.has_space_pending {
 		return false
