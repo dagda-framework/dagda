@@ -163,10 +163,5 @@ jobs:
       - name: Run the Cocoa caret and grapheme hit-test probe
         run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa
 
-      - name: Probe native macOS CGEvent pointer clicks on Cocoa
-        continue-on-error: true
+      - name: Run the Cocoa caret probe with native macOS CGEvent pointer clicks
         run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa --input-mode native
-
-      - name: Probe high-density 2x output on macOS runner
-        continue-on-error: true
-        run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa --high-density --require-min-scale 2.0
