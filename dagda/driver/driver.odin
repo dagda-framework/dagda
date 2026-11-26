@@ -105,13 +105,27 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 	if has_canvas {
 		// visible_canvas_bounds is the read-only intersection of
 		// the element's canvas rectangle with the canvas sheet,
-		// or null when that intersection has no area.
-		vis_x := max(el.canvas_bounds.x, f32(0))
-		vis_y := max(el.canvas_bounds.y, f32(0))
-		vis_right := min(el.canvas_bounds.x + el.canvas_bounds.width, canvas.width)
-		vis_bottom := min(el.canvas_bounds.y + el.canvas_bounds.height, canvas.height)
+		// or null when that intersection has no area. On any axis
+		// that fits inside the sheet, the declared origin and
+		// size are preserved exactly, even when the other axis
+		// is clipped.
+		cb := el.canvas_bounds
+		vis_x, vis_w: f32
+		if cb.x >= 0 && cb.x + cb.width <= canvas.width {
+			vis_x, vis_w = cb.x, cb.width
+		} else {
+			vis_x = max(cb.x, f32(0))
+			vis_w = min(cb.x + cb.width, canvas.width) - vis_x
+		}
+		vis_y, vis_h: f32
+		if cb.y >= 0 && cb.y + cb.height <= canvas.height {
+			vis_y, vis_h = cb.y, cb.height
+		} else {
+			vis_y = max(cb.y, f32(0))
+			vis_h = min(cb.y + cb.height, canvas.height) - vis_y
+		}
 		strings.write_string(b, ",\"visible_canvas_bounds\":")
-		if vis_right <= vis_x || vis_bottom <= vis_y {
+		if vis_w <= 0 || vis_h <= 0 {
 			strings.write_string(b, "null")
 		} else {
 			strings.write_string(b, "{\"x\":")
@@ -119,9 +133,9 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 			strings.write_string(b, ",\"y\":")
 			write_f32_exact(b, vis_y)
 			strings.write_string(b, ",\"width\":")
-			write_f32_exact(b, vis_right - vis_x)
+			write_f32_exact(b, vis_w)
 			strings.write_string(b, ",\"height\":")
-			write_f32_exact(b, vis_bottom - vis_y)
+			write_f32_exact(b, vis_h)
 			strings.write_byte(b, '}')
 		}
 		strings.write_string(b, ",\"canvas_bounds\":{\"x\":")

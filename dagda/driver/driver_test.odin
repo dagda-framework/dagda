@@ -413,6 +413,8 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 			{info = {id = 3, role = "fractional"}, kind = .Label, text = "Frac", bounds = {x = 93.125, y = -40, width = 200.0625, height = 620}},
 			{info = {id = 4, role = "edge"}, kind = .Label, text = "Edge", bounds = {x = 960, y = 100, width = 50, height = 50}},
 			{info = {id = 5, role = "outside"}, kind = .Label, text = "Out", bounds = {x = 1000, y = 600, width = 50, height = 50}},
+			{info = {id = 6, role = "tiny1"}, kind = .Label, text = "Tiny1", bounds = {x = 900, y = 10, width = 0.1, height = 50}},
+			{info = {id = 7, role = "tiny2"}, kind = .Label, text = "Tiny2", bounds = {x = 900, y = 100, width = 0.00001, height = 50}},
 		},
 	}
 	frame, ok := dagda.resolve_canvas(canvas, {width = 1200, height = 540})
@@ -425,6 +427,9 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":480,"width":60,"height":60}`))
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":10,"y":10,"width":100,"height":50}`))
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":93.125,"y":0,"width":200.0625,"height":540}`))
+	// Fully contained tiny widths are preserved exactly.
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":10,"width":0.1,"height":50}`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":100,"width":1e-05,"height":50}`))
 	// Edge-touching and entirely outside objects report null (twice).
 	testing.expect_value(t, strings.count(rep, `"visible_canvas_bounds":null`), 2)
 	// Existing fields are still present.

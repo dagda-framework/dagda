@@ -4,6 +4,7 @@ two window sizes: the logical-canvas intersection is identical,
 only the window bounds change with the viewport."""
 import json
 import os
+import select
 import shutil
 import subprocess
 import tempfile
@@ -22,7 +23,23 @@ def run_size(host, client_bin, tmp, width, height):
     proc = subprocess.Popen([str(host), str(sock), str(width), str(height)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=ROOT)
     try:
-        assert proc.stdout.readline().strip() == f"Listening {sock}"
+        # Bounded startup read: one monotonic deadline for the
+        # complete line, and a stalled child is reaped below.
+        fd = proc.stdout.fileno()
+        buf = b""
+        deadline = time.monotonic() + 10
+        while b"\n" not in buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise AssertionError("timed out waiting for visible-host startup")
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                raise AssertionError("timed out waiting for visible-host startup")
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                raise AssertionError("visible-host closed stdout")
+            buf += chunk
+        assert buf.decode().strip() == f"Listening {sock}"
         r = subprocess.run([str(client_bin), str(sock), "inspect", "clipped"],
                            capture_output=True, text=True, timeout=15)
         assert r.returncode == 0, (r.stdout, r.stderr)
@@ -31,8 +48,13 @@ def run_size(host, client_bin, tmp, width, height):
         assert el["canvas_bounds"] == {"x": 900, "y": 480, "width": 200, "height": 120}, el
         return el["bounds"]
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 def main():
