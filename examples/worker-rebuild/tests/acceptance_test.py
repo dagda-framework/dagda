@@ -120,6 +120,26 @@ class App:
         self.proc.wait(timeout=10)
 
 
+def commit_counts(text):
+    import re as _re
+    a = _re.search(r"commitsA=(\d+)", text)
+    b = _re.search(r"commitsB=(\d+)", text)
+    return (int(a.group(1)) if a else -1, int(b.group(1)) if b else -1)
+
+
+def field_preedit_hits(app, shot):
+    # Count preedit pixels within A's current inspected bounds,
+    # reacquiring the bounds for the matching capture if a
+    # resize moved them between inspect and screenshot.
+    for _ in range(3):
+        bounds = app.inspect("worker.field")["bounds"]
+        app.control(f"screenshot {shot}")
+        after = app.inspect("worker.field")["bounds"]
+        if bounds == after:
+            return count_preedit_pixels(shot, bounds), bounds
+    raise AssertionError("field bounds kept changing across captures")
+
+
 def count_preedit_pixels(path, bounds):
     data = Path(path).read_bytes()
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -212,8 +232,7 @@ def main():
         # worker presentation, before sending any final text.
         # If a rebuild cancelled the composition, this fails.
         shot = app.dir / "after-worker.png"
-        app.control(f"screenshot {shot}")
-        hits = count_preedit_pixels(shot, {"x": 0, "y": 0, "width": 100000, "height": 100000})
+        hits, _field_bounds = field_preedit_hits(app, shot)
         assert hits >= 20, f"composition was lost across the worker rebuild (preedit pixels={hits})"
         print(f"[2] composing field/preedit still active after worker presentation (preedit pixels={hits})")
         # Finish the composition normally at the intended place.
@@ -262,7 +281,7 @@ def main():
 
         # 2b. Borrowed slices refreshed in place: B starts with
         # no rename edit and is not editable. While A composes,
-        # a worker fills the existing slots and requests a
+        # a worker publishes the enable-B flag and requests a
         # rebuild; B's edit becomes discoverable, A's session
         # finishes at its original selection, then B edits.
         mut = App(app_bin, client_bin, tmp, "mutate", {"WORKER_MODE": "request"})
@@ -303,10 +322,8 @@ def main():
             time.sleep(0.02)
         assert discovered is not None and discovered["edits"] == [{"name": "rename", "argument": "text"}], discovered
         # A is still visibly composing after B became discoverable.
-        current_a = mut.inspect("worker.field")["bounds"]
         shot_mut = mut.dir / "composing-after-enable.png"
-        mut.control(f"screenshot {shot_mut}")
-        hits_mut = count_preedit_pixels(shot_mut, {"x": 0, "y": 0, "width": 100000, "height": 100000})
+        hits_mut, current_a = field_preedit_hits(mut, shot_mut)
         assert hits_mut >= 20, f"A stopped composing after the enable-B rebuild (preedit pixels={hits_mut}, bounds={current_a})"
         mut.control("key enter")
         mut.control("text Y")
@@ -315,8 +332,17 @@ def main():
         mut.control("text !")
         assert mut.wait_text("worker.other", "other 0!")["text"] == "other 0!"
         assert mut.inspect("worker.field")["text"] == "FielY"
-        final_present = mut.present.read_text()
-        assert "commitsA=1" in final_present and "commitsB=1" in final_present, final_present
+        # Bound the wait for the final presented B text, then
+        # check both commit counts as complete integers on that
+        # same presentation record.
+        count_deadline = time.monotonic() + 5
+        final_present = ""
+        while time.monotonic() < count_deadline:
+            final_present = mut.present.read_text() if mut.present.exists() else ""
+            if 'other="other 0!"' in final_present:
+                break
+            time.sleep(0.02)
+        assert commit_counts(final_present) == (1, 1), final_present
         print("[2b] in-place slice refresh: B edit discovered during A composition; both fields typed correctly")
         mut.quit()
         apps.remove(mut)
