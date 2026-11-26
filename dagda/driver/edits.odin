@@ -74,6 +74,8 @@ edit_error_reply :: proc(source: Edit_Source, id: dagda.Object_Id, result: dagda
 			}
 		}
 		name = "Stale_Revision"
+	case .Busy_Composing:
+		name = "Busy_Composing"
 	case .Alloc_Failed:
 		name = "Alloc_Failed"
 	case .Not_Handled:

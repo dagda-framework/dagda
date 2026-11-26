@@ -93,6 +93,7 @@ Edit_Result :: enum {
 	Unknown_Edit,
 	Wrong_Argument,
 	Stale_Revision,
+	Busy_Composing,
 	Alloc_Failed,
 	Not_Handled,
 }
