@@ -108,6 +108,13 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/shared-text/tests/e2e_shared_text.py build/shared-text-capture
 
+      - name: Run the multiline text acceptance test
+        env:
+          MULTILINE: "1"
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/multiline-text/tests/e2e_multiline_text.py
+
       - name: Run the composition conflict test
         env:
           SDL_VIDEODRIVER: dummy

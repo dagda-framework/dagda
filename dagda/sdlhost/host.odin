@@ -106,6 +106,16 @@ App :: struct {
 	// its advertised edits (the edits operation, which also
 	// requires the app to recognize the ID in revision_of).
 	editable_text_targets: []dagda.Object_Id,
+	// Optional list of editable element IDs that opt into hard-line-break
+	// multiline editing. Listing an ID here alone does not enable editing:
+	// the ID must also be eligible through text_edit.enabled and either
+	// editable_text_targets or the single-target fallback text_edit.target_id.
+	// An empty slice keeps single-line behavior for all editable fields.
+	// Borrowed under the same slice-borrowing contract as edits and
+	// editable_text_targets: pass the slice once, keep its backing array valid
+	// until run returns, and refresh entries only from the host-thread builder.
+	// Object ID 0 is a valid ID.
+	multiline_text_targets: []dagda.Object_Id,
 	// Called on the host thread with the visual field ID (which may be zero).
 	// true marks the first active preedit. Updates keep the same start. false
 	// closes it on cancellation, focus loss, field removal, or shutdown.
@@ -209,11 +219,10 @@ Host :: struct {
 	text_edit:     Text_Edit_State,
 	lshift_held:   bool,
 	rshift_held:   bool,
-	clipboard:     Clipboard,
-	mem_clipboard: Memory_Clipboard,
-	edit_cstr_buf: [256]u8,
-	text_cstr_buf: [256]u8,
-	needs_redraw:  bool,
+	clipboard:            Clipboard,
+	mem_clipboard:        Memory_Clipboard,
+	queued_control_cstrs: [dynamic]cstring,
+	needs_redraw:         bool,
 	rebuild:       Rebuild_Handle,
 	reported_composition: Active_Composition,
 }
@@ -255,7 +264,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	}
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
-	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets)
+	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 	host_report_composition(h, host_active_composition(h))
 	h.needs_redraw = true
 	return true
@@ -510,6 +519,8 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		mod = sdl.KMOD_LSHIFT
 	case "enter":
 		key = sdl.K_RETURN
+	case "kp_enter":
+		key = sdl.K_KP_ENTER
 	case "space":
 		key = sdl.K_SPACE
 	case "escape":
@@ -518,11 +529,21 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		key = sdl.K_LEFT
 	case "right":
 		key = sdl.K_RIGHT
+	case "up":
+		key = sdl.K_UP
+	case "down":
+		key = sdl.K_DOWN
 	case "shift+left":
 		key = sdl.K_LEFT
 		mod = sdl.KMOD_LSHIFT
 	case "shift+right":
 		key = sdl.K_RIGHT
+		mod = sdl.KMOD_LSHIFT
+	case "shift+up":
+		key = sdl.K_UP
+		mod = sdl.KMOD_LSHIFT
+	case "shift+down":
+		key = sdl.K_DOWN
 		mod = sdl.KMOD_LSHIFT
 	case "home":
 		key = sdl.K_HOME
@@ -1024,7 +1045,7 @@ host_step_keyboard_focus :: proc(h: ^Host, backward: bool) -> bool {
 	next_el := h.frame.elements[next_idx]
 	if text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, next_el.info.id) {
 		c1 := focus_clear(&h.focus)
-		c2 := text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, next_el.info.id, h.app.editable_text_targets)
+		c2 := text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, next_el.info.id, h.app.editable_text_targets, h.app.multiline_text_targets)
 		return c1 || c2
 	}
 
@@ -1078,7 +1099,7 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
-	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard)
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
 	if tres.needs_redraw {
 		h.needs_redraw = true
 	}
@@ -1133,7 +1154,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	#partial switch ev.type {
 	case .MOUSE_MOTION:
 		if h.text_edit.dragging {
-			if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.motion.x, h.app.editable_text_targets) {
+			if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.motion.x, h.app.editable_text_targets, ev.motion.y, h.app.multiline_text_targets) {
 				h.needs_redraw = true
 			}
 		}
@@ -1158,7 +1179,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 			if h.app.text_edit.enabled {
 				if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
 					_ = focus_clear(&h.focus)
-					started, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets, host_shift_down(h))
+					started, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets, host_shift_down(h), ev.button.y, h.app.multiline_text_targets)
 					if changed {
 						h.needs_redraw = true
 					}
@@ -1202,7 +1223,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	case .MOUSE_BUTTON_UP:
 		if ev.button.button == sdl.BUTTON_LEFT {
 			if h.text_edit.dragging {
-				if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.button.x, h.app.editable_text_targets) {
+				if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.button.x, h.app.editable_text_targets, ev.button.y, h.app.multiline_text_targets) {
 					h.needs_redraw = true
 				}
 				text_edit_drag_end(&h.text_edit)
@@ -1281,6 +1302,10 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
 	}
 	defer memory_clipboard_destroy(&h.mem_clipboard)
+	defer {
+		host_clear_control_cstrs(&h)
+		delete(h.queued_control_cstrs)
+	}
 	defer sdl.DestroyWindow(h.window)
 	defer sdl.DestroyRenderer(h.renderer)
 	// Release cached glyph textures before DestroyRenderer frees the renderer.
@@ -1355,7 +1380,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
-					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets)
+					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
 					host_report_composition(&h, host_active_composition(&h))
 					if tres.needs_redraw {
 						h.needs_redraw = true
@@ -1368,7 +1393,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							exit_code = 1
 							running = false
 						} else if tres.has_pending_edit {
-							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 						}
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
@@ -1381,7 +1406,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 							exit_code = 1
 							running = false
 						} else if has_pending_edit {
-							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &pending_edit)
+							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 						}
 					}
 				}
@@ -1389,6 +1414,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					break
 				}
 			}
+			host_clear_control_cstrs(&h)
 		}
 
 		if running && srv.active {

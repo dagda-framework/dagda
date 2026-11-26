@@ -25,6 +25,7 @@ Text_Session :: struct {
 	preedit_start:  int, // rune index into preedit
 	preedit_length: int, // runes
 	composing:      bool,
+	multiline:      bool,
 	allocator:      mem.Allocator,
 }
 
@@ -65,8 +66,8 @@ edit_destroy :: proc(session: ^Text_Session, edit: ^Text_Edit) {
 	edit^ = {}
 }
 
-text_session_init :: proc(session: ^Text_Session, committed: string, allocator := context.allocator) {
-	session^ = {caret = len(committed), anchor = len(committed), allocator = allocator}
+text_session_init :: proc(session: ^Text_Session, committed: string, allocator := context.allocator, multiline := false) {
+	session^ = {caret = len(committed), anchor = len(committed), multiline = multiline, allocator = allocator}
 }
 
 text_session_destroy :: proc(session: ^Text_Session) {
@@ -177,6 +178,26 @@ move_right :: proc(session: ^Text_Session, committed: string, extend_selection :
 	}
 }
 
+line_start_offset :: proc(s: string, offset: int) -> int {
+	pos := clamp(offset, 0, len(s))
+	for i := pos - 1; i >= 0; i -= 1 {
+		if s[i] == '\n' {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+line_end_offset :: proc(s: string, offset: int) -> int {
+	pos := clamp(offset, 0, len(s))
+	for i := pos; i < len(s); i += 1 {
+		if s[i] == '\n' {
+			return i
+		}
+	}
+	return len(s)
+}
+
 move_home :: proc(session: ^Text_Session, extend_selection := false) {
 	session.caret = 0
 	if !extend_selection {
@@ -186,6 +207,28 @@ move_home :: proc(session: ^Text_Session, extend_selection := false) {
 
 move_end :: proc(session: ^Text_Session, committed: string, extend_selection := false) {
 	session.caret = len(committed)
+	if !extend_selection {
+		session.anchor = session.caret
+	}
+}
+
+move_line_home :: proc(session: ^Text_Session, committed: string, extend_selection := false) {
+	if session.multiline {
+		session.caret = line_start_offset(committed, session.caret)
+	} else {
+		session.caret = 0
+	}
+	if !extend_selection {
+		session.anchor = session.caret
+	}
+}
+
+move_line_end :: proc(session: ^Text_Session, committed: string, extend_selection := false) {
+	if session.multiline {
+		session.caret = line_end_offset(committed, session.caret)
+	} else {
+		session.caret = len(committed)
+	}
 	if !extend_selection {
 		session.anchor = session.caret
 	}
@@ -219,6 +262,42 @@ valid_single_line :: proc(s: string) -> bool {
 	return true
 }
 
+valid_multiline :: proc(s: string) -> bool {
+	if !utf8.valid_string(s) {
+		return false
+	}
+	for i in 0 ..< len(s) {
+		if s[i] == '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+valid_text_for_session :: proc(session: ^Text_Session, s: string) -> bool {
+	return session != nil && session.multiline ? valid_multiline(s) : valid_single_line(s)
+}
+
+// normalize_multiline_newlines converts CRLF and lone CR sequences to LF.
+// Returns (normalized, ok). Caller owns the returned string.
+normalize_multiline_newlines :: proc(s: string, allocator := context.allocator) -> (string, bool) {
+	b, err := strings.builder_make(0, len(s), allocator)
+	if err != nil {
+		return "", false
+	}
+	for i := 0; i < len(s); i += 1 {
+		if s[i] == '\r' {
+			if i + 1 < len(s) && s[i + 1] == '\n' {
+				i += 1
+			}
+			strings.write_byte(&b, '\n')
+		} else {
+			strings.write_byte(&b, s[i])
+		}
+	}
+	return strings.to_string(b), true
+}
+
 // replace_range proposes replacing committed[start:end] with
 // inserted. Inputs are validated before any slicing, the
 // allocation result is checked, and the session is not mutated:
@@ -227,7 +306,7 @@ valid_single_line :: proc(s: string) -> bool {
 // lands after the whole formed character) takes effect only
 // when the app accepts the edit with apply_edit.
 replace_range :: proc(session: ^Text_Session, committed: string, start, end: int, inserted: string) -> Text_Edit {
-	if !valid_single_line(committed) || !valid_single_line(inserted) {
+	if !valid_text_for_session(session, committed) || !valid_text_for_session(session, inserted) {
 		return {caret = session.caret, err = .Invalid_Input}
 	}
 	if start < 0 || end < start || end > len(committed) {
