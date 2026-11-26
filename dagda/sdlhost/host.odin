@@ -38,6 +38,12 @@ App :: struct {
 	// Optional list of editable element IDs when multiple distinct single-line
 	// elements share text_edit; when empty, text_edit.target_id is used.
 	editable_text_targets: []dagda.Object_Id,
+	// Called on the host thread with the visual field ID (which may be zero).
+	// true marks the first active preedit. Updates keep the same start. false
+	// closes it on cancellation, focus loss, field removal, or shutdown.
+	// On commit, the callback runs after on_commit returns and only if the
+	// composition has ended. A rejected edit can keep composing and retry.
+	on_composition: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool),
 }
 
 Run_Options :: struct {
@@ -111,6 +117,22 @@ Host :: struct {
 	edit_cstr_buf: [256]u8,
 	text_cstr_buf: [256]u8,
 	needs_redraw:  bool,
+	reported_composition: Active_Composition,
+}
+
+@(private="package")
+host_report_composition :: proc(h: ^Host, current: Active_Composition) {
+	previous := h.reported_composition
+	if previous == current || h.app.on_composition == nil {
+		return
+	}
+	h.reported_composition = current
+	if previous.active {
+		h.app.on_composition(h.app.user_data, previous.field_id, false)
+	}
+	if current.active {
+		h.app.on_composition(h.app.user_data, current.field_id, true)
+	}
 }
 
 host_rebuild_frame :: proc(h: ^Host) -> bool {
@@ -136,6 +158,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
 	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets)
+	host_report_composition(h, host_active_composition(h))
 	h.needs_redraw = true
 	return true
 }
@@ -749,6 +772,7 @@ host_shift_down :: proc(h: ^Host) -> bool {
 // Shift+Tab traversal across editable fields and buttons, app-level Ctrl+Z
 // when the text field is not focused, and button keyboard activation.
 host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
+	defer host_report_composition(h, host_active_composition(h))
 	#partial switch ev.type {
 	case .KEY_DOWN:
 		if ev.key.key == sdl.K_LSHIFT {
@@ -824,6 +848,7 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 // hover tracking, and ordinary element activation. Returns false if a frame
 // rebuild failed so the host exits through its normal failure path.
 host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
+	defer host_report_composition(h, host_active_composition(h))
 	#partial switch ev.type {
 	case .MOUSE_MOTION:
 		if h.text_edit.dragging {
@@ -970,6 +995,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer font_destroy_textures(&h.font)
 	defer text_edit_destroy(&h.text_edit)
 	defer dagda.frame_destroy(&h.frame)
+	defer host_report_composition(&h, {})
 
 	if !host_rebuild_frame(&h) {
 		return 1
@@ -1010,6 +1036,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
 					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets)
+					host_report_composition(&h, host_active_composition(&h))
 					if tres.needs_redraw {
 						h.needs_redraw = true
 					}
