@@ -96,22 +96,52 @@ Text_Edit_Result :: struct {
 
 TEXT_EDIT_CARET_WIDTH :: f32(2)
 
+// text_edit_visible_rect intersects rect with the fitted canvas bounds when
+// frame.has_canvas is true, returning the actually visible window-space rect
+// of an editable field.
+text_edit_visible_rect :: proc(frame: dagda.Frame, rect: dagda.Rect) -> dagda.Rect {
+	if !frame.has_canvas {
+		return rect
+	}
+	t := frame.transform
+	fitted_x0 := t.offset.x
+	fitted_y0 := t.offset.y
+	fitted_x1 := t.offset.x + t.canvas.width * t.scale
+	fitted_y1 := t.offset.y + t.canvas.height * t.scale
+	x0 := max(rect.x, fitted_x0)
+	y0 := max(rect.y, fitted_y0)
+	x1 := min(rect.x + rect.width, fitted_x1)
+	y1 := min(rect.y + rect.height, fitted_y1)
+	return {
+		x      = x0,
+		y      = y0,
+		width  = max(x1 - x0, 0),
+		height = max(y1 - y0, 0),
+	}
+}
+
 // text_edit_layout returns the exact rendered text origin and pixel height
-// shared by painting and font_hit_test_caret for an editable single-line label.
+// shared by painting, click/drag hit-testing, scrolling, and IME candidate
+// placement, sized to the actually visible field interior.
 text_edit_layout :: proc(frame: dagda.Frame, rect: dagda.Rect) -> (text_x: f32, text_y: f32, px: f32) {
 	text_scale: f32 = frame.has_canvas ? clamp(frame.transform.scale, 0.4, 2.0) : 1.0
 	px = max(24 * text_scale, 12)
 	pad_x := max(16 * text_scale, 10)
-	text_x = rect.x + pad_x
+	vis := text_edit_visible_rect(frame, rect)
+	pad := min(pad_x, max((vis.width - TEXT_EDIT_CARET_WIDTH) * 0.5, 0))
+	text_x = vis.x + pad
 	text_y = rect.y + (rect.height - px) * 0.5
 	return
 }
 
-// text_edit_view_width returns the horizontal visible text width inside rect.
+// text_edit_view_width returns the horizontal visible text width inside the
+// actually visible field interior of rect.
 text_edit_view_width :: proc(frame: dagda.Frame, rect: dagda.Rect) -> f32 {
 	text_scale: f32 = frame.has_canvas ? clamp(frame.transform.scale, 0.4, 2.0) : 1.0
 	pad_x := max(16 * text_scale, 10)
-	return max(rect.width - 2 * pad_x, 0)
+	vis := text_edit_visible_rect(frame, rect)
+	pad := min(pad_x, max((vis.width - TEXT_EDIT_CARET_WIDTH) * 0.5, 0))
+	return max(vis.width - 2 * pad, 0)
 }
 
 text_edit_scroll_x :: proc(te: ^Text_Edit_State, id: dagda.Object_Id) -> f32 {
@@ -256,11 +286,12 @@ text_edit_update_ime_area :: proc(
 	if !found {
 		return
 	}
+	vis := text_edit_visible_rect(frame, el.bounds)
 	area := sdl.Rect{
-		x = c.int(math.floor(el.bounds.x)),
-		y = c.int(math.floor(el.bounds.y)),
-		w = max(c.int(math.ceil(el.bounds.width)), 1),
-		h = max(c.int(math.ceil(el.bounds.height)), 1),
+		x = c.int(math.floor(vis.x)),
+		y = c.int(math.floor(vis.y)),
+		w = max(c.int(math.ceil(vis.width)), 1),
+		h = max(c.int(math.ceil(vis.height)), 1),
 	}
 	caret_x := text_edit_caret_x(te, font, frame, el.bounds, el.text)
 	cursor := c.int(math.round(caret_x)) - area.x
@@ -443,11 +474,12 @@ text_edit_drag_move :: proc(
 		return false
 	}
 	text_x, _, px := text_edit_layout(frame, el.bounds)
+	vis := text_edit_visible_rect(frame, el.bounds)
 	scroll := text_edit_clamped_scroll(te, font, frame, te.drag_target_id, el.bounds, el.text, true)
 	offset: int
-	if move_x <= el.bounds.x {
+	if move_x <= vis.x {
 		offset = 0
-	} else if move_x >= el.bounds.x + el.bounds.width {
+	} else if move_x >= vis.x + vis.width {
 		offset = len(el.text)
 	} else {
 		offset = font_hit_test_caret(font, el.text, px, move_x - (text_x - scroll))
@@ -482,6 +514,34 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	return true
 }
 
+text_edit_prune_scroll_offsets :: proc(
+	te: ^Text_Edit_State,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id = nil,
+) {
+	if len(te.scroll_offsets) == 0 {
+		return
+	}
+	if !cfg.enabled {
+		clear(&te.scroll_offsets)
+		return
+	}
+	stale := make([dynamic]dagda.Object_Id, 0, len(te.scroll_offsets), context.temp_allocator)
+	for id in te.scroll_offsets {
+		if !text_edit_is_target(cfg, targets, id) {
+			append(&stale, id)
+			continue
+		}
+		if _, found := dagda.find(frame, id); !found {
+			append(&stale, id)
+		}
+	}
+	for id in stale {
+		delete_key(&te.scroll_offsets, id)
+	}
+}
+
 text_edit_reconcile :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
@@ -490,6 +550,7 @@ text_edit_reconcile :: proc(
 	cfg: Editable_Text_Config,
 	targets: []dagda.Object_Id = nil,
 ) {
+	text_edit_prune_scroll_offsets(te, frame, cfg, targets)
 	if !te.focused {
 		return
 	}

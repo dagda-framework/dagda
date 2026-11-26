@@ -673,7 +673,6 @@ poll_control_stdin :: proc(
 			fmt.printf("CONTROL_OK screenshot=%s\n", path)
 			_ = os.flush(os.stdout)
 		} else if line == "ime-area" {
-			text_edit_update_ime_area(&h.text_edit, h.window, &h.font, h.frame, h.app.text_edit)
 			area: sdl.Rect
 			cursor: c.int
 			if sdl.GetTextInputArea(h.window, &area, &cursor) {

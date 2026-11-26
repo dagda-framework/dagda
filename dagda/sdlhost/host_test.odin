@@ -3275,6 +3275,308 @@ test_narrow_field_horizontal_scroll_home_end_click_drag_ime_and_independent_view
 	}
 }
 
+@(test)
+test_partly_visible_left_and_right_clipped_fields_scroll_click_and_ime :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		return
+	}
+	defer sdl.Quit()
+
+	window: ^sdl.Window
+	renderer: ^sdl.Renderer
+	if !sdl.CreateWindowAndRenderer("clipped-scroll-test", 960, 540, {}, &window, &renderer) {
+		return
+	}
+	defer sdl.DestroyWindow(window)
+	defer sdl.DestroyRenderer(renderer)
+
+	Clip_App :: struct {
+		title:    string,
+		rev:      u64,
+		editable: [2]dagda.Object_Id,
+		elements: [2]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Clip_App)(user_data)
+		s.elements = {
+			// Right-clipped on 960x540 sheet: x=860, width=220 -> 100 visible pixels [860, 960].
+			{info = {id = 1, role = "right.clipped"}, kind = .Label, text = s.title, bounds = {x = 860, y = 60, width = 220, height = 60}},
+			// Left-clipped on 960x540 sheet: x=-80, width=220 -> 140 visible pixels [0, 140].
+			{info = {id = 2, role = "left.clipped"}, kind = .Label, text = s.title, bounds = {x = -80, y = 160, width = 220, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Clip_App)(user_data)
+		if id != 1 && id != 2 {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.title)
+		s.title = cloned
+		s.rev += 1
+		return true
+	}
+
+	s := Clip_App{
+		title    = strings.clone("0123456789 Long Title Cafe\u0301X"),
+		editable = {1, 2},
+	}
+	defer delete(s.title)
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	defer font_destroy_textures(&h.font)
+	h.window = window
+	h.ime_window = window
+	h.renderer = renderer
+	h.viewport = {width = 960, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		text_edit             = {enabled = true, on_commit = on_commit},
+		editable_text_targets = s.editable[:],
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	count_amber_in_rect :: proc(r: ^sdl.Renderer, x0, y0, x1, y1: i32) -> int {
+		surf := sdl.RenderReadPixels(r, nil)
+		if surf == nil {
+			return 0
+		}
+		defer sdl.DestroySurface(surf)
+		hits := 0
+		for y in y0 ..< y1 {
+			for x in x0 ..< x1 {
+				cr, cg, cb, ca: u8
+				if sdl.ReadSurfacePixel(surf, x, y, &cr, &cg, &cb, &ca) {
+					if abs(int(cr) - 255) <= 8 && abs(int(cg) - 206) <= 8 && abs(int(cb) - 84) <= 8 {
+						hits += 1
+					}
+				}
+			}
+		}
+		return hits
+	}
+
+	// 1. Right-clipped field (id=1): click x=915, press End, begin preedit -> caret & SDL anchor visible inside [860, 960].
+	d: sdl.Event
+	d.type = .MOUSE_BUTTON_DOWN
+	d.button.button = sdl.BUTTON_LEFT
+	d.button.down = true
+	d.button.x = 915
+	d.button.y = 90
+	u := d
+	u.type = .MOUSE_BUTTON_UP
+	u.button.down = false
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+
+	end_ev: sdl.Event
+	end_ev.type = .KEY_DOWN
+	end_ev.key.key = sdl.K_END
+	_, _, _ = host_dispatch_key_event(&h, &end_ev)
+	testing.expect_value(t, s.rev, u64(0))
+
+	el1, _ := dagda.find(h.frame, 1)
+	cx_end := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+	testing.expect(t, cx_end >= 860 && cx_end + TEXT_EDIT_CARET_WIDTH <= 960)
+	area: sdl.Rect
+	cursor: c.int
+	testing.expect(t, sdl.GetTextInputArea(window, &area, &cursor))
+	testing.expect(t, area.x + cursor >= 860 && area.x + cursor <= 960)
+	testing.expect(t, abs((area.x + cursor) - c.int(math.round(cx_end))) <= 1)
+
+	host_draw(&h)
+	testing.expect(t, count_amber_in_rect(renderer, 860, 60, 960, 120) >= 10)
+
+	// Begin preedit at right-clipped End -> caret & SDL anchor remain visible inside [860, 960].
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "abcdef"
+	pre.edit.start = 6
+	pre.edit.length = 0
+	_ = text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:])
+	cx_pre := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+	testing.expect(t, cx_pre >= 860 && cx_pre + TEXT_EDIT_CARET_WIDTH <= 960)
+	testing.expect(t, sdl.GetTextInputArea(window, &area, &cursor))
+	testing.expect(t, area.x + cursor >= 860 && area.x + cursor <= 960)
+	testing.expect(t, abs((area.x + cursor) - c.int(math.round(cx_pre))) <= 1)
+	host_draw(&h)
+	testing.expect(t, count_amber_in_rect(renderer, 860, 60, 960, 120) >= 10)
+
+	// Cancel preedit, press Home -> caret visible at left side of [860, 960], rev unchanged.
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+	home_ev: sdl.Event
+	home_ev.type = .KEY_DOWN
+	home_ev.key.key = sdl.K_HOME
+	_, _, _ = host_dispatch_key_event(&h, &home_ev)
+	testing.expect_value(t, s.rev, u64(0))
+	cx_home := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el1.bounds, s.title)
+	testing.expect(t, cx_home >= 860 && cx_home <= 900)
+
+	// Press End, click beside visible decomposed é ("Cafe\u0301|X"), type "!" -> exact UTF-8 bytes.
+	_, _, _ = host_dispatch_key_event(&h, &end_ev)
+	tx1, _, px1 := text_edit_layout(h.frame, el1.bounds)
+	scroll1 := text_edit_scroll_x(&h.text_edit, 1)
+	click_x := tx1 - scroll1 + font_measure_width(&h.font, s.title[:len(s.title) - 1], px1)
+	testing.expect(t, click_x >= 860 && click_x <= 960)
+	d.button.x = click_x
+	u.button.x = click_x
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	ti: sdl.Event
+	ti.type = .TEXT_INPUT
+	ti.text.text = "!"
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &ti, s.editable[:])
+	testing.expect_value(t, tres.needs_rebuild, true)
+	testing.expect(t, host_rebuild_frame(&h))
+	text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+	testing.expect_value(t, s.title, "0123456789 Long Title Cafe\u0301!X")
+	testing.expect_value(t, s.rev, u64(1))
+
+	// 2. Left-clipped field (id=2): Home & End both keep caret & SDL anchor visible inside [0, 140],
+	//    and clicking beside visible decomposed é edits the intended bytes.
+	testing.expect(t, text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 2, s.editable[:]))
+	el2, _ := dagda.find(h.frame, 2)
+	_, _, _ = host_dispatch_key_event(&h, &home_ev)
+	cx2_home := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el2.bounds, s.title)
+	testing.expect(t, cx2_home >= 0 && cx2_home <= 40)
+	_, _, _ = host_dispatch_key_event(&h, &end_ev)
+	cx2_end := text_edit_caret_x(&h.text_edit, &h.font, h.frame, el2.bounds, s.title)
+	testing.expect(t, cx2_end >= 0 && cx2_end + TEXT_EDIT_CARET_WIDTH <= 140)
+	testing.expect(t, sdl.GetTextInputArea(window, &area, &cursor))
+	testing.expect(t, area.x + cursor >= 0 && area.x + cursor <= 140)
+	testing.expect_value(t, s.rev, u64(1))
+
+	tx2, _, px2 := text_edit_layout(h.frame, el2.bounds)
+	scroll2 := text_edit_scroll_x(&h.text_edit, 2)
+	// Click right after "Cafe\u0301" (before "!X") inside visible [0, 140].
+	click_x2 := tx2 - scroll2 + font_measure_width(&h.font, s.title[:len(s.title) - 2], px2)
+	testing.expect(t, click_x2 >= 0 && click_x2 <= 140)
+	d.button.x = click_x2
+	d.button.y = 190
+	u.button.x = click_x2
+	u.button.y = 190
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	ti.text.text = "?"
+	tres = text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &ti, s.editable[:])
+	testing.expect_value(t, tres.needs_rebuild, true)
+	testing.expect(t, host_rebuild_frame(&h))
+	text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+	testing.expect_value(t, s.title, "0123456789 Long Title Cafe\u0301?!X")
+	testing.expect_value(t, s.rev, u64(2))
+}
+
+@(test)
+test_scroll_offsets_bounded_on_empty_frame_blur_ineligible_and_replacements :: proc(t: ^testing.T) {
+	Prune_App :: struct {
+		active_id: dagda.Object_Id,
+		empty:     bool,
+		eligible:  bool,
+		title:     string,
+		targets:   [1]dagda.Object_Id,
+		elements:  [1]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Prune_App)(user_data)
+		if s.empty {
+			return {size = {width = 960, height = 540}, elements = nil}
+		}
+		s.elements = {
+			{info = {id = s.active_id, role = "dyn.field"}, kind = .Label, text = s.title, bounds = {x = 40, y = 60, width = 200, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+
+	s := Prune_App{
+		active_id = 1,
+		eligible  = true,
+		title     = "0123456789 Long Scrollable Title For Lifetime Pruning Test",
+		targets   = {1},
+	}
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		text_edit             = {enabled = true},
+		editable_text_targets = s.targets[:],
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	end_ev: sdl.Event
+	end_ev.type = .KEY_DOWN
+	end_ev.key.key = sdl.K_END
+
+	// 1. Focus + End -> scroll entry created for id=1.
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 1, h.app.editable_text_targets))
+	_, _, _ = host_dispatch_key_event(&h, &end_ev)
+	saved_scroll := text_edit_scroll_x(&h.text_edit, 1)
+	testing.expect(t, saved_scroll > 50)
+	testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
+
+	// 2. Surviving field temporarily loses focus -> scroll entry is preserved across reconcile.
+	testing.expect(t, text_edit_blur(&h.text_edit, nil))
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
+	testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 1), saved_scroll)
+
+	// 3. Reconcile to an empty frame -> stale entry released immediately.
+	s.empty = true
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, len(h.text_edit.scroll_offsets), 0)
+
+	// 4. Restore field, scroll again, then mark ineligible -> entry released immediately.
+	s.empty = false
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 1, h.app.editable_text_targets))
+	_, _, _ = host_dispatch_key_event(&h, &end_ev)
+	testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
+
+	h.app.text_edit.enabled = false
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, len(h.text_edit.scroll_offsets), 0)
+	h.app.text_edit.enabled = true
+
+	// 5. Repeated replacements across 50 distinct IDs in one live window stay bounded to 1 entry.
+	for next_id in dagda.Object_Id(100) ..< dagda.Object_Id(150) {
+		s.active_id = next_id
+		s.targets[0] = next_id
+		testing.expect(t, host_rebuild_frame(&h))
+		testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, next_id, h.app.editable_text_targets))
+		_, _, _ = host_dispatch_key_event(&h, &end_ev)
+		testing.expect(t, text_edit_scroll_x(&h.text_edit, next_id) > 50)
+		testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
+	}
+}
+
 Failed_Start_State :: struct {
 	ready_calls:   int,
 	second_result: Rebuild_Result,

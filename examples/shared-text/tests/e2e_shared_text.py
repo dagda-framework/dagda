@@ -312,8 +312,16 @@ def main() -> int:
 
         # Initial capture to let any compositor map/resize settle.
         init_png = capture_dir / "00-init.png"
-        send_control(proc, reader, f"screenshot {init_png}")
-        png_w, png_h, rgb0 = decode_png_rgb(init_png)
+        prev_dims = None
+        png_w = png_h = 0
+        rgb0 = bytearray()
+        for _ in range(10):
+            send_control(proc, reader, f"screenshot {init_png}")
+            png_w, png_h, rgb0 = decode_png_rgb(init_png)
+            if prev_dims == (png_w, png_h):
+                break
+            prev_dims = (png_w, png_h)
+            time.sleep(0.05)
 
         code1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
         code2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
