@@ -34,6 +34,10 @@ State :: struct {
 	builder_tid:   u64,
 	built_label:   [64]u8,
 	built_len:     int,
+	other_buf:     [64]u8,
+	other_len:     int,
+	stop:          bool,
+	stale_worker:  ^thread.Thread,
 	elements:      [3]dagda.Element,
 	present_path:  string,
 	result_path:   string,
@@ -64,13 +68,14 @@ app_view :: proc(user_data: rawptr) -> dagda.View {
 	label := fmt.bprintf(s.built_label[:], "%s", s.label)
 	s.built_len = len(label)
 	s.builder_tid = u64(sdl.GetCurrentThreadID())
-	other := s.other
+	other_text := fmt.bprintf(s.other_buf[:], "%s", s.other)
+	s.other_len = len(other_text)
 	field := s.field
 	sync.mutex_unlock(&s.mu)
 	s.elements = {
 		{info = {id = 1, role = "worker.label"}, kind = .Label, text = string(s.built_label[:s.built_len])},
 		{info = {id = 2, role = "worker.field"}, kind = .Label, text = field},
-		{info = {id = 3, role = "worker.other"}, kind = .Label, text = other},
+		{info = {id = 3, role = "worker.other"}, kind = .Label, text = string(s.other_buf[:s.other_len])},
 	}
 	return {elements = s.elements[:]}
 }
@@ -78,7 +83,7 @@ app_view :: proc(user_data: rawptr) -> dagda.View {
 app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
-	text := fmt.tprintf("present label=%q other=%q builder=%d host=%d\n", string(s.built_label[:s.built_len]), s.other, s.builder_tid, s.host_tid)
+	text := fmt.tprintf("present label=%q other=%q builder=%d host=%d\n", string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -101,6 +106,12 @@ worker_main :: proc(data: rawptr) {
 	s := (^State)(data)
 	// Wait for the trigger file so the test controls timing.
 	for i in 0 ..< 500 {
+		sync.mutex_lock(&s.mu)
+		stopped := s.stop
+		sync.mutex_unlock(&s.mu)
+		if stopped {
+			return
+		}
 		if os.exists(s.trigger_path) {
 			break
 		}
@@ -123,6 +134,12 @@ worker_main :: proc(data: rawptr) {
 	// "other", ...), publishing and requesting per trigger.
 	last := ""
 	for i in 0 ..< 3000 {
+		sync.mutex_lock(&s.mu)
+		stopped := s.stop
+		sync.mutex_unlock(&s.mu)
+		if stopped {
+			return
+		}
 		data_bytes, read_err := os.read_entire_file(s.trigger_path, context.temp_allocator)
 		if read_err == nil && len(data_bytes) > 0 {
 			trigger := string(data_bytes)
@@ -142,6 +159,12 @@ worker_main :: proc(data: rawptr) {
 stale_live_worker :: proc(data: rawptr) {
 	s := (^State)(data)
 	for i in 0 ..< 500 {
+		sync.mutex_lock(&s.mu)
+		stopped := s.stop
+		sync.mutex_unlock(&s.mu)
+		if stopped {
+			return
+		}
 		if os.exists(s.trigger_path) {
 			break
 		}
@@ -155,7 +178,7 @@ app_ready :: proc(user_data: rawptr, handle: sdlhost.Rebuild_Handle) {
 	s := (^State)(user_data)
 	s.handle = handle
 	if s.runs == 1 {
-		_ = thread.create_and_start_with_data(s, stale_live_worker)
+		s.stale_worker = thread.create_and_start_with_data(s, stale_live_worker)
 		return
 	}
 	s.host_tid = u64(sdl.GetCurrentThreadID())
@@ -244,6 +267,15 @@ main :: proc() {
 		sync.mutex_unlock(&state.mu)
 		state.runs = 1
 		code = sdlhost.run(app, opts)
+	}
+	sync.mutex_lock(&state.mu)
+	state.stop = true
+	sync.mutex_unlock(&state.mu)
+	if state.worker != nil {
+		thread.join(state.worker)
+	}
+	if state.stale_worker != nil {
+		thread.join(state.stale_worker)
 	}
 	if code != 0 {
 		os.exit(code)

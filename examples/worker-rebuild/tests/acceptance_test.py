@@ -12,6 +12,8 @@ control where the worker publishes without requesting.
 import json
 import os
 import select
+import struct
+import zlib
 import shutil
 import subprocess
 import tempfile
@@ -118,6 +120,52 @@ class App:
         self.proc.wait(timeout=10)
 
 
+def count_preedit_pixels(path, bounds):
+    data = Path(path).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, w, h, color = 8, b"", 0, 0, 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        chunk = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            w, h, depth, color = struct.unpack(">IIBB", chunk[:10])
+            assert depth == 8 and color in (2, 6)
+        elif kind == b"IDAT":
+            idat += chunk
+        pos += 12 + length
+    bpp = 4 if color == 6 else 3
+    raw = zlib.decompress(idat)
+    stride = w * bpp
+    px = bytearray(w * h * bpp)
+    prev = bytearray(stride)
+    p = 0
+    for y in range(h):
+        filt = raw[p]; p += 1
+        line = bytearray(raw[p:p + stride]); p += stride
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if filt == 1: line[i] = (line[i] + a) & 0xFF
+            elif filt == 2: line[i] = (line[i] + b) & 0xFF
+            elif filt == 3: line[i] = (line[i] + (a + b) // 2) & 0xFF
+            elif filt == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pr) & 0xFF
+        px[y * stride:(y + 1) * stride] = line
+        prev = line
+    x0, y0 = int(bounds["x"]), int(bounds["y"])
+    x1, y1 = int(bounds["x"] + bounds["width"]), int(bounds["y"] + bounds["height"])
+    hits = 0
+    for y in range(max(0, y0), min(h, y1)):
+        for x in range(max(0, x0), min(w, x1)):
+            rgb = tuple(px[(y * w + x) * bpp:(y * w + x) * bpp + 3])
+            if all(abs(a - b) <= 4 for a, b in zip(rgb, (62, 78, 118))):
+                hits += 1
+    return hits
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="dagda-worker-rebuild-"))
     apps = []
@@ -152,7 +200,15 @@ def main():
         # path while this composition is active (second trigger).
         app.fire("other")
         assert app.wait_text("worker.other", "other 1")["text"] == "other 1"
-        app.wait_present("other")
+        app.wait_present("other 1")
+        # Observe the active composing field/preedit after the
+        # worker presentation, before sending any final text.
+        # If a rebuild cancelled the composition, this fails.
+        shot = app.dir / "after-worker.png"
+        app.control(f"screenshot {shot}")
+        hits = count_preedit_pixels(shot, fb)
+        assert hits >= 20, f"composition was lost across the worker rebuild (preedit pixels={hits})"
+        print(f"[2] composing field/preedit still active after worker presentation (preedit pixels={hits})")
         # Finish the composition normally at the intended place.
         app.control("key enter")
         app.control("text Y")

@@ -296,7 +296,7 @@ host_render :: proc(h: ^Host, screenshot_path := "") -> bool {
 	if len(screenshot_path) > 0 {
 		ok = host_save_screenshot(h, screenshot_path)
 	}
-	sdl.RenderPresent(h.renderer)
+	ok = sdl.RenderPresent(h.renderer) && ok
 	h.needs_redraw = false
 	return ok
 }
@@ -930,14 +930,6 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	if !host_rebuild_frame(&h) {
 		return 1
 	}
-	h.rebuild = rebuild_register()
-	if app.rebuild_handle != nil {
-		app.rebuild_handle^ = h.rebuild
-	}
-	_ = host_present(&h)
-	if app.on_ready != nil {
-		app.on_ready(app.user_data, h.rebuild)
-	}
 
 	srv: driver.Server
 	if len(opts.socket_path) > 0 {
@@ -946,6 +938,22 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 	}
 	defer driver.server_stop(&srv)
+
+	// Publish readiness only once every fallible startup step
+	// has succeeded; a failed start leaves no live handle.
+	rebuild_handle, registered := rebuild_register()
+	if !registered {
+		fmt.eprintln("could not register rebuild event")
+		return 1
+	}
+	h.rebuild = rebuild_handle
+	if app.rebuild_handle != nil {
+		app.rebuild_handle^ = h.rebuild
+	}
+	_ = host_present(&h)
+	if app.on_ready != nil {
+		app.on_ready(app.user_data, h.rebuild)
+	}
 
 	control_buf: [dynamic]u8
 	defer delete(control_buf)

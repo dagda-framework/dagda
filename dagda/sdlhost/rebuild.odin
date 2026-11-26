@@ -31,34 +31,44 @@ Rebuild_Result :: enum {
 	Stale,  // no live window has this generation
 }
 
+@(private)
 Rebuild_Entry :: struct {
 	id:         u64,
 	event_type: u32,
 	closing:    bool,
 }
 
+@(private)
 rebuild_registry_mutex: sync.Mutex
+@(private)
 rebuild_next_id: u64 = 1
 // Fixed storage: the registry itself never allocates, so a
 // request racing shutdown cannot fail on allocation either.
+@(private)
 rebuild_live: [64]Rebuild_Entry
+@(private)
 rebuild_live_count: int
-rebuild_closed: [64]u64
-rebuild_closed_count: int
 
-rebuild_register :: proc() -> Rebuild_Handle {
+@(private)
+rebuild_register :: proc() -> (Rebuild_Handle, bool) {
 	event_type := sdl.RegisterEvents(1)
+	if event_type == 0 {
+		return {}, false
+	}
 	sync.mutex_lock(&rebuild_registry_mutex)
+	if rebuild_live_count >= len(rebuild_live) {
+		sync.mutex_unlock(&rebuild_registry_mutex)
+		return {}, false
+	}
 	id := rebuild_next_id
 	rebuild_next_id += 1
-	if rebuild_live_count < len(rebuild_live) {
-		rebuild_live[rebuild_live_count] = {id = id, event_type = u32(event_type)}
-		rebuild_live_count += 1
-	}
+	rebuild_live[rebuild_live_count] = {id = id, event_type = u32(event_type)}
+	rebuild_live_count += 1
 	sync.mutex_unlock(&rebuild_registry_mutex)
-	return {id = id, event_type = u32(event_type)}
+	return {id = id, event_type = u32(event_type)}, true
 }
 
+@(private)
 rebuild_find :: proc(id: u64) -> (Rebuild_Entry, bool) {
 	for entry in rebuild_live[:rebuild_live_count] {
 		if entry.id == id {
@@ -68,6 +78,7 @@ rebuild_find :: proc(id: u64) -> (Rebuild_Entry, bool) {
 	return {}, false
 }
 
+@(private)
 rebuild_mark_closing :: proc(handle: Rebuild_Handle) {
 	sync.mutex_lock(&rebuild_registry_mutex)
 	for &entry in rebuild_live[:rebuild_live_count] {
@@ -78,16 +89,13 @@ rebuild_mark_closing :: proc(handle: Rebuild_Handle) {
 	sync.mutex_unlock(&rebuild_registry_mutex)
 }
 
+@(private)
 rebuild_unregister :: proc(handle: Rebuild_Handle) {
 	sync.mutex_lock(&rebuild_registry_mutex)
 	for entry, i in rebuild_live[:rebuild_live_count] {
 		if entry.id == handle.id {
 			rebuild_live_count -= 1
 			rebuild_live[i] = rebuild_live[rebuild_live_count]
-			if rebuild_closed_count < len(rebuild_closed) {
-				rebuild_closed[rebuild_closed_count] = handle.id
-				rebuild_closed_count += 1
-			}
 			break
 		}
 	}
@@ -109,19 +117,20 @@ request_rebuild :: proc(handle: Rebuild_Handle) -> Rebuild_Result {
 		return .Stale
 	}
 	if entry.closing || entry.event_type != handle.event_type {
+		result := entry.closing ? Rebuild_Result.Closed : Rebuild_Result.Stale
 		sync.mutex_unlock(&rebuild_registry_mutex)
-		return entry.closing ? .Closed : .Stale
+		return result
 	}
-	sync.mutex_unlock(&rebuild_registry_mutex)
-
+	// The registry mutex is held across the post, synchronizing
+	// with teardown: a request cannot validate against the old
+	// lifetime, wait, and then post into a later one.
 	ev: sdl.Event
 	ev.type = sdl.EventType(handle.event_type)
 	ev.user.windowID = 0
 	ev.user.code = 0
 	ev.user.data1 = rawptr(uintptr(handle.id))
 	ev.user.data2 = nil
-	if !sdl.PushEvent(&ev) {
-		return .Closed
-	}
-	return .Posted
+	posted := sdl.PushEvent(&ev)
+	sync.mutex_unlock(&rebuild_registry_mutex)
+	return posted ? .Posted : .Closed
 }

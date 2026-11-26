@@ -2760,3 +2760,71 @@ test_editable_canvas_press_preserves_full_pointer_gesture_lifecycle :: proc(t: ^
 	testing.expect_value(t, s.button_hits, 1)
 	testing.expect_value(t, s.holding_gesture, false)
 }
+
+Failed_Start_State :: struct {
+	ready_calls:   int,
+	second_result: Rebuild_Result,
+}
+
+failed_start_failed_handle: Rebuild_Handle
+
+failed_ready :: proc(user_data: rawptr, handle: Rebuild_Handle) {
+	s := (^Failed_Start_State)(user_data)
+	s.ready_calls += 1
+}
+
+second_ready :: proc(user_data: rawptr, handle: Rebuild_Handle) {
+	s := (^Failed_Start_State)(user_data)
+	s.ready_calls += 1
+	s.second_result = request_rebuild(failed_start_failed_handle)
+}
+
+failed_view :: proc(user_data: rawptr) -> dagda.View {
+	elements := []dagda.Element{{info = {id = 1, role = "x"}, kind = .Label, text = "x"}}
+	return {elements = elements}
+}
+
+@(test)
+test_failed_start_publishes_no_handle :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	state: Failed_Start_State
+	storage: Rebuild_Handle
+	app := App{
+		title = "Dagda — Failed Start", width = 320, height = 160,
+		user_data = &state, view = failed_view,
+		rebuild_handle = &storage, on_ready = failed_ready,
+	}
+	bad_path := fmt.tprintf("/tmp/dagda-no-such-dir-%d/x.sock", posix.getpid())
+	code := run(app, {socket_path = bad_path})
+	testing.expect_value(t, code, 1)
+	testing.expect_value(t, state.ready_calls, 0)
+	testing.expect_value(t, storage.id, u64(0))
+	failed_start_failed_handle = storage
+	testing.expect_value(t, request_rebuild(storage), Rebuild_Result.Stale)
+
+	// A second ordinary window in the same process: asking it
+	// to rebuild through the failed window's handle is Stale,
+	// never Posted.
+	quit_proc :: proc(th: ^thread.Thread) {
+		time.sleep(300 * time.Millisecond)
+		ev: sdl.Event
+		ev.type = .QUIT
+		_ = sdl.PushEvent(&ev)
+	}
+	th := thread.create(quit_proc)
+	thread.start(th)
+	sock_dir := fmt.tprintf("/tmp/dagda-sdlhost-restart-%d", posix.getpid())
+	_ = os.make_directory(sock_dir)
+	defer _ = os.remove(sock_dir)
+	state2: Failed_Start_State
+	app2 := App{
+		title = "Dagda — Restart", width = 320, height = 160,
+		user_data = &state2, view = failed_view, on_ready = second_ready,
+	}
+	code2 := run(app2, {socket_path = fmt.tprintf("%s/x.sock", sock_dir)})
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, code2, 0)
+	testing.expect_value(t, state2.ready_calls, 1)
+	testing.expect_value(t, state2.second_result, Rebuild_Result.Stale)
+}
