@@ -752,6 +752,109 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 	return
 }
 
+// host_dispatch_mouse_event routes MOUSE_MOTION, MOUSE_BUTTON_DOWN, and
+// MOUSE_BUTTON_UP across editable text drag selection, canvas pointer gestures,
+// hover tracking, and ordinary element activation.
+host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool) {
+	#partial switch ev.type {
+	case .MOUSE_MOTION:
+		if h.text_edit.dragging {
+			if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.motion.x, h.app.editable_text_targets) {
+				h.needs_redraw = true
+			}
+			return false
+		}
+		pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
+		if pres.changed {
+			needs_rebuild = true
+		}
+		if !pres.consumed {
+			id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
+			if hit != h.has_hovered || (hit && id != h.hovered_id) {
+				h.has_hovered = hit
+				h.hovered_id = hit ? id : 0
+				h.needs_redraw = true
+			}
+		}
+
+	case .MOUSE_BUTTON_DOWN:
+		if ev.button.button == sdl.BUTTON_LEFT {
+			id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
+			if h.app.text_edit.enabled {
+				if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
+					_ = focus_clear(&h.focus)
+					_, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets)
+					if changed {
+						h.needs_redraw = true
+					}
+					h.has_pressed = true
+					h.pressed_id = id
+					return false
+				} else if text_edit_blur(&h.text_edit, h.ime_window) {
+					h.needs_redraw = true
+				}
+			}
+			h.has_pressed = hit
+			h.pressed_id = hit ? id : 0
+			pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
+			if pres.changed {
+				needs_rebuild = true
+			}
+			if !pres.suppress_click {
+				if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
+					needs_rebuild = true
+				} else {
+					h.needs_redraw = true
+				}
+			} else if !pres.changed {
+				h.needs_redraw = true
+			}
+		} else if ev.button.button == sdl.BUTTON_RIGHT && h.pointer.active {
+			pres := host_handle_pointer_cancel_event(h, ev)
+			if pres.changed {
+				needs_rebuild = true
+			}
+		}
+
+	case .MOUSE_BUTTON_UP:
+		if ev.button.button == sdl.BUTTON_LEFT {
+			if h.text_edit.dragging {
+				if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.button.x, h.app.editable_text_targets) {
+					h.needs_redraw = true
+				}
+				text_edit_drag_end(&h.text_edit)
+				if h.has_pressed {
+					h.has_pressed = false
+					h.pressed_id = 0
+					h.needs_redraw = true
+				}
+				return false
+			}
+			pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
+			if h.has_pressed {
+				h.has_pressed = false
+				h.pressed_id = 0
+				h.needs_redraw = true
+			}
+			if pres.changed {
+				needs_rebuild = true
+			}
+			if pres.consumed && !pres.suppress_click && pres.has_click_id {
+				if pointer_try_activate(
+					h.frame,
+					{x = ev.button.x, y = ev.button.y},
+					pres.click_target_id,
+					h.app.handle,
+					h.app.user_data,
+				) {
+					needs_rebuild = true
+				}
+			}
+		}
+	}
+	return needs_rebuild
+}
+
 run :: proc(app: App, opts: Run_Options = {}) -> int {
 	signal_stopped = false
 	act: posix.sigaction_t
@@ -827,92 +930,11 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						exit_code = 1
 						running = false
 					}
-				case .MOUSE_MOTION:
-					pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-					if pres.changed {
+				case .MOUSE_MOTION, .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
+					if host_dispatch_mouse_event(&h, &ev) {
 						if !host_rebuild_frame(&h) {
 							exit_code = 1
 							running = false
-						}
-					}
-					if running && !pres.consumed {
-						id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
-						if hit != h.has_hovered || (hit && id != h.hovered_id) {
-							h.has_hovered = hit
-							h.hovered_id = hit ? id : 0
-							h.needs_redraw = true
-						}
-					}
-				case .MOUSE_BUTTON_DOWN:
-					if ev.button.button == sdl.BUTTON_LEFT {
-						id, hit := dagda.hit_test(h.frame, {x = ev.button.x, y = ev.button.y})
-						if h.app.text_edit.enabled {
-							if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
-								_ = focus_clear(&h.focus)
-								if text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets) {
-									h.needs_redraw = true
-								}
-							} else if text_edit_blur(&h.text_edit, h.ime_window) {
-								h.needs_redraw = true
-							}
-						}
-						h.has_pressed = hit
-						h.pressed_id = hit ? id : 0
-						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-						if pres.changed {
-							if !host_rebuild_frame(&h) {
-								exit_code = 1
-								running = false
-							}
-						}
-						if running && !pres.suppress_click {
-							if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
-								if !host_rebuild_frame(&h) {
-									exit_code = 1
-									running = false
-								}
-							} else {
-								h.needs_redraw = true
-							}
-						} else if running && !pres.changed {
-							h.needs_redraw = true
-						}
-					} else if ev.button.button == sdl.BUTTON_RIGHT && h.pointer.active {
-						pres := host_handle_pointer_cancel_event(&h, &ev)
-						if pres.changed {
-							if !host_rebuild_frame(&h) {
-								exit_code = 1
-								running = false
-							}
-						}
-					}
-				case .MOUSE_BUTTON_UP:
-					if ev.button.button == sdl.BUTTON_LEFT {
-						pres := pointer_handle_event(&h.pointer, h.frame, &ev, h.app.on_pointer, h.app.user_data)
-						if h.has_pressed {
-							h.has_pressed = false
-							h.pressed_id = 0
-							h.needs_redraw = true
-						}
-						if pres.changed {
-							if !host_rebuild_frame(&h) {
-								exit_code = 1
-								running = false
-							}
-						}
-						if running && pres.consumed && !pres.suppress_click && pres.has_click_id {
-							if pointer_try_activate(
-								h.frame,
-								{x = ev.button.x, y = ev.button.y},
-								pres.click_target_id,
-								h.app.handle,
-								h.app.user_data,
-							) {
-								if !host_rebuild_frame(&h) {
-									exit_code = 1
-									running = false
-								}
-							}
 						}
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:

@@ -2055,3 +2055,207 @@ test_clipboard_copy_declines_nul_preserving_memory_backend_and_state :: proc(t: 
 	testing.expect_value(t, s.rev, u64(3))
 	testing.expect_value(t, s.undo_depth, 1)
 }
+
+@(test)
+test_mouse_drag_selection_grapheme_bounds_clamping_composition_and_canvas_drag :: proc(t: ^testing.T) {
+	Drag_App :: struct {
+		title:        string,
+		rev:          u64,
+		card_x:       f32,
+		card_presses: int,
+		card_moves:   int,
+		card_ups:     int,
+		editable:     [2]dagda.Object_Id,
+		elements:     [3]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Drag_App) -> dagda.Frame {
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 200, width = 640, height = 80}},
+			{info = {id = 3, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = s.card_x, y = 340, width = 180, height = 80}},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Drag_App)(user_data)
+		if !ev.has_target || ev.target_id != 3 {
+			return false
+		}
+		#partial switch ev.phase {
+		case .Press:
+			s.card_presses += 1
+			return true
+		case .Move:
+			s.card_moves += 1
+			s.card_x = ev.point.x
+			return true
+		case .Release:
+			s.card_ups += 1
+			return true
+		}
+		return false
+	}
+
+	s := Drag_App{
+		title    = "Ae\u0301B",
+		card_x   = 80,
+		editable = {1, 2},
+	}
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.frame = make_frame(&s)
+	h.app = App{
+		user_data             = &s,
+		on_pointer            = on_pointer,
+		text_edit             = {enabled = true},
+		editable_text_targets = s.editable[:],
+	}
+	h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
+	defer {
+		memory_clipboard_destroy(&h.mem_clipboard)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	mouse_down :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_DOWN
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = true
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	mouse_move :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_MOTION
+		ev.motion.x = x
+		ev.motion.y = y
+		return ev
+	}
+	mouse_up :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_UP
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = false
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	ctrl_c :: proc() -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = sdl.K_C
+		ev.key.mod = sdl.KMOD_LCTRL
+		return ev
+	}
+
+	el1, found1 := dagda.find(h.frame, 1)
+	el2, found2 := dagda.find(h.frame, 2)
+	card, found3 := dagda.find(h.frame, 3)
+	testing.expect(t, found1 && found2 && found3)
+
+	tx, _, px := text_edit_layout(h.frame, el1.bounds)
+	y1 := el1.bounds.y + el1.bounds.height * 0.5
+	y2 := el2.bounds.y + el2.bounds.height * 0.5
+	x_after_a := tx + font_measure_width(&h.font, "A", px)
+	x_after_e := tx + font_measure_width(&h.font, "Ae\u0301", px)
+
+	// 1. LTR drag across decomposed "e\u0301" (moving vertically over field 2 stays on field 1).
+	d := mouse_down(x_after_a, y1)
+	m := mouse_move(x_after_e, y2)
+	u := mouse_up(x_after_e, y2)
+	_ = host_dispatch_mouse_event(&h, &d)
+	testing.expect_value(t, h.text_edit.dragging, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, s.rev, u64(0))
+
+	copy_ev := ctrl_c()
+	_, _, _ = host_dispatch_key_event(&h, &copy_ev)
+	testing.expect_value(t, h.mem_clipboard.text, "e\u0301")
+
+	// 2. RTL drag across decomposed "e\u0301".
+	d = mouse_down(x_after_e, y1)
+	m = mouse_move(x_after_a, y1)
+	u = mouse_up(x_after_a, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 4)
+	testing.expect_value(t, h.text_edit.session.caret, 1)
+	testing.expect_value(t, s.rev, u64(0))
+
+	// 3. Dragging past right end and past left end clamps cleanly to [0, len(title)].
+	d = mouse_down(x_after_a, y1)
+	m = mouse_move(el1.bounds.x + el1.bounds.width + 120, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, len(s.title))
+	m = mouse_move(el1.bounds.x - 120, y1)
+	u = mouse_up(el1.bounds.x - 120, y1)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	// 4. Ordinary click collapses selection to a single caret.
+	d = mouse_down(x_after_e, y1)
+	u = mouse_up(x_after_e, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 4)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+
+	// 5. Active IME composition in field 1: pressing/dragging field 2 preserves field 1's composition.
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:], h.clipboard)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+
+	d = mouse_down(x_after_a, y2)
+	m = mouse_move(x_after_e, y2)
+	u = mouse_up(x_after_e, y2)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "e")
+
+	// Cancel composition, then verify canvas object dragging (card id=3) still works cleanly.
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+
+	cx := card.bounds.x + card.bounds.width * 0.5
+	cy := card.bounds.y + card.bounds.height * 0.5
+	d = mouse_down(cx, cy)
+	m = mouse_move(cx + 40, cy)
+	u = mouse_up(cx + 40, cy)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &d), true)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &m), true)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &u), true)
+	testing.expect_value(t, s.card_presses, 1)
+	testing.expect_value(t, s.card_moves, 1)
+	testing.expect_value(t, s.card_ups, 1)
+}

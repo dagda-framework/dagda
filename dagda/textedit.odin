@@ -196,6 +196,17 @@ select_all :: proc(session: ^Text_Session, committed: string) {
 	session.caret = len(committed)
 }
 
+// set_caret moves the caret to offset clamped to a grapheme cluster boundary
+// in committed. When extend_selection is false, the selection anchor moves
+// with the caret; when true, the anchor stays fixed so selection extends in
+// either direction.
+set_caret :: proc(session: ^Text_Session, committed: string, offset: int, extend_selection := false) {
+	session.caret = clamp_grapheme_boundary(committed, offset)
+	if !extend_selection {
+		session.anchor = session.caret
+	}
+}
+
 valid_single_line :: proc(s: string) -> bool {
 	if !utf8.valid_string(s) {
 		return false
