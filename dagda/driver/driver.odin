@@ -288,6 +288,67 @@ extract_top_level_u64 :: proc(line: string, target_key: string) -> (val: u64, fo
 	}
 }
 
+F32_MAX_MAGNITUDE :: 3.402823466e+38
+
+// parse_f32_token converts an original JSON number token to a
+// finite f32 without going through the parser's integer value,
+// so huge integer tokens cannot wrap before conversion. Valid
+// fractional and exponent forms are accepted; anything outside
+// the finite f32 range is rejected.
+parse_f32_token :: proc(kind: json.Token_Kind, text: string) -> (f32, bool) {
+	if kind != .Integer && kind != .Float {
+		return 0, false
+	}
+	val, ok := strconv.parse_f64(text)
+	if !ok || val != val || val > F32_MAX_MAGNITUDE || val < -F32_MAX_MAGNITUDE {
+		return 0, false
+	}
+	return f32(val), true
+}
+
+extract_top_level_f32 :: proc(line: string, target_key: string) -> (val: f32, found: bool, ok: bool) {
+	t := json.make_tokenizer(line, .JSON, true)
+	depth := 0
+	key_matches := false
+	pending := false
+	for {
+		token, err := json.get_token(&t)
+		if token.kind == .EOF {
+			return val, found, found
+		}
+		if err != .None {
+			return 0, false, false
+		}
+		if pending {
+			if depth == 1 {
+				parsed, valid := parse_f32_token(token.kind, token.text)
+				if !valid {
+					return 0, true, false
+				}
+				val = parsed
+				found = true
+			}
+			pending = false
+		}
+		switch token.kind {
+		case .Open_Brace, .Open_Bracket:
+			depth += 1
+		case .Close_Brace, .Close_Bracket:
+			depth -= 1
+		case .String:
+			if depth == 1 {
+				key_matches = is_key_name(token.text, target_key)
+			}
+		case .Colon:
+			if depth == 1 && key_matches {
+				pending = true
+			}
+			key_matches = false
+		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .Ident, .Comma, .EOF, .Invalid:
+		}
+	}
+}
+
 // dispatch handles one newline-delimited JSON request against a resolved
 // dagda.Frame and Action_Handler. It returns the owned JSON reply line
 // (caller deletes) and whether an action was applied (so the host can rebuild
@@ -369,8 +430,8 @@ dispatch :: proc(
 		// dagda.hit_test, so a query answers exactly what a
 		// pointer press would hit without touching focus,
 		// actions, or application state. ID 0 is a valid hit.
-		x, ok_x := get_number(obj, "x")
-		y, ok_y := get_number(obj, "y")
+		x, _, ok_x := extract_top_level_f32(line, "x")
+		y, _, ok_y := extract_top_level_f32(line, "y")
 		if !ok_x || !ok_y {
 			return reply_error("Malformed_Request"), false
 		}

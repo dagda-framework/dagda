@@ -471,3 +471,45 @@ test_hit_test_op :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, c.count, 0) // the query changed no app state
 }
+
+@(test)
+test_hit_test_numeric_tokens :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {{info = {id = 3, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}}},
+	}
+	viewports := [][2]f32{{1200, 540}, {720, 540}}
+	for viewport in viewports {
+		frame, ok := dagda.resolve_canvas(canvas, {width = viewport[0], height = viewport[1]})
+		testing.expect(t, ok)
+		// A huge integer token that is still a finite f32 must
+		// not wrap: the point is far outside and simply misses.
+		huge, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":18446744073709551746,"y":150}`)
+		defer delete(huge)
+		testing.expect_value(t, huge, `{"ok":true,"id":null}`)
+		// Immediately inside / first outside the clipped edge.
+		inside_x := viewport[0] == 1200 ? "1079" : "719"
+		outside_x := viewport[0] == 1200 ? "1080" : "720"
+		inside_y := viewport[0] == 1200 ? "520" : "450"
+		inside_req := fmt.tprintf(`{{"op":"hit-test","x":%s,"y":%s}}`, inside_x, inside_y)
+		testing.expect_value(t, inside_req, viewport[0] == 1200 ? `{"op":"hit-test","x":1079,"y":520}` : `{"op":"hit-test","x":719,"y":450}`)
+		inside, _ := dispatch(frame, test_counter_handle, &c, inside_req)
+		defer delete(inside)
+		testing.expect_value(t, inside, `{"ok":true,"id":3}`)
+		outside_req := fmt.tprintf(`{{"op":"hit-test","x":%s,"y":%s}}`, outside_x, inside_y)
+		testing.expect_value(t, outside_req, viewport[0] == 1200 ? `{"op":"hit-test","x":1080,"y":520}` : `{"op":"hit-test","x":720,"y":450}`)
+		outside, _ := dispatch(frame, test_counter_handle, &c, outside_req)
+		defer delete(outside)
+		testing.expect_value(t, outside, `{"ok":true,"id":null}`)
+		// Out of finite f32 range is malformed; fractional and
+		// exponent forms stay valid.
+		big, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1e40,"y":150}`)
+		defer delete(big)
+		testing.expect_value(t, big, `{"ok":false,"error":"Malformed_Request"}`)
+		frac, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1.5e2,"y":150}`)
+		defer delete(frac)
+		testing.expect_value(t, frac, `{"ok":true,"id":null}`)
+		dagda.frame_destroy(&frame)
+	}
+}

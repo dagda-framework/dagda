@@ -124,7 +124,9 @@ run_client :: proc() -> int {
 		}
 		x, ok_x := strconv.parse_f64(os.args[3])
 		y, ok_y := strconv.parse_f64(os.args[4])
-		if !ok_x || !ok_y {
+		// Coordinates must be finite f32 window coordinates,
+		// matching the wire decoder's range.
+		if !ok_x || !ok_y || x != x || y != y || x > 3.402823466e+38 || x < -3.402823466e+38 || y > 3.402823466e+38 || y < -3.402823466e+38 {
 			usage()
 			return 2
 		}
