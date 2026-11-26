@@ -29,6 +29,9 @@ jobs:
           ./scripts/odin.sh build tests/js-wasm32-consumer -collection:dagda=. -target:js_wasm32 -out:"$RUNNER_TEMP/dagda-consumer.wasm"
           test -s "$RUNNER_TEMP/dagda-consumer.wasm"
 
+      - name: Run the first-app guide smoke test
+        run: python3 tests/docs/first_app_smoke.py
+
       - name: Run the Odin test suites
         env:
           SDL_VIDEODRIVER: dummy
