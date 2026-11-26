@@ -17,10 +17,18 @@ and pointer input (no platform-specific keyboard shortcuts):
 5. Resizes the window (640x480), verifies updated window/output/field bounds,
    and repeats the left/right midpoint clicks with markers ('<', '>').
 
-Input path:
-- Pointer clicks and plain text commits are injected via --control-stdin into
-  SDL3's event queue (SDL_PushEvent of SDL_EVENT_MOUSE_BUTTON_DOWN/UP in
-  logical window coordinates and SDL_EVENT_TEXT_INPUT).
+Input paths (reported separately):
+- Pointer clicks:
+  - --input-mode sdl (default): injected via --control-stdin into SDL3's event
+    queue (SDL_PushEvent of SDL_EVENT_MOUSE_BUTTON_DOWN/UP in logical window
+    points). Works even on backends that cannot report global window coordinates.
+  - --input-mode native: posted through macOS CoreGraphics CGEventPost in global
+    screen logical points converted from SDL_GetWindowPosition. Requires a valid
+    current content origin and a focused target window before posting any click,
+    and never falls back to SDL injection.
+- Marker text commits: always injected via --control-stdin `text`
+  (SDL_PushEvent of SDL_EVENT_TEXT_INPUT) so marker insertion stays independent
+  of platform keyboard shortcuts and input-source state.
 - Element discovery and committed text/bounds assertions run in a separate
   dagda-client process over the Unix domain socket.
 """
@@ -312,24 +320,38 @@ def run_client(client_bin: Path, sock: Path, *args: str) -> tuple[int, dict]:
     return proc.returncode, json.loads(line)
 
 
-def send_control(proc: subprocess.Popen, reader: DeadlineLineReader, cmd: str) -> str:
+def send_control_raw(proc: subprocess.Popen, reader: DeadlineLineReader, cmd: str) -> str:
     assert proc.stdin is not None
     proc.stdin.write((cmd + "\n").encode("utf-8"))
     proc.stdin.flush()
-    resp = reader.read_line(f"control {cmd!r}", timeout=10.0)
+    return reader.read_line(f"control {cmd!r}", timeout=10.0)
+
+
+def send_control(proc: subprocess.Popen, reader: DeadlineLineReader, cmd: str) -> str:
+    resp = send_control_raw(proc, reader, cmd)
     assert resp.startswith("CONTROL_OK"), f"control {cmd!r} failed: {resp!r}"
     return resp
 
 
-def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dict[str, object]:
-    resp = send_control(proc, reader, "window-info")
-    # CONTROL_OK window-info driver=cocoa pos=100,80 win=800x540 output=800x540 density=1.0000 display_scale=1.0000
+def parse_window_info(resp: str) -> dict[str, object]:
+    # CONTROL_OK window-info driver=cocoa pos=100,80 win=800x540 output=800x540 density=1.0000 display_scale=1.0000 focused=1
     parts = dict(tok.split("=", 1) for tok in resp.split()[2:])
-    pos_x, pos_y = (int(v) for v in parts["pos"].split(","))
+    pos_raw = parts["pos"]
+    if pos_raw == "unavailable":
+        has_pos = False
+        pos_x: int | None = None
+        pos_y: int | None = None
+    else:
+        px_str, py_str = pos_raw.split(",")
+        has_pos = True
+        pos_x = int(px_str)
+        pos_y = int(py_str)
     win_w, win_h = (int(v) for v in parts["win"].split("x"))
     out_w, out_h = (int(v) for v in parts["output"].split("x"))
+    focused = parts.get("focused") == "1"
     return {
         "driver": parts["driver"],
+        "has_pos": has_pos,
         "pos_x": pos_x,
         "pos_y": pos_y,
         "win_w": win_w,
@@ -340,7 +362,26 @@ def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dic
         "scale_y": out_h / win_h if win_h > 0 else 0.0,
         "density": float(parts["density"]),
         "display_scale": float(parts["display_scale"]),
+        "focused": focused,
     }
+
+
+def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dict[str, object]:
+    return parse_window_info(send_control(proc, reader, "window-info"))
+
+
+def wait_for_native_ready(proc: subprocess.Popen, reader: DeadlineLineReader, timeout: float = 2.0) -> dict[str, object]:
+    """Wait until the host reports both a valid content origin and input focus."""
+    deadline = time.monotonic() + timeout
+    info = query_window_info(proc, reader)
+    while (not info["has_pos"] or not info["focused"]) and time.monotonic() < deadline:
+        time.sleep(0.05)
+        info = query_window_info(proc, reader)
+    if not info["has_pos"] or info["pos_x"] is None or info["pos_y"] is None:
+        raise RuntimeError(f"native pointer mode requires a valid window content origin, got {info}")
+    if not info["focused"]:
+        raise RuntimeError(f"native pointer mode requires a focused target window before clicking, got {info}")
+    return info
 
 
 class CGPoint(ctypes.Structure):
@@ -400,24 +441,81 @@ class MacOSNativePointer:
 
 
 def deliver_click(
-    proc: subprocess.Popen,
-    reader: DeadlineLineReader,
+    proc: subprocess.Popen | None,
+    reader: DeadlineLineReader | None,
     info: dict[str, object],
     win_x: float,
     win_y: float,
-    native_ptr: MacOSNativePointer | None,
+    native_ptr: object | None,
 ) -> tuple[str, tuple[float, float]]:
     """Deliver a click at logical window coordinates (win_x, win_y).
     Returns (provenance_label, delivered_coords).
     """
     if native_ptr is not None:
+        if not info.get("has_pos") or info.get("pos_x") is None or info.get("pos_y") is None:
+            raise RuntimeError(f"refusing to post native click without a valid window content origin: {info}")
+        if not info.get("focused"):
+            raise RuntimeError(f"refusing to post native click to an unfocused window: {info}")
         screen_x = float(info["pos_x"]) + win_x
         screen_y = float(info["pos_y"]) + win_y
         native_ptr.click_screen(screen_x, screen_y)
         return "macos-cgevent", (screen_x, screen_y)
+    assert proc is not None and reader is not None
     send_control(proc, reader, f"click {win_x:.2f} {win_y:.2f}")
     time.sleep(0.05)
     return "sdl-injected", (win_x, win_y)
+
+
+def verify_native_pointer_guards() -> None:
+    """Controlled failure and zero-origin checks:
+    - Unavailable content origin -> refuses to click; poster receives zero clicks.
+    - Unfocused target window -> refuses to click; poster receives zero clicks.
+    - Legitimate (0, 0) content origin with focus -> posts exact converted screen point.
+    """
+    class RecordingPoster:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, float]] = []
+
+        def click_screen(self, x: float, y: float) -> None:
+            self.calls.append((x, y))
+
+    poster = RecordingPoster()
+
+    # 1. Unavailable origin (SDL_GetWindowPosition returned false).
+    unavail = parse_window_info(
+        "CONTROL_OK window-info driver=cocoa pos=unavailable win=800x540 output=800x540 density=1.0000 display_scale=1.0000 focused=1"
+    )
+    assert unavail["has_pos"] is False and unavail["pos_x"] is None and unavail["pos_y"] is None
+    try:
+        deliver_click(None, None, unavail, 66.5, 211.25, poster)
+    except RuntimeError as exc:
+        assert "origin" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when window origin is unavailable")
+    assert len(poster.calls) == 0, f"poster must receive zero clicks on unavailable origin, got {poster.calls}"
+
+    # 2. Unfocused window (SDL_RaiseWindow / focus unavailable).
+    unfocused = parse_window_info(
+        "CONTROL_OK window-info driver=cocoa pos=100,80 win=800x540 output=800x540 density=1.0000 display_scale=1.0000 focused=0"
+    )
+    assert unfocused["has_pos"] is True and unfocused["focused"] is False
+    try:
+        deliver_click(None, None, unfocused, 66.5, 211.25, poster)
+    except RuntimeError as exc:
+        assert "unfocused" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when target window is unfocused")
+    assert len(poster.calls) == 0, f"poster must receive zero clicks on unfocused window, got {poster.calls}"
+
+    # 3. Legitimate (0, 0) content origin with focus.
+    zero_origin = parse_window_info(
+        "CONTROL_OK window-info driver=cocoa pos=0,0 win=800x540 output=800x540 density=1.0000 display_scale=1.0000 focused=1"
+    )
+    assert zero_origin["has_pos"] is True and zero_origin["pos_x"] == 0 and zero_origin["pos_y"] == 0
+    mode, coords = deliver_click(None, None, zero_origin, 66.5, 211.25, poster)
+    assert mode == "macos-cgevent" and coords == (66.5, 211.25), (mode, coords)
+    assert poster.calls == [(66.5, 211.25)], poster.calls
+    print("[native-guards] unavailable origin & unfocused window posted 0 clicks; legitimate (0,0) origin converted cleanly")
 
 
 def query_measure(proc: subprocess.Popen, reader: DeadlineLineReader, px: float, text: str) -> float:
@@ -545,9 +643,10 @@ def verify_grapheme_clicks(
     expected_after_right = new_prefix + E_ACUTE_DECOMPOSED + right_marker + suffix_after_e
     el_final = wait_for_role_text(client_bin, sock, "canvas.title", expected_after_right)
 
+    origin_str = f"({info['pos_x']},{info['pos_y']})pt" if info["has_pos"] else "unavailable"
     print(
         f"[{stage}] driver={info['driver']} click_input={click_mode} text_input=sdl-injected "
-        f"win_origin=({info['pos_x']},{info['pos_y']})pt win={info['win_w']}x{info['win_h']}pt "
+        f"win_origin={origin_str} focused={int(bool(info['focused']))} win={info['win_w']}x{info['win_h']}pt "
         f"output={info['out_w']}x{info['out_h']}px png={png_w}x{png_h}px "
         f"scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
         f"density={info['density']:.4f} display_scale={info['display_scale']:.4f} "
@@ -604,6 +703,7 @@ def main() -> int:
     subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
 
     verify_startup_timeout_bounded()
+    verify_native_pointer_guards()
 
     sock_dir = Path(tempfile.mkdtemp(prefix="dagda-cocoa-caret."))
     os.chmod(sock_dir, 0o700)
@@ -631,7 +731,11 @@ def main() -> int:
 
         if native_ptr is not None:
             send_control(proc, reader, "raise")
-            time.sleep(0.15)
+            wait_for_native_ready(proc, reader, timeout=2.0)
+
+        # Verify out-of-range move-window coordinates are rejected by the live host.
+        bad_move = send_control_raw(proc, reader, "move-window 4294967296 4294967296")
+        assert bad_move == "CONTROL_ERR invalid move-window", f"unexpected reply for overflow move-window: {bad_move!r}"
 
         # Settle initial window dimensions and content origin.
         init_png = capture_dir / "00-init.png"
@@ -645,9 +749,10 @@ def main() -> int:
             time.sleep(0.05)
 
         info0 = query_window_info(proc, reader)
+        origin0_str = f"({info0['pos_x']},{info0['pos_y']})pt" if info0["has_pos"] else "unavailable"
         print(
             f"[startup] driver={info0['driver']} high_density_opt_in={args.high_density} "
-            f"win_origin=({info0['pos_x']},{info0['pos_y']})pt win={info0['win_w']}x{info0['win_h']}pt "
+            f"win_origin={origin0_str} focused={int(bool(info0['focused']))} win={info0['win_w']}x{info0['win_h']}pt "
             f"output={info0['out_w']}x{info0['out_h']}px scale={info0['scale_x']:.3f}x{info0['scale_y']:.3f} "
             f"density={info0['density']:.4f} display_scale={info0['display_scale']:.4f}"
         )
@@ -689,6 +794,7 @@ def main() -> int:
         # Stage 2: Move (under native mode) and resize to 640x480, wait for Cocoa/WM to settle,
         # then reacquire window origin & field bounds and repeat clicks.
         if native_ptr is not None:
+            assert res1["info"]["has_pos"] and res1["info"]["pos_x"] is not None and res1["info"]["pos_y"] is not None
             new_pos_x = int(res1["info"]["pos_x"]) + 40
             new_pos_y = int(res1["info"]["pos_y"]) + 40
             send_control(proc, reader, f"move-window {new_pos_x} {new_pos_y}")
@@ -703,6 +809,8 @@ def main() -> int:
         assert el_after_resize["bounds"] != res1["bounds"], (
             f"field bounds did not change after resize: {el_after_resize['bounds']}"
         )
+        if native_ptr is not None:
+            wait_for_native_ready(proc, reader, timeout=2.0)
 
         res2 = verify_grapheme_clicks(
             stage="resized-640x480",
