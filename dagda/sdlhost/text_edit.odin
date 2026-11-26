@@ -527,7 +527,8 @@ text_edit_prune_scroll_offsets :: proc(
 		clear(&te.scroll_offsets)
 		return
 	}
-	stale := make([dynamic]dagda.Object_Id, 0, len(te.scroll_offsets), context.temp_allocator)
+	stale: [dynamic]dagda.Object_Id
+	defer delete(stale)
 	for id in te.scroll_offsets {
 		if !text_edit_is_target(cfg, targets, id) {
 			append(&stale, id)

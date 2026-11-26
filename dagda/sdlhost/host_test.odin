@@ -1,5 +1,6 @@
 package sdlhost
 
+import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:math"
@@ -3542,9 +3543,25 @@ test_scroll_offsets_bounded_on_empty_frame_blur_ineligible_and_replacements :: p
 	testing.expect(t, saved_scroll > 50)
 	testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
 
-	// 2. Surviving field temporarily loses focus -> scroll entry is preserved across reconcile.
+	// 2. Surviving field temporarily loses focus -> scroll entry is preserved across reconcile,
+	//    and 10,000 unchanged rebuilds leave a dedicated Default_Temp_Allocator untouched.
 	testing.expect(t, text_edit_blur(&h.text_edit, nil))
-	testing.expect(t, host_rebuild_frame(&h))
+	{
+		temp_alloc: runtime.Default_Temp_Allocator
+		runtime.default_temp_allocator_init(&temp_alloc, runtime.DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE, context.allocator)
+		defer runtime.default_temp_allocator_destroy(&temp_alloc)
+		prev_temp := context.temp_allocator
+		context.temp_allocator = runtime.default_temp_allocator(&temp_alloc)
+		defer context.temp_allocator = prev_temp
+
+		testing.expect(t, host_rebuild_frame(&h))
+		used_after_warmup := temp_alloc.arena.total_used
+		for _ in 0 ..< 10_000 {
+			testing.expect(t, host_rebuild_frame(&h))
+		}
+		testing.expect_value(t, temp_alloc.arena.total_used, used_after_warmup)
+		testing.expect_value(t, temp_alloc.arena.total_used, uint(0))
+	}
 	testing.expect_value(t, len(h.text_edit.scroll_offsets), 1)
 	testing.expect_value(t, text_edit_scroll_x(&h.text_edit, 1), saved_scroll)
 
