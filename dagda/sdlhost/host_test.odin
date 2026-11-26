@@ -1056,6 +1056,361 @@ test_dual_undo_handlers_one_keypress_one_undo :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_two_editable_elements_shared_string_preedit_isolation_and_undo :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		return
+	}
+	defer sdl.Quit()
+
+	font: Font
+	if !font_init(&font) {
+		return
+	}
+	defer font_destroy(&font)
+
+	Shared_State :: struct {
+		title:       string,
+		rev:         u64,
+		last_id:     dagda.Object_Id,
+		undo:        [dynamic]string,
+		editable:    [2]dagda.Object_Id,
+		elements:    [2]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^Shared_State) -> dagda.Frame {
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 200, width = 640, height = 80}},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Shared_State)(user_data)
+		if (id != 1 && id != 2) || new_text == s.title {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		append(&s.undo, s.title)
+		s.title = cloned
+		s.rev += 1
+		s.last_id = id
+		return true
+	}
+	on_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
+		s := (^Shared_State)(user_data)
+		if (id != 1 && id != 2) || len(s.undo) == 0 {
+			return false
+		}
+		delete(s.title)
+		s.title = pop(&s.undo)
+		s.rev += 1
+		s.last_id = id
+		return true
+	}
+
+	window: ^sdl.Window
+	renderer: ^sdl.Renderer
+	testing.expect(t, sdl.CreateWindowAndRenderer("Shared Text Test", 800, 540, {}, &window, &renderer))
+	defer sdl.DestroyWindow(window)
+	defer sdl.DestroyRenderer(renderer)
+	defer font_destroy_textures(&font)
+
+	s := Shared_State{
+		title    = strings.clone("Slide Title"),
+		editable = {1, 2},
+	}
+	defer {
+		delete(s.title)
+		for u in s.undo {
+			delete(u)
+		}
+		delete(s.undo)
+	}
+
+	h: Host
+	h.window = window
+	h.ime_window = window
+	h.renderer = renderer
+	h.font = font
+	h.frame = make_frame(&s)
+	h.app = App{
+		user_data = &s,
+		text_edit = {
+			enabled   = true,
+			on_commit = on_commit,
+			on_undo   = on_undo,
+		},
+		editable_text_targets = s.editable[:],
+	}
+	defer {
+		font = h.font
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	// Verify positional Editable_Text_Config{true, 1, nil, nil} remains source-compatible.
+	legacy_cfg := Editable_Text_Config{true, 1, nil, nil}
+	testing.expect_value(t, text_edit_is_target(legacy_cfg, nil, 1), true)
+	testing.expect_value(t, text_edit_is_target(legacy_cfg, nil, 2), false)
+
+	// 1. Click inside element 1 after "Slide" (byte 5) and insert "!".
+	el1, ok1 := dagda.find(h.frame, 1)
+	testing.expect(t, ok1)
+	tx1, _, px1 := text_edit_layout(h.frame, el1.bounds)
+	slide_w := font_measure_width(&h.font, "Slide", px1)
+	testing.expect(t, text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 1, tx1 + slide_w, h.app.editable_text_targets))
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.caret, 5)
+
+	ti1: sdl.Event
+	ti1.type = .TEXT_INPUT
+	ti1.text.text = "!"
+	res := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &ti1, h.app.editable_text_targets)
+	testing.expect_value(t, res.needs_rebuild, true)
+	dagda.frame_destroy(&h.frame)
+	h.frame = make_frame(&s)
+	text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &res.pending_edit)
+	testing.expect_value(t, s.title, "Slide! Title")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, s.last_id, dagda.Object_Id(1))
+
+	// 2. Click inside element 2 at the start (byte 0) and start preedit "e".
+	el2, ok2 := dagda.find(h.frame, 2)
+	testing.expect(t, ok2)
+	tx2, _, _ := text_edit_layout(h.frame, el2.bounds)
+	testing.expect(t, text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 2, tx2 - 4, h.app.editable_text_targets))
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &pre, h.app.editable_text_targets)
+
+	// Verify ONLY element 2 paints preedit highlight RGB(62,78,118) and element 1 has 0 preedit pixels.
+	host_draw(&h)
+	surface := sdl.RenderReadPixels(h.renderer, nil)
+	testing.expect(t, surface != nil)
+	if surface != nil {
+		defer sdl.DestroySurface(surface)
+		count_preedit_bg :: proc(surf: ^sdl.Surface, b: dagda.Rect) -> int {
+			hits := 0
+			for y := c.int(math.floor(b.y)); y < c.int(math.ceil(b.y + b.height)); y += 1 {
+				for x := c.int(math.floor(b.x)); x < c.int(math.ceil(b.x + b.width)); x += 1 {
+					r, g, bl, a: u8
+					if sdl.ReadSurfacePixel(surf, x, y, &r, &g, &bl, &a) && r == 62 && g == 78 && bl == 118 {
+						hits += 1
+					}
+				}
+			}
+			return hits
+		}
+		el1_now, _ := dagda.find(h.frame, 1)
+		el2_now, _ := dagda.find(h.frame, 2)
+		testing.expect_value(t, count_preedit_bg(surface, el1_now.bounds), 0)
+		testing.expect(t, count_preedit_bg(surface, el2_now.bounds) >= 50)
+	}
+
+	// 3. Commit "é" on element 2 -> updates shared string once and reports id=2.
+	ti2: sdl.Event
+	ti2.type = .TEXT_INPUT
+	ti2.text.text = "é"
+	res = text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &s, &ti2, h.app.editable_text_targets)
+	testing.expect_value(t, res.needs_rebuild, true)
+	dagda.frame_destroy(&h.frame)
+	h.frame = make_frame(&s)
+	text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &res.pending_edit)
+	testing.expect_value(t, s.title, "éSlide! Title")
+	testing.expect_value(t, s.rev, u64(2))
+	testing.expect_value(t, s.last_id, dagda.Object_Id(2))
+
+	// 4. Undo once -> restores "Slide! Title" and reports id=2.
+	undo_ev: sdl.Event
+	undo_ev.type = .KEY_DOWN
+	undo_ev.key.key = sdl.K_Z
+	undo_ev.key.mod = sdl.KMOD_LCTRL
+	rebuild, _, _ := host_dispatch_key_event(&h, &undo_ev)
+	testing.expect_value(t, rebuild, true)
+	testing.expect_value(t, s.title, "Slide! Title")
+	testing.expect_value(t, s.rev, u64(3))
+	testing.expect_value(t, s.last_id, dagda.Object_Id(2))
+}
+
+@(test)
+test_click_field_b_during_field_a_preedit_keeps_composition_and_commits_to_a :: proc(t: ^testing.T) {
+	State :: struct {
+		title:        string,
+		rev:          u64,
+		commit_count: int,
+		last_id:      dagda.Object_Id,
+		editable:     [2]dagda.Object_Id,
+		elements:     [2]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^State) -> dagda.Frame {
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 200, width = 640, height = 80}},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^State)(user_data)
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.title)
+		s.title = cloned
+		s.rev += 1
+		s.commit_count += 1
+		s.last_id = id
+		return true
+	}
+
+	s := State{title = strings.clone("Slide Title"), editable = {1, 2}}
+	defer delete(s.title)
+
+	frame := make_frame(&s)
+	defer dagda.frame_destroy(&frame)
+
+	cfg := Editable_Text_Config{true, 0, on_commit, nil}
+	te: Text_Edit_State
+	defer text_edit_destroy(&te)
+
+	// Focus field A (id=1), select "Title" (6..11), and start preedit "e".
+	testing.expect(t, text_edit_focus_id(&te, nil, nil, frame, cfg, 1, s.editable[:]))
+	te.session.anchor = 6
+	te.session.caret = 11
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &pre, s.editable[:])
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+
+	// Click field B (id=2) while A is composing: focus, caret, selection, and preedit stay in A.
+	testing.expect_value(t, text_edit_click_id(&te, nil, nil, frame, cfg, 2, 100, s.editable[:]), false)
+	testing.expect_value(t, te.focused, true)
+	testing.expect_value(t, te.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, te.session.anchor, 6)
+	testing.expect_value(t, te.session.caret, 11)
+	testing.expect_value(t, dagda.is_composing(&te.session), true)
+	testing.expect_value(t, te.session.preedit, "e")
+
+	// Deliver final "é": commits exactly once attributed to A (id=1).
+	final_ev: sdl.Event
+	final_ev.type = .TEXT_INPUT
+	final_ev.text.text = "é"
+	res := text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &final_ev, s.editable[:])
+	testing.expect_value(t, res.needs_rebuild, true)
+	dagda.frame_destroy(&frame)
+	frame = make_frame(&s)
+	text_edit_apply_committed(&te, nil, nil, frame, cfg, &res.pending_edit)
+	testing.expect_value(t, s.title, "Slide é")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, s.commit_count, 1)
+	testing.expect_value(t, s.last_id, dagda.Object_Id(1))
+	testing.expect_value(t, dagda.is_composing(&te.session), false)
+
+	// After A commits, a fresh click can now focus B.
+	testing.expect_value(t, text_edit_click_id(&te, nil, nil, frame, cfg, 2, 100, s.editable[:]), true)
+	testing.expect_value(t, te.active_id, dagda.Object_Id(2))
+}
+
+@(test)
+test_click_field_b_during_field_a_preedit_escape_then_click_b_and_text_input :: proc(t: ^testing.T) {
+	State :: struct {
+		title:        string,
+		rev:          u64,
+		commit_count: int,
+		last_id:      dagda.Object_Id,
+		editable:     [2]dagda.Object_Id,
+		elements:     [2]dagda.Canvas_Element,
+	}
+	make_frame :: proc(s: ^State) -> dagda.Frame {
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 200, width = 640, height = 80}},
+		}
+		frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+		assert(ok)
+		return frame
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^State)(user_data)
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.title)
+		s.title = cloned
+		s.rev += 1
+		s.commit_count += 1
+		s.last_id = id
+		return true
+	}
+
+	s := State{title = strings.clone("Slide Title"), editable = {1, 2}}
+	defer delete(s.title)
+
+	frame := make_frame(&s)
+	defer dagda.frame_destroy(&frame)
+
+	cfg := Editable_Text_Config{true, 0, on_commit, nil}
+	te: Text_Edit_State
+	defer text_edit_destroy(&te)
+
+	// Start preedit "e" in field A (id=1), then click field B (id=2).
+	testing.expect(t, text_edit_focus_id(&te, nil, nil, frame, cfg, 1, s.editable[:]))
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &pre, s.editable[:])
+	testing.expect_value(t, text_edit_click_id(&te, nil, nil, frame, cfg, 2, 100, s.editable[:]), false)
+	testing.expect_value(t, te.active_id, dagda.Object_Id(1))
+
+	// Cancel with Escape: preserves revision and clears composition.
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	_ = text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &esc, s.editable[:])
+	testing.expect_value(t, dagda.is_composing(&te.session), false)
+	testing.expect_value(t, s.title, "Slide Title")
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, s.commit_count, 0)
+
+	// Click field B again -> now focuses B.
+	testing.expect_value(t, text_edit_click_id(&te, nil, nil, frame, cfg, 2, 100, s.editable[:]), true)
+	testing.expect_value(t, te.active_id, dagda.Object_Id(2))
+
+	// Send TEXT_INPUT("Q") directly without any preceding keydown -> commits once under B (id=2).
+	ti: sdl.Event
+	ti.type = .TEXT_INPUT
+	ti.text.text = "Q"
+	res := text_edit_handle_event(&te, nil, nil, frame, cfg, &s, &ti, s.editable[:])
+	testing.expect_value(t, res.needs_rebuild, true)
+	dagda.frame_destroy(&frame)
+	frame = make_frame(&s)
+	text_edit_apply_committed(&te, nil, nil, frame, cfg, &res.pending_edit)
+	testing.expect_value(t, s.title, "Slide TitleQ")
+	testing.expect_value(t, s.rev, u64(1))
+	testing.expect_value(t, s.commit_count, 1)
+	testing.expect_value(t, s.last_id, dagda.Object_Id(2))
+}
+
+@(test)
 test_canvas_editable_text_click_places_caret_at_two_viewports :: proc(t: ^testing.T) {
 	font: Font
 	if !font_init(&font) {
