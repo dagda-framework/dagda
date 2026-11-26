@@ -439,3 +439,97 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 	// Existing fields are still present.
 	testing.expect(t, strings.contains(rep, `"canvas_bounds":{"x":900,"y":480,"width":200,"height":120}`))
 }
+
+@(test)
+test_hit_test_op :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {
+			{info = {id = 0, role = "under"}, kind = .Button, text = "Under", bounds = {x = 0, y = 0, width = 200, height = 200}},
+			{info = {id = 2, role = "over"}, kind = .Button, text = "Over", bounds = {x = 100, y = 100, width = 200, height = 200}},
+			{info = {id = 3, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}},
+		},
+	}
+	frame, ok := dagda.resolve_canvas(canvas, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	cases := [][2]string{
+		{`{"op":"hit-test","x":270,"y":150}`, `{"ok":true,"id":2}`},   // overlap: last drawn wins
+		{`{"op":"hit-test","x":130,"y":10}`, `{"ok":true,"id":0}`},    // ID 0 is a valid hit
+		{`{"op":"hit-test","x":1079,"y":520}`, `{"ok":true,"id":3}`},  // partly clipped canvas element
+		{`{"op":"hit-test","x":10,"y":270}`, `{"ok":true,"id":null}`}, // letterbox miss
+		{`{"op":"hit-test","x":"10","y":270}`, `{"ok":false,"error":"Malformed_Request"}`},
+		{`{"op":"hit-test","x":10}`, `{"ok":false,"error":"Malformed_Request"}`},
+	}
+	for caze in cases {
+		rep, applied := dispatch(frame, test_counter_handle, &c, caze[0])
+		defer delete(rep)
+		testing.expect_value(t, applied, false)
+		testing.expect_value(t, rep, caze[1])
+	}
+	testing.expect_value(t, c.count, 0) // the query changed no app state
+}
+
+@(test)
+test_hit_test_numeric_tokens :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {{info = {id = 3, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}}},
+	}
+	viewports := [][2]f32{{1200, 540}, {720, 540}}
+	for viewport in viewports {
+		frame, ok := dagda.resolve_canvas(canvas, {width = viewport[0], height = viewport[1]})
+		testing.expect(t, ok)
+		// A huge integer token that is still a finite f32 must
+		// not wrap: the point is far outside and simply misses.
+		huge, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":18446744073709551746,"y":150}`)
+		defer delete(huge)
+		testing.expect_value(t, huge, `{"ok":true,"id":null}`)
+		// Immediately inside / first outside the clipped edge.
+		inside_x := viewport[0] == 1200 ? "1079" : "719"
+		outside_x := viewport[0] == 1200 ? "1080" : "720"
+		inside_y := viewport[0] == 1200 ? "520" : "450"
+		inside_req := fmt.tprintf(`{{"op":"hit-test","x":%s,"y":%s}}`, inside_x, inside_y)
+		testing.expect_value(t, inside_req, viewport[0] == 1200 ? `{"op":"hit-test","x":1079,"y":520}` : `{"op":"hit-test","x":719,"y":450}`)
+		inside, _ := dispatch(frame, test_counter_handle, &c, inside_req)
+		defer delete(inside)
+		testing.expect_value(t, inside, `{"ok":true,"id":3}`)
+		outside_req := fmt.tprintf(`{{"op":"hit-test","x":%s,"y":%s}}`, outside_x, inside_y)
+		testing.expect_value(t, outside_req, viewport[0] == 1200 ? `{"op":"hit-test","x":1080,"y":520}` : `{"op":"hit-test","x":720,"y":450}`)
+		outside, _ := dispatch(frame, test_counter_handle, &c, outside_req)
+		defer delete(outside)
+		testing.expect_value(t, outside, `{"ok":true,"id":null}`)
+		// Out of finite f32 range is malformed; fractional and
+		// exponent forms stay valid.
+		big, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1e40,"y":150}`)
+		defer delete(big)
+		testing.expect_value(t, big, `{"ok":false,"error":"Malformed_Request"}`)
+		frac, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1.5e2,"y":150}`)
+		defer delete(frac)
+		testing.expect_value(t, frac, `{"ok":true,"id":null}`)
+		dagda.frame_destroy(&frame)
+	}
+}
+
+@(test)
+test_hit_test_f32_max_coordinates :: proc(t: ^testing.T) {
+	c: Test_Counter
+	frame, ok := dagda.resolve(dagda.View{elements = {{info = {id = 0, role = "a"}, kind = .Button, text = "A"}}}, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+	cases := []string{
+		`{"op":"hit-test","x":340282346638528859811704183484516925440,"y":150}`,
+		`{"op":"hit-test","x":-340282346638528859811704183484516925440,"y":150}`,
+	}
+	for req in cases {
+		rep, _ := dispatch(frame, test_counter_handle, &c, req)
+		defer delete(rep)
+		testing.expect_value(t, rep, `{"ok":true,"id":null}`)
+	}
+	big, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1e40,"y":150}`)
+	defer delete(big)
+	testing.expect_value(t, big, `{"ok":false,"error":"Malformed_Request"}`)
+}

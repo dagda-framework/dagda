@@ -12,6 +12,7 @@ import "dagda:dagda"
 //   {"op":"inspect"}                          -> list all resolved elements
 //   {"op":"inspect","role":"counter.value"}   -> discover resolved elements by role
 //   {"op":"invoke","id":2,"action":"activate"} -> invoke an advertised action by ID
+//   {"op":"hit-test","x":120,"y":40}          -> topmost element at a window point, or null
 // Replies:
 //   {"ok":true,"elements":[...]}
 //   {"ok":true,"id":2,"action":"activate"}
@@ -287,6 +288,71 @@ extract_top_level_u64 :: proc(line: string, target_key: string) -> (val: u64, fo
 	}
 }
 
+// The exact largest finite f32, widened to f64. A rounded
+// decimal cutoff would reject that last representable value.
+max_f32_widened :: proc() -> f64 {
+	return f64(transmute(f32)u32(0x7F7FFFFF))
+}
+
+// parse_f32_token converts an original JSON number token to a
+// finite f32 without going through the parser's integer value,
+// so huge integer tokens cannot wrap before conversion. Valid
+// fractional and exponent forms are accepted; anything outside
+// the finite f32 range is rejected.
+parse_f32_token :: proc(kind: json.Token_Kind, text: string) -> (f32, bool) {
+	if kind != .Integer && kind != .Float {
+		return 0, false
+	}
+	val, ok := strconv.parse_f64(text)
+	if !ok || val != val || val > max_f32_widened() || val < -max_f32_widened() {
+		return 0, false
+	}
+	return f32(val), true
+}
+
+extract_top_level_f32 :: proc(line: string, target_key: string) -> (val: f32, found: bool, ok: bool) {
+	t := json.make_tokenizer(line, .JSON, true)
+	depth := 0
+	key_matches := false
+	pending := false
+	for {
+		token, err := json.get_token(&t)
+		if token.kind == .EOF {
+			return val, found, found
+		}
+		if err != .None {
+			return 0, false, false
+		}
+		if pending {
+			if depth == 1 {
+				parsed, valid := parse_f32_token(token.kind, token.text)
+				if !valid {
+					return 0, true, false
+				}
+				val = parsed
+				found = true
+			}
+			pending = false
+		}
+		switch token.kind {
+		case .Open_Brace, .Open_Bracket:
+			depth += 1
+		case .Close_Brace, .Close_Bracket:
+			depth -= 1
+		case .String:
+			if depth == 1 {
+				key_matches = is_key_name(token.text, target_key)
+			}
+		case .Colon:
+			if depth == 1 && key_matches {
+				pending = true
+			}
+			key_matches = false
+		case .Null, .False, .True, .Infinity, .NaN, .Integer, .Float, .Ident, .Comma, .EOF, .Invalid:
+		}
+	}
+}
+
 // dispatch handles one newline-delimited JSON request against a resolved
 // dagda.Frame and Action_Handler. It returns the owned JSON reply line
 // (caller deletes) and whether an action was applied (so the host can rebuild
@@ -360,6 +426,28 @@ dispatch :: proc(
 			return reply_error("Unknown_Role"), false
 		}
 		strings.write_string(&b, "]}")
+		return strings.to_string(b), false
+
+	case "hit-test":
+		// Read-only: coordinates are logical window coordinates,
+		// the same space inspect reports as bounds. Delegates to
+		// dagda.hit_test, so a query answers exactly what a
+		// pointer press would hit without touching focus,
+		// actions, or application state. ID 0 is a valid hit.
+		x, _, ok_x := extract_top_level_f32(line, "x")
+		y, _, ok_y := extract_top_level_f32(line, "y")
+		if !ok_x || !ok_y {
+			return reply_error("Malformed_Request"), false
+		}
+		b: strings.Builder
+		strings.builder_init(&b)
+		strings.write_string(&b, "{\"ok\":true,\"id\":")
+		if hit_id, hit := dagda.hit_test(frame, {x = x, y = y}); hit {
+			strings.write_u64(&b, u64(hit_id))
+		} else {
+			strings.write_string(&b, "null")
+		}
+		strings.write_byte(&b, '}')
 		return strings.to_string(b), false
 
 	case "invoke":

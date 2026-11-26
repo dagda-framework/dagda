@@ -10,6 +10,7 @@ import "dagda:dagda/driver"
 usage :: proc() {
 	fmt.eprintln("usage: dagda-client <socket-path> inspect [role]")
 	fmt.eprintln("       dagda-client <socket-path> invoke  <id> <action>")
+	fmt.eprintln("       dagda-client <socket-path> hit-test <x> <y>  (logical window coordinates, as in inspect bounds)")
 	fmt.eprintln("       dagda-client <socket-path> edits   <id>")
 	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> text <text>")
 	fmt.eprintln("       dagda-client <socket-path> preview <id> <edit> <base_revision> none")
@@ -116,6 +117,21 @@ run_client :: proc() -> int {
 			return 2
 		}
 		strings.write_byte(&b, '}')
+	case "hit-test":
+		if len(os.args) != 5 {
+			usage()
+			return 2
+		}
+		x, ok_x := strconv.parse_f64(os.args[3])
+		y, ok_y := strconv.parse_f64(os.args[4])
+		// Coordinates must be finite f32 window coordinates,
+		// matching the wire decoder's range.
+		max_coord := f64(transmute(f32)u32(0x7F7FFFFF)) // exact f32 maximum, widened
+		if !ok_x || !ok_y || x != x || y != y || x > max_coord || x < -max_coord || y > max_coord || y < -max_coord {
+			usage()
+			return 2
+		}
+		fmt.sbprintf(&b, "{{\"op\":\"hit-test\",\"x\":%g,\"y\":%g}}", x, y)
 	case:
 		usage()
 		return 2
