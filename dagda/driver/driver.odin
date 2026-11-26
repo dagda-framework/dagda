@@ -12,6 +12,7 @@ import "dagda:dagda"
 //   {"op":"inspect"}                          -> list all resolved elements
 //   {"op":"inspect","role":"counter.value"}   -> discover resolved elements by role
 //   {"op":"invoke","id":2,"action":"activate"} -> invoke an advertised action by ID
+//   {"op":"hit-test","x":120,"y":40}          -> topmost element at a window point, or null
 // Replies:
 //   {"ok":true,"elements":[...]}
 //   {"ok":true,"id":2,"action":"activate"}
@@ -360,6 +361,28 @@ dispatch :: proc(
 			return reply_error("Unknown_Role"), false
 		}
 		strings.write_string(&b, "]}")
+		return strings.to_string(b), false
+
+	case "hit-test":
+		// Read-only: coordinates are logical window coordinates,
+		// the same space inspect reports as bounds. Delegates to
+		// dagda.hit_test, so a query answers exactly what a
+		// pointer press would hit without touching focus,
+		// actions, or application state. ID 0 is a valid hit.
+		x, ok_x := get_number(obj, "x")
+		y, ok_y := get_number(obj, "y")
+		if !ok_x || !ok_y {
+			return reply_error("Malformed_Request"), false
+		}
+		b: strings.Builder
+		strings.builder_init(&b)
+		strings.write_string(&b, "{\"ok\":true,\"id\":")
+		if hit_id, hit := dagda.hit_test(frame, {x = x, y = y}); hit {
+			strings.write_u64(&b, u64(hit_id))
+		} else {
+			strings.write_string(&b, "null")
+		}
+		strings.write_byte(&b, '}')
 		return strings.to_string(b), false
 
 	case "invoke":

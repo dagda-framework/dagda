@@ -439,3 +439,35 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 	// Existing fields are still present.
 	testing.expect(t, strings.contains(rep, `"canvas_bounds":{"x":900,"y":480,"width":200,"height":120}`))
 }
+
+@(test)
+test_hit_test_op :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {
+			{info = {id = 0, role = "under"}, kind = .Button, text = "Under", bounds = {x = 0, y = 0, width = 200, height = 200}},
+			{info = {id = 2, role = "over"}, kind = .Button, text = "Over", bounds = {x = 100, y = 100, width = 200, height = 200}},
+			{info = {id = 3, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}},
+		},
+	}
+	frame, ok := dagda.resolve_canvas(canvas, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	cases := [][2]string{
+		{`{"op":"hit-test","x":270,"y":150}`, `{"ok":true,"id":2}`},   // overlap: last drawn wins
+		{`{"op":"hit-test","x":130,"y":10}`, `{"ok":true,"id":0}`},    // ID 0 is a valid hit
+		{`{"op":"hit-test","x":1079,"y":520}`, `{"ok":true,"id":3}`},  // partly clipped canvas element
+		{`{"op":"hit-test","x":10,"y":270}`, `{"ok":true,"id":null}`}, // letterbox miss
+		{`{"op":"hit-test","x":"10","y":270}`, `{"ok":false,"error":"Malformed_Request"}`},
+		{`{"op":"hit-test","x":10}`, `{"ok":false,"error":"Malformed_Request"}`},
+	}
+	for caze in cases {
+		rep, applied := dispatch(frame, test_counter_handle, &c, caze[0])
+		defer delete(rep)
+		testing.expect_value(t, applied, false)
+		testing.expect_value(t, rep, caze[1])
+	}
+	testing.expect_value(t, c.count, 0) // the query changed no app state
+}
