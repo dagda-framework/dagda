@@ -797,8 +797,8 @@ text_edit_handle_event :: proc(
 		key := ev.key.key
 		mod := ev.key.mod
 		shift := (mod & sdl.KMOD_SHIFT) != {}
-		ctrl := (mod & sdl.KMOD_CTRL) != {}
-		alt_or_gui := (mod & (sdl.KMOD_ALT | sdl.KMOD_GUI)) != {}
+		ctrl := has_primary_modifier(mod)
+		alt_or_gui := (mod & (sdl.KMOD_ALT | non_primary_modifier())) != {}
 
 		if key == sdl.K_ESCAPE {
 			text_edit_drag_end(te)
