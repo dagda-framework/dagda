@@ -1,7 +1,7 @@
 <h1>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dagda-wordmark-dark.png">
-    <img alt="Dagda" src="assets/brand/dagda-wordmark.png" width="240">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dagda-wordmark-dark.svg">
+    <img alt="Dagda" src="assets/brand/dagda-wordmark.svg" width="240">
   </picture>
 </h1>
 
