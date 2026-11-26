@@ -114,10 +114,15 @@ cd my-counter
 "$DAGDA/scripts/odin.sh" build . -collection:dagda="$DAGDA" -out:my-counter
 ```
 
-Build the agent client once, from the Dagda checkout:
+Still in `my-counter`, build the agent client once. The source
+is given as an absolute path inside the checkout, so this also
+works when the checkout has no `build/` directory yet:
 
 ```sh
-"$DAGDA/scripts/odin.sh" build examples/dagda-client -collection:dagda="$DAGDA" -out:"$DAGDA/build/dagda-client"
+mkdir -p "$DAGDA/build"
+"$DAGDA/scripts/odin.sh" build "$DAGDA/examples/dagda-client" -collection:dagda="$DAGDA" -out:"$DAGDA/build/dagda-client"
+CLIENT="$DAGDA/build/dagda-client"
+echo "CLIENT=$CLIENT"
 ```
 
 Start your counter on a socket in a fresh private directory
@@ -130,12 +135,15 @@ echo "SOCK=$SOCK"
 ./my-counter --socket "$SOCK"
 ```
 
-Click **Increment** once in the window. In terminal 2, paste the
-printed `SOCK=...` line, then inspect the count — it reads `1`:
+Click **Increment** once in the window. In terminal 2 — a fresh
+shell that needs nothing else — paste both printed assignments
+(the `SOCK=...` line from terminal 1 and the `CLIENT=...` line
+from the build step), then inspect the count — it reads `1`:
 
 ```sh
 SOCK=/tmp/my-counter.AbCdEf/counter.sock   # paste your line
-"$DAGDA/build/dagda-client" "$SOCK" inspect counter.value
+CLIENT=/path/to/dagda/build/dagda-client   # paste your line
+"$CLIENT" "$SOCK" inspect counter.value
 # {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"1",...}]}
 ```
 
@@ -143,10 +151,10 @@ Now let the agent press the same button. Discover its ID by
 role, invoke it, and inspect again — the count reads `2`:
 
 ```sh
-"$DAGDA/build/dagda-client" "$SOCK" inspect counter.increment
+"$CLIENT" "$SOCK" inspect counter.increment
 # {"ok":true,"elements":[{"id":2,"role":"counter.increment","kind":"button","text":"Increment",...}]}
-"$DAGDA/build/dagda-client" "$SOCK" invoke 2 activate
-"$DAGDA/build/dagda-client" "$SOCK" inspect counter.value
+"$CLIENT" "$SOCK" invoke 2 activate
+"$CLIENT" "$SOCK" inspect counter.value
 # {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"2",...}]}
 ```
 
@@ -157,6 +165,10 @@ file, and `rmdir "$SOCK_DIR"` in terminal 1 cleans up.
 
 - The in-repo version of this app, with its acceptance test, is
   [examples/counter](../examples/counter/).
+- A shared editable headline lives in
+  [examples/shared-text](../examples/shared-text/), and the
+  headless advertised-edit workflow in
+  [examples/advertised-edit-app](../examples/advertised-edit-app/).
 - For fixed-aspect canvas layouts, advertised edits, and IME
   text editing, see the examples under `examples/` and the
   framework packages under `dagda/` in the checkout.
