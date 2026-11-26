@@ -4804,8 +4804,25 @@ test_multiline_paste_normalization_failure_and_control_push_growth_failure :: pr
 	dagda.set_caret(&h.text_edit.session, state.text, 8, true)
 	testing.expect(t, clipboard_set(h.clipboard, "x\r\ny"))
 
+	// The clipboard owns the first clone. Fail only the normalization buffer
+	// and allow later allocations so a mistaken deletion could still commit.
+	Paste_Allocator :: struct {
+		backing: mem.Allocator,
+		attempts: int,
+	}
+	paste_alloc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+		a := (^Paste_Allocator)(data)
+		if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+			a.attempts += 1
+			if a.attempts == 2 {
+				return nil, .Out_Of_Memory
+			}
+		}
+		return a.backing.procedure(a.backing.data, mode, size, alignment, old_memory, old_size, loc)
+	}
 	orig_alloc := h.text_edit.session.allocator
-	h.text_edit.session.allocator = mem.nil_allocator()
+	alloc := Paste_Allocator{backing = orig_alloc}
+	h.text_edit.session.allocator = {procedure = paste_alloc, data = &alloc}
 	paste_ev: sdl.Event
 	paste_ev.type = .KEY_DOWN
 	paste_ev.key.windowID = sdl.GetWindowID(win)
@@ -4814,6 +4831,7 @@ test_multiline_paste_normalization_failure_and_control_push_growth_failure :: pr
 	paste_ev.key.down = true
 	res := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &state, &paste_ev, nil, h.clipboard, ml_ids[:])
 	h.text_edit.session.allocator = orig_alloc
+	testing.expect_value(t, alloc.attempts, 2)
 
 	// Atomic failure: zero commits, no deletion, selection [3..8] untouched.
 	testing.expect(t, res.consumed)
