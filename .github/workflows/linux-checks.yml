@@ -122,6 +122,12 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/composition-conflict/tests/e2e_composition_conflict.py build/conflict-capture
 
+      - name: Run the paragraph interleaving test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/paragraph-interleaving/tests/e2e_paragraph_interleaving.py
+
       - name: Run the title edit conflict test
         env:
           SDL_VIDEODRIVER: dummy
