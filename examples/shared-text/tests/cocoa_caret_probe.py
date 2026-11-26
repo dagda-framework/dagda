@@ -443,27 +443,47 @@ class MacOSNativePointer:
 def deliver_click(
     proc: subprocess.Popen | None,
     reader: DeadlineLineReader | None,
-    info: dict[str, object],
+    info: dict[str, object] | None,
     win_x: float,
     win_y: float,
     native_ptr: object | None,
-) -> tuple[str, tuple[float, float]]:
+    query_info_fn=None,
+) -> tuple[str, tuple[float, float], dict[str, object] | None]:
     """Deliver a click at logical window coordinates (win_x, win_y).
-    Returns (provenance_label, delivered_coords).
+
+    In native mode, re-reads current host window-info right before posting,
+    refuses to post if origin is unavailable, focus was lost, or layout sizes
+    changed since the target was measured, and converts using the latest origin.
+    Returns (provenance_label, delivered_coords, live_info).
     """
     if native_ptr is not None:
-        if not info.get("has_pos") or info.get("pos_x") is None or info.get("pos_y") is None:
-            raise RuntimeError(f"refusing to post native click without a valid window content origin: {info}")
-        if not info.get("focused"):
-            raise RuntimeError(f"refusing to post native click to an unfocused window: {info}")
-        screen_x = float(info["pos_x"]) + win_x
-        screen_y = float(info["pos_y"]) + win_y
+        if query_info_fn is not None:
+            live_info = query_info_fn()
+        elif proc is not None and reader is not None:
+            live_info = query_window_info(proc, reader)
+        else:
+            live_info = info
+        assert live_info is not None
+        if not live_info.get("has_pos") or live_info.get("pos_x") is None or live_info.get("pos_y") is None:
+            raise RuntimeError(f"refusing to post native click without a valid window content origin: {live_info}")
+        if not live_info.get("focused"):
+            raise RuntimeError(f"refusing to post native click to an unfocused window: {live_info}")
+        if info is not None:
+            expected_sizes = (info["win_w"], info["win_h"], info["out_w"], info["out_h"])
+            live_sizes = (live_info["win_w"], live_info["win_h"], live_info["out_w"], live_info["out_h"])
+            if live_sizes != expected_sizes:
+                raise RuntimeError(
+                    f"window/output layout size changed before native click: "
+                    f"expected {expected_sizes}, got {live_sizes}"
+                )
+        screen_x = float(live_info["pos_x"]) + win_x
+        screen_y = float(live_info["pos_y"]) + win_y
         native_ptr.click_screen(screen_x, screen_y)
-        return "macos-cgevent", (screen_x, screen_y)
+        return "macos-cgevent", (screen_x, screen_y), live_info
     assert proc is not None and reader is not None
     send_control(proc, reader, f"click {win_x:.2f} {win_y:.2f}")
     time.sleep(0.05)
-    return "sdl-injected", (win_x, win_y)
+    return "sdl-injected", (win_x, win_y), info
 
 
 def verify_native_pointer_guards() -> None:
@@ -512,10 +532,154 @@ def verify_native_pointer_guards() -> None:
         "CONTROL_OK window-info driver=cocoa pos=0,0 win=800x540 output=800x540 density=1.0000 display_scale=1.0000 focused=1"
     )
     assert zero_origin["has_pos"] is True and zero_origin["pos_x"] == 0 and zero_origin["pos_y"] == 0
-    mode, coords = deliver_click(None, None, zero_origin, 66.5, 211.25, poster)
+    mode, coords, _ = deliver_click(None, None, zero_origin, 66.5, 211.25, poster)
     assert mode == "macos-cgevent" and coords == (66.5, 211.25), (mode, coords)
     assert poster.calls == [(66.5, 211.25)], poster.calls
     print("[native-guards] unavailable origin & unfocused window posted 0 clicks; legitimate (0,0) origin converted cleanly")
+
+
+def verify_two_click_native_guards(app_bin: Path, client_bin: Path, capture_dir: Path) -> None:
+    """Exercise verify_grapheme_clicks directly with a recording native poster on a
+    real dummy-SDL shared-text host to prove per-click host-state re-reads:
+    1. Focus loss after click 1 withholds click 2 (only 1 click posted).
+    2. Origin move after click 1 (same layout size) converts click 2 with the new origin.
+    3. Layout size change after click 1 withholds click 2 (only 1 click posted).
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-two-click-guards."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared.sock"
+    proc = None
+    try:
+        env = dict(os.environ)
+        env["SDL_VIDEODRIVER"] = "dummy"
+        env.pop("DAGDA_SDL_HIGH_PIXEL_DENSITY", None)
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+            env=env,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        wait_for_startup(proc, reader, sock, timeout=10.0)
+
+        el0 = inspect_role(client_bin, sock, "canvas.title")
+        b0 = el0["bounds"]
+        send_control(proc, reader, f"click {b0['x'] + 2.0:.2f} {b0['y'] + b0['height'] * 0.5:.2f}")
+        send_control(proc, reader, f"text Caf{E_ACUTE_DECOMPOSED} ")
+        wait_for_role_text(client_bin, sock, "canvas.title", f"Caf{E_ACUTE_DECOMPOSED} Slide Title")
+
+        # Case 1: Focus lost after click 1 -> click 2 must be withheld.
+        state = {"focused": True, "dx": 0, "dy": 0, "dw": 0, "reads": 0}
+
+        def read_info() -> dict[str, object]:
+            state["reads"] += 1
+            base = query_window_info(proc, reader)
+            base["focused"] = state["focused"]
+            base["has_pos"] = True
+            base["pos_x"] = int(base["pos_x"] or 0) + state["dx"]
+            base["pos_y"] = int(base["pos_y"] or 0) + state["dy"]
+            base["win_w"] = int(base["win_w"]) + state["dw"]
+            return base
+
+        class ForwardingPoster:
+            def __init__(self, on_after_first) -> None:
+                self.calls: list[tuple[float, float]] = []
+                self.on_after_first = on_after_first
+
+            def click_screen(self, sx: float, sy: float) -> None:
+                self.calls.append((sx, sy))
+                cur = query_window_info(proc, reader)
+                wx = sx - (int(cur["pos_x"] or 0) + state["dx"])
+                wy = sy - (int(cur["pos_y"] or 0) + state["dy"])
+                send_control(proc, reader, f"click {wx:.2f} {wy:.2f}")
+                time.sleep(0.03)
+                if len(self.calls) == 1 and self.on_after_first is not None:
+                    self.on_after_first()
+
+        poster_focus = ForwardingPoster(lambda: state.__setitem__("focused", False))
+        try:
+            verify_grapheme_clicks(
+                stage="guard-focus-loss",
+                proc=proc,
+                reader=reader,
+                client_bin=client_bin,
+                sock=sock,
+                capture_dir=capture_dir,
+                prefix_before_e="Caf",
+                suffix_after_e=" Slide Title",
+                left_marker="[",
+                right_marker="]",
+                native_ptr=poster_focus,
+                require_min_scale=0.0,
+                query_info_fn=read_info,
+            )
+        except RuntimeError as exc:
+            assert "unfocused" in str(exc), str(exc)
+        else:
+            raise AssertionError("expected RuntimeError when focus is lost between click 1 and click 2")
+        assert len(poster_focus.calls) == 1, f"second click must be withheld on focus loss: {poster_focus.calls}"
+        assert state["reads"] >= 3, f"expected per-click window-info re-reads, got {state['reads']}"
+
+        # Case 2: Only origin shifts (+50, +30) after click 1 -> click 2 uses updated origin and succeeds.
+        state.update({"focused": True, "dx": 0, "dy": 0, "dw": 0, "reads": 0})
+        poster_move = ForwardingPoster(lambda: (state.__setitem__("dx", 50), state.__setitem__("dy", 30)))
+        res_move = verify_grapheme_clicks(
+            stage="guard-origin-shift",
+            proc=proc,
+            reader=reader,
+            client_bin=client_bin,
+            sock=sock,
+            capture_dir=capture_dir,
+            prefix_before_e="Caf[",
+            suffix_after_e=" Slide Title",
+            left_marker="<",
+            right_marker=">",
+            native_ptr=poster_move,
+            require_min_scale=0.0,
+            query_info_fn=read_info,
+        )
+        assert len(poster_move.calls) == 2, poster_move.calls
+        # Click 2's y must be shifted by +30 relative to click 1's y (same mid_y, +30 origin shift).
+        assert abs((poster_move.calls[1][1] - poster_move.calls[0][1]) - 30.0) <= 0.5, poster_move.calls
+        assert res_move["text"].encode("utf-8") == f"Caf[<{E_ACUTE_DECOMPOSED}> Slide Title".encode("utf-8")
+
+        # Case 3: Layout size changes after click 1 -> click 2 must be withheld.
+        state.update({"focused": True, "dx": 0, "dy": 0, "dw": 0, "reads": 0})
+        poster_resize = ForwardingPoster(lambda: state.__setitem__("dw", -40))
+        try:
+            verify_grapheme_clicks(
+                stage="guard-size-change",
+                proc=proc,
+                reader=reader,
+                client_bin=client_bin,
+                sock=sock,
+                capture_dir=capture_dir,
+                prefix_before_e="Caf[<",
+                suffix_after_e="> Slide Title",
+                left_marker="(",
+                right_marker=")",
+                native_ptr=poster_resize,
+                require_min_scale=0.0,
+                query_info_fn=read_info,
+            )
+        except RuntimeError as exc:
+            assert "size changed" in str(exc), str(exc)
+        else:
+            raise AssertionError("expected RuntimeError when layout size changes between click 1 and click 2")
+        assert len(poster_resize.calls) == 1, f"second click must be withheld on size change: {poster_resize.calls}"
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
+        proc = None
+        print("[two-click-guards] focus-loss withheld click 2; origin-shift converted click 2 with latest origin; size-change withheld click 2")
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 def query_measure(proc: subprocess.Popen, reader: DeadlineLineReader, px: float, text: str) -> float:
@@ -569,10 +733,12 @@ def verify_grapheme_clicks(
     suffix_after_e: str,
     left_marker: str,
     right_marker: str,
-    native_ptr: MacOSNativePointer | None,
+    native_ptr: object | None,
     require_min_scale: float,
+    query_info_fn=None,
 ) -> dict[str, object]:
-    info = query_window_info(proc, reader)
+    read_info = query_info_fn if query_info_fn is not None else (lambda: query_window_info(proc, reader))
+    info = read_info()
     if require_min_scale > 0.0:
         assert info["scale_x"] >= require_min_scale and info["scale_y"] >= require_min_scale, (
             f"[{stage}] required min scale {require_min_scale:.2f}x on both axes, "
@@ -594,7 +760,9 @@ def verify_grapheme_clicks(
 
     left_edge = text_x + w_before
     click_left_x = left_edge + grapheme_w * 0.25
-    click_mode, left_delivered = deliver_click(proc, reader, info, click_left_x, mid_y, native_ptr)
+    click_mode, left_delivered, _ = deliver_click(
+        proc, reader, info, click_left_x, mid_y, native_ptr, query_info_fn=read_info
+    )
 
     shot_left = capture_dir / f"{stage}-left-caret.png"
     send_control(proc, reader, f"screenshot {shot_left}")
@@ -623,7 +791,11 @@ def verify_grapheme_clicks(
 
     right_edge = text_x + w_after_r
     click_right_x = text_x + w_before_r + grapheme_w_r * 0.75
-    _, right_delivered = deliver_click(proc, reader, info, click_right_x, mid_y, native_ptr)
+    _, right_delivered, latest_info = deliver_click(
+        proc, reader, info, click_right_x, mid_y, native_ptr, query_info_fn=read_info
+    )
+    if latest_info is not None:
+        info = latest_info
 
     shot_right = capture_dir / f"{stage}-right-caret.png"
     send_control(proc, reader, f"screenshot {shot_right}")
@@ -704,6 +876,7 @@ def main() -> int:
 
     verify_startup_timeout_bounded()
     verify_native_pointer_guards()
+    verify_two_click_native_guards(app_bin, client_bin, capture_dir)
 
     sock_dir = Path(tempfile.mkdtemp(prefix="dagda-cocoa-caret."))
     os.chmod(sock_dir, 0o700)
