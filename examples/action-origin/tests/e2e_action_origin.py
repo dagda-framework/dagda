@@ -88,22 +88,16 @@ def wait_for_role_text(client_bin: Path, sock: Path, role: str, expected: str, t
     raise AssertionError(f"timed out waiting for {role} == {expected!r}; last={last}")
 
 
-def main() -> int:
-    treat_driver_as_local = "--treat-driver-as-local" in sys.argv[1:]
-    build_dir = ROOT / "build"
-    build_dir.mkdir(parents=True, exist_ok=True)
-    app_bin = build_dir / "action-origin"
-    client_bin = build_dir / "dagda-client"
-
-    subprocess.check_call([str(ODIN), "build", "examples/action-origin", "-collection:dagda=.", f"-out:{app_bin}"], cwd=ROOT)
-    subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
-
-    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-action-origin."))
+def run_mode(app_bin: Path, client_bin: Path, with_edits: bool, treat_driver_as_local: bool) -> None:
+    mode_name = "edits" if with_edits else "plain"
+    sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-action-origin-{mode_name}."))
     os.chmod(sock_dir, 0o700)
     sock = sock_dir / "origin.sock"
     proc = None
     try:
         cmd = [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"]
+        if with_edits:
+            cmd.append("--with-edits")
         if treat_driver_as_local:
             cmd.append("--treat-driver-as-local")
         proc = subprocess.Popen(
@@ -116,7 +110,7 @@ def main() -> int:
         )
         assert proc.stdout is not None
         reader = DeadlineLineReader(proc.stdout)
-        ready = reader.read_line("action-origin startup", timeout=5.0)
+        ready = reader.read_line(f"action-origin ({mode_name}) startup", timeout=5.0)
         assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
 
         # Discover editable current item and Add button.
@@ -183,20 +177,34 @@ def main() -> int:
         wait_for_role_text(client_bin, sock, "item.current", "Item 5!")
 
         print(
-            "[action-origin] driver(add_id=%d -> count=2,sel=0,origin=Driver,type 'X'->'abXcd',item1='Item 2') -> "
+            f"[action-origin:{mode_name}] driver(add_id={add_id} -> count=2,sel=0,origin=Driver,type 'X'->'abXcd',item1='Item 2') -> "
             "local_click(count=3,sel=2,origin=Local) -> local_enter(count=4,sel=3,origin=Local) -> "
-            "local_space(count=5,sel=4,origin=Local) -> tab_wrap('Item 5!')" % add_id
+            "local_space(count=5,sel=4,origin=Local) -> tab_wrap('Item 5!')"
         )
 
         send_control(proc, reader, "quit")
         proc.wait(timeout=5)
         assert proc.returncode == 0 and not sock.exists()
         proc = None
-        print("All action-origin checks passed.")
-        return 0
     finally:
         stop_process(proc)
         shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def main() -> int:
+    treat_driver_as_local = "--treat-driver-as-local" in sys.argv[1:]
+    build_dir = ROOT / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    app_bin = build_dir / "action-origin"
+    client_bin = build_dir / "dagda-client"
+
+    subprocess.check_call([str(ODIN), "build", "examples/action-origin", "-collection:dagda=.", f"-out:{app_bin}"], cwd=ROOT)
+    subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
+
+    for with_edits in (False, True):
+        run_mode(app_bin, client_bin, with_edits, treat_driver_as_local)
+    print("All action-origin checks passed.")
+    return 0
 
 
 if __name__ == "__main__":

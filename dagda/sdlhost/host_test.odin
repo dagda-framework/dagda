@@ -3808,7 +3808,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 }
 
 @(test)
-test_action_origin_local_pointer_keyboard_and_driver_with_and_without_edits :: proc(t: ^testing.T) {
+test_action_origin_local_pointer_keyboard_and_thread_scope :: proc(t: ^testing.T) {
 	Origin_App :: struct {
 		origins:       [dynamic]Action_Origin,
 		frame_origins: [dynamic]Action_Origin,
@@ -3842,9 +3842,6 @@ test_action_origin_local_pointer_keyboard_and_driver_with_and_without_edits :: p
 	}
 	noop_pointer :: proc(_: rawptr, _: Pointer_Event) -> bool {
 		return false
-	}
-	dummy_edit_handler :: proc(_: rawptr, _: dagda.Action_Target, _: string, _: dagda.Edit_Argument) -> dagda.Edit_Result {
-		return .Unknown_Object
 	}
 
 	// Outside any host-delivered handler call, origin is .None.
@@ -3917,68 +3914,8 @@ test_action_origin_local_pointer_keyboard_and_driver_with_and_without_edits :: p
 	testing.expect(t, host_rebuild_frame(&h))
 	testing.expect_value(t, current_action_origin(), Action_Origin.None)
 
-	// 4. Driver invoke via real Unix socket (without advertised edits AND with advertised edits) -> .Driver.
-	sock_dir := fmt.tprintf("/tmp/dagda-origin-test-%d", posix.getpid())
-	_ = os.make_directory(sock_dir)
-	defer _ = os.remove(sock_dir)
-	sock_path := fmt.tprintf("%s/app.sock", sock_dir)
-	defer _ = os.remove(sock_path)
-
-	srv: driver.Server
-	testing.expect(t, driver.server_start(&srv, sock_path))
-	defer driver.server_stop(&srv)
-
-	send_invoke :: proc(t: ^testing.T, sock_path: string, srv: ^driver.Server, h: ^Host, with_edits: bool) {
-		Client_Ctx :: struct {
-			sock: string,
-			ok:   bool,
-		}
-		cctx := Client_Ctx{sock = sock_path}
-		ct := thread.create_and_start_with_poly_data(&cctx, proc(c: ^Client_Ctx) {
-			fd, ok := driver.connect_unix(c.sock)
-			if !ok {
-				return
-			}
-			defer posix.close(fd)
-			if !driver.write_all(fd, "{\"op\":\"invoke\",\"id\":2,\"action\":\"activate\"}\n") {
-				return
-			}
-			reader := driver.Line_Reader{fd = fd}
-			if reply, rok := driver.read_line(&reader); rok {
-				c.ok = strings.contains(reply, "\"ok\":true")
-			}
-		})
-		deadline := time.tick_now()
-		applied := false
-		for time.tick_since(deadline) < 2 * time.Second {
-			driver_action := Action_Dispatch{handler = h.app.handle, user_data = h.app.user_data, origin = .Driver}
-			rebuild_failed := false
-			if with_edits {
-				applied, rebuild_failed = driver.server_poll_edits(srv, &h.frame, action_dispatch_trampoline, &driver_action, h.app.edits, h, host_rebuild_cb)
-			} else {
-				applied, rebuild_failed = driver.server_poll(srv, &h.frame, action_dispatch_trampoline, &driver_action, h, host_rebuild_cb)
-			}
-			testing.expect_value(t, rebuild_failed, false)
-			if applied {
-				break
-			}
-			time.sleep(2 * time.Millisecond)
-		}
-		thread.join(ct)
-		thread.destroy(ct)
-		testing.expect(t, applied)
-		testing.expect(t, cctx.ok)
-	}
-
-	send_invoke(t, sock_path, &srv, &h, false)
-	testing.expect_value(t, current_action_origin(), Action_Origin.None)
-
-	h.app.edits = {handler = dummy_edit_handler}
-	send_invoke(t, sock_path, &srv, &h, true)
-	testing.expect_value(t, current_action_origin(), Action_Origin.None)
-
-	// Verify exact recorded origins: 4 Local (click, pointer-click, Enter, Space) + 2 Driver (plain, edits).
-	expected := [6]Action_Origin{.Local, .Local, .Local, .Local, .Driver, .Driver}
+	// Verify exact recorded origins: 4 Local (click, pointer-click, Enter, Space).
+	expected := [4]Action_Origin{.Local, .Local, .Local, .Local}
 	testing.expect_value(t, len(s.origins), len(expected))
 	for want, i in expected {
 		if i < len(s.origins) {
@@ -3986,7 +3923,7 @@ test_action_origin_local_pointer_keyboard_and_driver_with_and_without_edits :: p
 		}
 	}
 	// Every single frame builder invocation observed .None.
-	testing.expect(t, len(s.frame_origins) >= 6)
+	testing.expect(t, len(s.frame_origins) >= 4)
 	for fo in s.frame_origins {
 		testing.expect_value(t, fo, Action_Origin.None)
 	}

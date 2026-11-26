@@ -44,6 +44,7 @@ jobs:
           ./scripts/odin.sh test examples/title-driver -collection:dagda=.
           ./scripts/odin.sh test examples/title-window -collection:dagda=.
           ./scripts/odin.sh test examples/shared-text -collection:dagda=.
+          ./scripts/odin.sh test examples/action-origin -collection:dagda=.
 
       - name: Build the title window and counter example
         run: |
