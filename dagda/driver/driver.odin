@@ -110,19 +110,32 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 		// size are preserved exactly, even when the other axis
 		// is clipped.
 		cb := el.canvas_bounds
+		// Compare each extent with the space remaining on its
+		// axis instead of summing origin + size, whose rounding
+		// could hide a far-edge overrun.
 		vis_x, vis_w: f32
-		if cb.x >= 0 && cb.x + cb.width <= canvas.width {
-			vis_x, vis_w = cb.x, cb.width
+		if cb.x >= 0 {
+			remaining := canvas.width - cb.x
+			if cb.width <= remaining {
+				vis_x, vis_w = cb.x, cb.width
+			} else {
+				vis_x, vis_w = cb.x, remaining
+			}
 		} else {
-			vis_x = max(cb.x, f32(0))
-			vis_w = min(cb.x + cb.width, canvas.width) - vis_x
+			vis_x = 0
+			vis_w = min(cb.width + cb.x, canvas.width)
 		}
 		vis_y, vis_h: f32
-		if cb.y >= 0 && cb.y + cb.height <= canvas.height {
-			vis_y, vis_h = cb.y, cb.height
+		if cb.y >= 0 {
+			remaining := canvas.height - cb.y
+			if cb.height <= remaining {
+				vis_y, vis_h = cb.y, cb.height
+			} else {
+				vis_y, vis_h = cb.y, remaining
+			}
 		} else {
-			vis_y = max(cb.y, f32(0))
-			vis_h = min(cb.y + cb.height, canvas.height) - vis_y
+			vis_y = 0
+			vis_h = min(cb.height + cb.y, canvas.height)
 		}
 		strings.write_string(b, ",\"visible_canvas_bounds\":")
 		if vis_w <= 0 || vis_h <= 0 {
