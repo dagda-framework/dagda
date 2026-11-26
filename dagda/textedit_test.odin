@@ -237,3 +237,32 @@ test_composition_lifecycle :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.revision, 1)
 	testing.expect(t, !is_composing(&session))
 }
+
+@(test)
+test_set_caret_clamps_to_grapheme_boundaries_and_extends_both_directions :: proc(t: ^testing.T) {
+	// "Ae\u0301B": 'A' (0..1), 'e' + U+0301 (1..4), 'B' (4..5).
+	text := "Ae\u0301B"
+	session: Text_Session
+	text_session_init(&session, text)
+	defer text_session_destroy(&session)
+
+	// Mid-grapheme offset (byte 2, between 'e' and U+0301) clamps to grapheme start (1).
+	set_caret(&session, text, 2, false)
+	testing.expect_value(t, session.anchor, 1)
+	testing.expect_value(t, session.caret, 1)
+
+	// Extend right across decomposed e+U+0301 to byte 4.
+	set_caret(&session, text, 4, true)
+	testing.expect_value(t, session.anchor, 1)
+	testing.expect_value(t, session.caret, 4)
+
+	// Extend past right end clamps to len(text).
+	set_caret(&session, text, 99, true)
+	testing.expect_value(t, session.anchor, 1)
+	testing.expect_value(t, session.caret, len(text))
+
+	// Extend past left end clamps to 0 while anchor stays fixed.
+	set_caret(&session, text, -10, true)
+	testing.expect_value(t, session.anchor, 1)
+	testing.expect_value(t, session.caret, 0)
+}

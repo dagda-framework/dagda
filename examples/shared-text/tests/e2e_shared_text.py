@@ -171,6 +171,27 @@ def glyph_mask(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[frozenset[
     return frozenset(pts), max_dx
 
 
+def glyph_x_span(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[float, float]:
+    """Return (min_x, max_x) window-pixel X coordinates of rendered white text glyphs inside bounds."""
+    x0 = max(0, int(math.floor(bounds["x"])) + 4)
+    y0 = max(0, int(math.floor(bounds["y"])) + 4)
+    x1 = min(w, int(math.ceil(bounds["x"] + bounds["width"])) - 4)
+    y1 = min(h, int(math.ceil(bounds["y"] + bounds["height"])) - 4)
+    min_x = x1
+    max_x = -1
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        for x in range(x0, x1):
+            r, g, b = rgb[row_off + x * 3], rgb[row_off + x * 3 + 1], rgb[row_off + x * 3 + 2]
+            if r >= 160 and g >= 160 and b >= 160:
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+    assert max_x > min_x, f"no glyphs found inside {bounds}"
+    return float(min_x), float(max_x + 1)
+
+
 def inspect_visual_state(w: int, h: int, rgb: bytearray, bounds: dict) -> tuple[int, int, int]:
     """Return (preedit_bg_hits, sel_bg_hits, max_amber_row_width) inside bounds."""
     x0 = max(0, int(math.floor(bounds["x"])))
@@ -413,6 +434,9 @@ def main() -> int:
 
         verify_keyboard_tab_traversal(app_bin, client_bin, capture_dir)
         verify_clipboard_copy_paste(app_bin, client_bin, capture_dir)
+        drag_sizes = ("800x540", "640x480") if os.environ.get("SDL_VIDEODRIVER") == "dummy" else ("800x540",)
+        for sz in drag_sizes:
+            verify_mouse_drag_selection(app_bin, client_bin, capture_dir, sz)
         print("All shared-text checks passed.")
         return 0
     finally:
@@ -638,6 +662,131 @@ def verify_clipboard_copy_paste(app_bin: Path, client_bin: Path, capture_dir: Pa
             f"[shared-clip] copy('fe\\u0301',rev=1) -> paste_v2('Cafe\\u0301 fe\\u0301',rev=2,id=2) -> "
             f"undo('Cafe\\u0301 Title',rev=3) -> multiline_reject(sel_kept->'Cafe\\u0301 X',rev=4->undo rev=5) -> "
             f"preedit_ctrl_v_intact(bg={pre2_bg},uline_w={uline2_w}->'Cafe\\u0301 Titleé',rev=6)"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_mouse_drag_selection(app_bin: Path, client_bin: Path, capture_dir: Path, req_size: str) -> None:
+    """Mouse drag selection in both directions across a decomposed é (U+0065 + U+0301):
+    copy and verify exact UTF-8 bytes, type over selection, undo once, verify revision
+    is unchanged by selection alone, and verify clamping past both ends.
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix=f"dagda-shared-drag-{req_size}."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared-drag.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", req_size, "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line(f"shared-text drag ({req_size}) startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        # Settle initial window map, set title to "Ae\u0301B" (decomposed é = U+0065 + U+0301).
+        init_png = capture_dir / f"08-drag-{req_size}-init.png"
+        send_control(proc, reader, f"screenshot {init_png}")
+        c1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        c2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        assert c1 == 0 and c2 == 0
+        b1, b2 = el1_resp["elements"][0]["bounds"], el2_resp["elements"][0]["bounds"]
+
+        decomposed = "Ae\u0301B"
+        assert decomposed.encode("utf-8") == b"Ae\xcc\x81B"
+        y1 = b1["y"] + b1["height"] * 0.5
+        y2 = b2["y"] + b2["height"] * 0.5
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key ctrl+a")
+        send_control(proc, reader, f"text {decomposed}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Click outside to measure unfocused glyph span without caret/selection interference.
+        send_control(proc, reader, "click 4.00 4.00")
+        span_png = capture_dir / f"09-drag-{req_size}-span.png"
+        send_control(proc, reader, f"screenshot {span_png}")
+        png_w, png_h, rgb = decode_png_rgb(span_png)
+        g_min_x, g_max_x = glyph_x_span(png_w, png_h, rgb, b1)
+        span = g_max_x - g_min_x
+        x_before_e = g_min_x + span * 0.35
+        x_after_e = g_min_x + span * 0.65
+
+        # 1. Left-to-right drag across decomposed é -> selection alone leaves revision unchanged.
+        send_control(proc, reader, f"down {x_before_e:.2f} {y1:.2f}")
+        send_control(proc, reader, f"move {x_after_e:.2f} {y1:.2f}")
+        send_control(proc, reader, f"up {x_after_e:.2f} {y1:.2f}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Copy LTR selection, paste at end of view 2 to verify exact bytes b"e\xcc\x81".
+        send_control(proc, reader, "key ctrl+c")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        send_control(proc, reader, "key ctrl+v")
+        r_ltr = wait_for_role_text(client_bin, sock, "outline.title", "Ae\u0301Be\u0301")
+        assert r_ltr["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81Be\xcc\x81"
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=0")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # 2. Right-to-left drag across decomposed é -> copy, type over it, and undo once.
+        send_control(proc, reader, f"down {x_after_e:.2f} {y1:.2f}")
+        send_control(proc, reader, f"move {x_before_e:.2f} {y1:.2f}")
+        send_control(proc, reader, f"up {x_before_e:.2f} {y1:.2f}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        send_control(proc, reader, "clipboard cleared")
+        send_control(proc, reader, "key ctrl+c")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # Type "X" over the RTL selection -> replaces exact "e\u0301" -> "AXB"; undo restores "Ae\u0301B".
+        send_control(proc, reader, "text X")
+        wait_for_role_text(client_bin, sock, "outline.title", "AXB")
+        wait_for_role_text(client_bin, sock, "canvas.title", "AXB")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=2, last_id=1, actions=0")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=5, undo=1, last_id=1, actions=0")
+
+        # Verify RTL copy also placed exact bytes b"e\xcc\x81" on the clipboard.
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        send_control(proc, reader, "key ctrl+v")
+        r_rtl = wait_for_role_text(client_bin, sock, "canvas.title", "Ae\u0301Be\u0301")
+        assert r_rtl["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81Be\xcc\x81"
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+
+        # 3. Drag past both ends clamps to [0, len(text)] -> typing "Z" replaces entire title.
+        send_control(proc, reader, f"down {b1['x'] + b1['width'] - 4.0:.2f} {y1:.2f}")
+        send_control(proc, reader, f"move {b1['x'] - 40.0:.2f} {y1:.2f}")
+        send_control(proc, reader, f"up {b1['x'] - 40.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "text Z")
+        wait_for_role_text(client_bin, sock, "outline.title", "Z")
+        wait_for_role_text(client_bin, sock, "canvas.title", "Z")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+
+        print(
+            f"[shared-drag] requested={req_size} captured={png_w}x{png_h}: "
+            f"ltr_copy('e\\u0301',rev_kept=1) -> rtl_copy+overwrite('AXB'->undo 'Ae\\u0301B') -> "
+            f"clamp_ends('Z'->undo 'Ae\\u0301B')"
         )
 
         send_control(proc, reader, "quit")

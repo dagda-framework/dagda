@@ -2055,3 +2055,708 @@ test_clipboard_copy_declines_nul_preserving_memory_backend_and_state :: proc(t: 
 	testing.expect_value(t, s.rev, u64(3))
 	testing.expect_value(t, s.undo_depth, 1)
 }
+
+@(test)
+test_mouse_drag_selection_grapheme_bounds_clamping_composition_and_canvas_drag :: proc(t: ^testing.T) {
+	Drag_App :: struct {
+		title:        string,
+		rev:          u64,
+		card_x:       f32,
+		card_presses: int,
+		card_moves:   int,
+		card_ups:     int,
+		editable:     [2]dagda.Object_Id,
+		elements:     [3]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Drag_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 60, width = 640, height = 80}},
+			{info = {id = 2, role = "canvas.title"}, kind = .Label, text = s.title, bounds = {x = 80, y = 200, width = 640, height = 80}},
+			{info = {id = 3, role = "slide.card"}, kind = .Button, text = "Card", bounds = {x = s.card_x, y = 340, width = 180, height = 80}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Drag_App)(user_data)
+		if !ev.has_target || ev.target_id != 3 {
+			return false
+		}
+		#partial switch ev.phase {
+		case .Press:
+			s.card_presses += 1
+			return true
+		case .Move:
+			s.card_moves += 1
+			s.card_x = ev.point.x
+			return true
+		case .Release:
+			s.card_ups += 1
+			return true
+		}
+		return false
+	}
+
+	s := Drag_App{
+		title    = "Ae\u0301B",
+		card_x   = 80,
+		editable = {1, 2},
+	}
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		on_pointer            = on_pointer,
+		text_edit             = {enabled = true},
+		editable_text_targets = s.editable[:],
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
+	defer {
+		memory_clipboard_destroy(&h.mem_clipboard)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	mouse_down :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_DOWN
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = true
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	mouse_move :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_MOTION
+		ev.motion.x = x
+		ev.motion.y = y
+		return ev
+	}
+	mouse_up :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_UP
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = false
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	ctrl_c :: proc() -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = sdl.K_C
+		ev.key.mod = sdl.KMOD_LCTRL
+		return ev
+	}
+
+	el1, found1 := dagda.find(h.frame, 1)
+	el2, found2 := dagda.find(h.frame, 2)
+	card, found3 := dagda.find(h.frame, 3)
+	testing.expect(t, found1 && found2 && found3)
+
+	tx, _, px := text_edit_layout(h.frame, el1.bounds)
+	y1 := el1.bounds.y + el1.bounds.height * 0.5
+	y2 := el2.bounds.y + el2.bounds.height * 0.5
+	x_after_a := tx + font_measure_width(&h.font, "A", px)
+	x_after_e := tx + font_measure_width(&h.font, "Ae\u0301", px)
+
+	// 1. LTR drag across decomposed "e\u0301" (moving vertically over field 2 stays on field 1).
+	d := mouse_down(x_after_a, y1)
+	m := mouse_move(x_after_e, y2)
+	u := mouse_up(x_after_e, y2)
+	_ = host_dispatch_mouse_event(&h, &d)
+	testing.expect_value(t, h.text_edit.dragging, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, s.rev, u64(0))
+
+	copy_ev := ctrl_c()
+	_, _, _ = host_dispatch_key_event(&h, &copy_ev)
+	testing.expect_value(t, h.mem_clipboard.text, "e\u0301")
+
+	// 2. RTL drag across decomposed "e\u0301".
+	d = mouse_down(x_after_e, y1)
+	m = mouse_move(x_after_a, y1)
+	u = mouse_up(x_after_a, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 4)
+	testing.expect_value(t, h.text_edit.session.caret, 1)
+	testing.expect_value(t, s.rev, u64(0))
+
+	// 3. Dragging past right end and past left end clamps cleanly to [0, len(title)].
+	d = mouse_down(x_after_a, y1)
+	m = mouse_move(el1.bounds.x + el1.bounds.width + 120, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, len(s.title))
+	m = mouse_move(el1.bounds.x - 120, y1)
+	u = mouse_up(el1.bounds.x - 120, y1)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	// 4. Ordinary click collapses selection to a single caret.
+	d = mouse_down(x_after_e, y1)
+	u = mouse_up(x_after_e, y1)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.session.anchor, 4)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+
+	// 5. Active IME composition in field 1: pressing/dragging field 2 preserves field 1's composition.
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:], h.clipboard)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+
+	d = mouse_down(x_after_a, y2)
+	m = mouse_move(x_after_e, y2)
+	u = mouse_up(x_after_e, y2)
+	_ = host_dispatch_mouse_event(&h, &d)
+	_ = host_dispatch_mouse_event(&h, &m)
+	_ = host_dispatch_mouse_event(&h, &u)
+	testing.expect_value(t, h.text_edit.focused, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "e")
+
+	// Cancel composition, then verify canvas object dragging (card id=3) still works cleanly.
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+
+	cx := card.bounds.x + card.bounds.width * 0.5
+	cy := card.bounds.y + card.bounds.height * 0.5
+	d = mouse_down(cx, cy)
+	m = mouse_move(cx + 40, cy)
+	u = mouse_up(cx + 40, cy)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &d), true)
+	testing.expect_value(t, h.text_edit.focused, false)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &m), true)
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &u), true)
+	testing.expect_value(t, s.card_presses, 1)
+	testing.expect_value(t, s.card_moves, 1)
+	testing.expect_value(t, s.card_ups, 1)
+}
+
+@(test)
+test_editable_canvas_press_notifies_on_pointer_rebuilds_and_keeps_drag_target :: proc(t: ^testing.T) {
+	Deck_App :: struct {
+		titles:         [2]string,
+		selected_slide: int,
+		press_calls:    int,
+		last_press_id:  dagda.Object_Id,
+		editable:       [3]dagda.Object_Id,
+		elements:       [3]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Deck_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "outline.row.0"}, kind = .Label, text = s.titles[0], bounds = {x = 40, y = 60, width = 320, height = 70}},
+			{info = {id = 2, role = "outline.row.1"}, kind = .Label, text = s.titles[1], bounds = {x = 40, y = 160, width = 320, height = 70}},
+			{info = {id = 3, role = "slide.headline"}, kind = .Label, text = s.titles[s.selected_slide], bounds = {x = 400, y = 60, width = 500, height = 80}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Deck_App)(user_data)
+		if ev.phase != .Press || !ev.has_target {
+			return false
+		}
+		s.press_calls += 1
+		s.last_press_id = ev.target_id
+		if ev.target_id == 1 && s.selected_slide != 0 {
+			s.selected_slide = 0
+			return true
+		}
+		if ev.target_id == 2 && s.selected_slide != 1 {
+			s.selected_slide = 1
+			return true
+		}
+		return false
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Deck_App)(user_data)
+		idx := -1
+		if id == 1 {
+			idx = 0
+		} else if id == 2 {
+			idx = 1
+		} else if id == 3 {
+			idx = s.selected_slide
+		}
+		if idx < 0 {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.titles[idx])
+		s.titles[idx] = cloned
+		return true
+	}
+
+	s := Deck_App{
+		titles         = {strings.clone("Quarterly results"), strings.clone("Next steps")},
+		selected_slide = 0,
+		editable       = {1, 2, 3},
+	}
+	defer {
+		delete(s.titles[0])
+		delete(s.titles[1])
+	}
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		on_pointer            = on_pointer,
+		text_edit             = {enabled = true, on_commit = on_commit},
+		editable_text_targets = s.editable[:],
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	mouse_down :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_DOWN
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = true
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	mouse_move :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_MOTION
+		ev.motion.x = x
+		ev.motion.y = y
+		return ev
+	}
+	mouse_up :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_UP
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = false
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+
+	row1, ok1 := dagda.find(h.frame, 1)
+	row2, ok2 := dagda.find(h.frame, 2)
+	testing.expect(t, ok1 && ok2)
+
+	// 1. Click slide B's row ("Next steps") after "Next" -> on_pointer(.Press) fires once,
+	//    rebuilds headline to "Next steps", and typing " two" updates both row 2 and headline.
+	tx2, _, px2 := text_edit_layout(h.frame, row2.bounds)
+	y2 := row2.bounds.y + row2.bounds.height * 0.5
+	x_after_next := tx2 + font_measure_width(&h.font, "Next", px2)
+
+	d := mouse_down(x_after_next, y2)
+	u := mouse_up(x_after_next, y2)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect_value(t, s.press_calls, 1)
+	testing.expect_value(t, s.last_press_id, dagda.Object_Id(2))
+	testing.expect_value(t, s.selected_slide, 1)
+	testing.expect_value(t, h.text_edit.dragging, true)
+	testing.expect_value(t, h.text_edit.drag_target_id, dagda.Object_Id(2))
+
+	hl, hl_ok := dagda.find(h.frame, 3)
+	testing.expect(t, hl_ok)
+	testing.expect_value(t, hl.text, "Next steps")
+
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.press_calls, 1)
+
+	ti: sdl.Event
+	ti.type = .TEXT_INPUT
+	ti.text.text = " two"
+	tres := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &ti, s.editable[:])
+	testing.expect_value(t, tres.needs_rebuild, true)
+	testing.expect(t, host_rebuild_frame(&h))
+	text_edit_apply_committed(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+
+	r2_after, _ := dagda.find(h.frame, 2)
+	hl_after, _ := dagda.find(h.frame, 3)
+	testing.expect_value(t, r2_after.text, "Next two steps")
+	testing.expect_value(t, hl_after.text, "Next two steps")
+
+	// 2. Press on slide A's row (id=1) triggers rebuild + keeps drag selection attached to row 1.
+	tx1, _, px1 := text_edit_layout(h.frame, row1.bounds)
+	y1 := row1.bounds.y + row1.bounds.height * 0.5
+	x_after_quarterly := tx1 + font_measure_width(&h.font, "Quarterly", px1)
+	d = mouse_down(tx1, y1)
+	m := mouse_move(x_after_quarterly, y2) // move vertically over row 2
+	u = mouse_up(x_after_quarterly, y2)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect_value(t, s.selected_slide, 0)
+	testing.expect_value(t, s.press_calls, 2)
+	testing.expect_value(t, h.text_edit.dragging, true)
+	testing.expect_value(t, h.text_edit.drag_target_id, dagda.Object_Id(1))
+	testing.expect(t, host_dispatch_mouse_event(&h, &m))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, len("Quarterly"))
+
+	// 3. During active IME composition in row 1, clicking row 2 does NOT fire on_pointer
+	//    and preserves focus, preedit, and selected slide 0.
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:])
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+
+	d = mouse_down(tx2, y2)
+	u = mouse_up(tx2, y2)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.press_calls, 2)
+	testing.expect_value(t, s.selected_slide, 0)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "e")
+}
+
+@(test)
+test_release_rebuild_runs_before_activation_and_propagates_failure :: proc(t: ^testing.T) {
+	Swap_App :: struct {
+		button_id:     dagda.Object_Id,
+		swap_on_up:    bool,
+		fail_rebuild:  bool,
+		activate_2:    int,
+		activate_9:    int,
+		elements:      [1]dagda.Canvas_Element,
+		bad_elements:  [2]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Swap_App)(user_data)
+		if s.fail_rebuild {
+			// Duplicate IDs make dagda.resolve_canvas fail cleanly.
+			s.bad_elements = {
+				{info = {id = 2, role = "btn.dup"}, kind = .Button, text = "A", bounds = {x = 80, y = 80, width = 160, height = 60}},
+				{info = {id = 2, role = "btn.dup"}, kind = .Button, text = "B", bounds = {x = 260, y = 80, width = 160, height = 60}},
+			}
+			return {size = {width = 960, height = 540}, elements = s.bad_elements[:]}
+		}
+		s.elements = {
+			{info = {id = s.button_id, role = "swap.btn"}, kind = .Button, text = "Go", bounds = {x = 80, y = 80, width = 160, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Swap_App)(user_data)
+		if ev.phase == .Release && s.swap_on_up {
+			s.button_id = 9
+			return true
+		}
+		return false
+	}
+	on_action :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^Swap_App)(user_data)
+		if action != .Activate {
+			return false
+		}
+		if id == 2 {
+			s.activate_2 += 1
+			return true
+		}
+		if id == 9 {
+			s.activate_9 += 1
+			return true
+		}
+		return false
+	}
+
+	s := Swap_App{button_id = 2}
+	h: Host
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data  = &s,
+		canvas     = make_canvas,
+		handle     = on_action,
+		on_pointer = on_pointer,
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer dagda.frame_destroy(&h.frame)
+
+	btn, ok := dagda.find(h.frame, 2)
+	testing.expect(t, ok)
+	cx := btn.bounds.x + btn.bounds.width * 0.5
+	cy := btn.bounds.y + btn.bounds.height * 0.5
+
+	down: sdl.Event
+	down.type = .MOUSE_BUTTON_DOWN
+	down.button.button = sdl.BUTTON_LEFT
+	down.button.down = true
+	down.button.x = cx
+	down.button.y = cy
+
+	up: sdl.Event
+	up.type = .MOUSE_BUTTON_UP
+	up.button.button = sdl.BUTTON_LEFT
+	up.button.down = false
+	up.button.x = cx
+	up.button.y = cy
+
+	// 1. Ordinary unchanged button activates exactly once on release.
+	testing.expect(t, host_dispatch_mouse_event(&h, &down))
+	testing.expect(t, host_dispatch_mouse_event(&h, &up))
+	testing.expect_value(t, s.activate_2, 1)
+	testing.expect_value(t, s.activate_9, 0)
+
+	// 2. Release callback replaces button 2 with button 9 at identical bounds and returns true:
+	//    frame rebuilds before activation check, so neither 2 nor 9 activates.
+	s.swap_on_up = true
+	testing.expect(t, host_dispatch_mouse_event(&h, &down))
+	testing.expect(t, host_dispatch_mouse_event(&h, &up))
+	testing.expect_value(t, s.button_id, dagda.Object_Id(9))
+	testing.expect_value(t, s.activate_2, 1)
+	testing.expect_value(t, s.activate_9, 0)
+
+	// 3. Rebuild failure during release propagates false so the host exits cleanly.
+	s.button_id = 2
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect(t, host_dispatch_mouse_event(&h, &down))
+	s.fail_rebuild = true
+	testing.expect_value(t, host_dispatch_mouse_event(&h, &up), false)
+	testing.expect_value(t, s.activate_2, 1)
+	testing.expect_value(t, s.activate_9, 0)
+}
+
+@(test)
+test_editable_canvas_press_preserves_full_pointer_gesture_lifecycle :: proc(t: ^testing.T) {
+	Recorded_Ev :: struct {
+		phase:      Pointer_Phase,
+		has_target: bool,
+		target_id:  dagda.Object_Id,
+	}
+	Lifecycle_App :: struct {
+		events:          [dynamic]Recorded_Ev,
+		holding_gesture: bool,
+		button_hits:     int,
+		editable:        [2]dagda.Object_Id,
+		elements:        [3]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Lifecycle_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "field.a"}, kind = .Label, text = "Alpha Title", bounds = {x = 40, y = 60, width = 420, height = 70}},
+			{info = {id = 2, role = "field.b"}, kind = .Label, text = "Beta Title", bounds = {x = 40, y = 160, width = 420, height = 70}},
+			{info = {id = 3, role = "action.btn"}, kind = .Button, text = "Run", bounds = {x = 500, y = 60, width = 140, height = 70}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Lifecycle_App)(user_data)
+		append(&s.events, Recorded_Ev{phase = ev.phase, has_target = ev.has_target, target_id = ev.target_id})
+		switch ev.phase {
+		case .Press:
+			s.holding_gesture = true
+			return true // trigger rebuild on press
+		case .Move:
+			return false
+		case .Release, .Cancel:
+			s.holding_gesture = false
+			return false
+		}
+		return false
+	}
+	on_action :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^Lifecycle_App)(user_data)
+		if id == 3 && action == .Activate {
+			s.button_hits += 1
+			return true
+		}
+		return false
+	}
+
+	s := Lifecycle_App{editable = {1, 2}}
+	defer delete(s.events)
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		handle                = on_action,
+		on_pointer            = on_pointer,
+		text_edit             = {enabled = true},
+		editable_text_targets = s.editable[:],
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	mouse_down :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_DOWN
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = true
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	mouse_move :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_MOTION
+		ev.motion.x = x
+		ev.motion.y = y
+		return ev
+	}
+	mouse_up :: proc(x, y: f32) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .MOUSE_BUTTON_UP
+		ev.button.button = sdl.BUTTON_LEFT
+		ev.button.down = false
+		ev.button.x = x
+		ev.button.y = y
+		return ev
+	}
+	esc_key :: proc() -> sdl.Event {
+		ev: sdl.Event
+		ev.type = .KEY_DOWN
+		ev.key.key = sdl.K_ESCAPE
+		return ev
+	}
+
+	el1, ok1 := dagda.find(h.frame, 1)
+	el2, ok2 := dagda.find(h.frame, 2)
+	btn, ok3 := dagda.find(h.frame, 3)
+	testing.expect(t, ok1 && ok2 && ok3)
+	tx1, _, px1 := text_edit_layout(h.frame, el1.bounds)
+	y1 := el1.bounds.y + el1.bounds.height * 0.5
+	y2 := el2.bounds.y + el2.bounds.height * 0.5
+	x_after_alpha := tx1 + font_measure_width(&h.font, "Alpha", px1)
+
+	// 1. Click on editable field 1: Press(1) -> Release(1), app no longer holding gesture.
+	d := mouse_down(tx1, y1)
+	u := mouse_up(tx1, y1)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect_value(t, s.holding_gesture, true)
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, len(s.events), 2)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 1})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Release, true, 1})
+
+	// 2. Drag from editable field 1 and release over field 2: Press(1) -> Move(1) -> Release(1),
+	//    text selection stays on field 1, app no longer holding gesture.
+	clear(&s.events)
+	d = mouse_down(tx1, y1)
+	m := mouse_move(x_after_alpha, y2)
+	u = mouse_up(x_after_alpha, y2)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &m))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, len("Alpha"))
+	testing.expect_value(t, len(s.events), 3)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 1})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Move, true, 1})
+	testing.expect_value(t, s.events[2], Recorded_Ev{.Release, true, 1})
+
+	// 3. Press on editable field 1 -> Escape -> mouse-up: Press(1) -> Cancel(1) only (no Release),
+	//    app no longer holding gesture and text drag ended.
+	clear(&s.events)
+	d = mouse_down(tx1, y1)
+	esc := esc_key()
+	u = mouse_up(x_after_alpha, y1)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect_value(t, s.holding_gesture, true)
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, h.text_edit.dragging, false)
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, len(s.events), 2)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 1})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Cancel, true, 1})
+
+	// 4. Blocked cross-field press during composition must not start a gesture.
+	clear(&s.events)
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:])
+	d = mouse_down(tx1, y2)
+	u = mouse_up(tx1, y2)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, len(s.events), 0)
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(1))
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	_, _, _ = host_dispatch_key_event(&h, &esc) // cancel composition
+
+	// 5. Actionable button click activates once; drag or Escape-cancel suppresses activation.
+	bx := btn.bounds.x + btn.bounds.width * 0.5
+	by := btn.bounds.y + btn.bounds.height * 0.5
+	d = mouse_down(bx, by)
+	u = mouse_up(bx, by)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.button_hits, 1)
+	testing.expect_value(t, s.holding_gesture, false)
+
+	d = mouse_down(bx, by)
+	m = mouse_move(bx + 10, by)
+	u = mouse_up(bx + 10, by)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &m))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.button_hits, 1)
+
+	d = mouse_down(bx, by)
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	_, _, _ = host_dispatch_key_event(&h, &esc)
+	u = mouse_up(bx, by)
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, s.button_hits, 1)
+	testing.expect_value(t, s.holding_gesture, false)
+}

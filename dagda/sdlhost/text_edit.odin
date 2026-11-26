@@ -28,9 +28,11 @@ Editable_Text_Config :: struct {
 }
 
 Text_Edit_State :: struct {
-	focused:   bool,
-	active_id: dagda.Object_Id,
-	session:   dagda.Text_Session,
+	focused:        bool,
+	active_id:      dagda.Object_Id,
+	dragging:       bool,
+	drag_target_id: dagda.Object_Id,
+	session:        dagda.Text_Session,
 }
 
 // Active_Composition identifies which visual field in the current host window
@@ -144,6 +146,8 @@ text_edit_destroy :: proc(te: ^Text_Edit_State) {
 	dagda.text_session_destroy(&te.session)
 	te.focused = false
 	te.active_id = 0
+	te.dragging = false
+	te.drag_target_id = 0
 }
 
 text_edit_update_ime_area :: proc(
@@ -199,6 +203,8 @@ text_edit_focus_id :: proc(
 		dagda.text_session_init(&te.session, el.text)
 		te.focused = true
 		te.active_id = target_id
+		te.dragging = false
+		te.drag_target_id = 0
 		if window != nil {
 			if !was_focused {
 				_ = sdl.StartTextInput(window)
@@ -254,9 +260,10 @@ text_edit_click_id :: proc(
 	if font != nil && font.loaded {
 		text_x, _, px := text_edit_layout(frame, el.bounds)
 		offset := font_hit_test_caret(font, el.text, px, click_x - text_x)
-		if te.session.caret != offset || te.session.anchor != offset {
-			te.session.caret = offset
-			te.session.anchor = offset
+		prev_caret := te.session.caret
+		prev_anchor := te.session.anchor
+		dagda.set_caret(&te.session, el.text, offset, false)
+		if te.session.caret != prev_caret || te.session.anchor != prev_anchor {
 			changed = true
 		}
 	}
@@ -276,6 +283,81 @@ text_edit_click :: proc(
 	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), click_x, targets)
 }
 
+// text_edit_press_id focuses target_id, places the selection anchor at press_x
+// using the existing click-to-caret metrics, and begins mouse drag selection
+// along target_id. While another editable field has an active preedit, pressing
+// target_id leaves focus, caret, selection, and preedit untouched.
+text_edit_press_id :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	target_id: dagda.Object_Id,
+	press_x: f32,
+	targets: []dagda.Object_Id = nil,
+) -> (started: bool, changed: bool) {
+	if !text_edit_is_target(cfg, targets, target_id) {
+		return false, false
+	}
+	if te.focused && te.active_id != target_id && dagda.is_composing(&te.session) {
+		return false, false
+	}
+	if _, found := dagda.find(frame, target_id); !found {
+		return false, false
+	}
+	changed = text_edit_click_id(te, window, font, frame, cfg, target_id, press_x, targets)
+	if te.focused && te.active_id == target_id && !dagda.is_composing(&te.session) {
+		te.dragging = true
+		te.drag_target_id = target_id
+		started = true
+	}
+	return started, changed
+}
+
+// text_edit_drag_move extends the selection in either direction along the
+// originating field, clamping past either end and landing on grapheme
+// boundaries through Text_Session.
+text_edit_drag_move :: proc(
+	te: ^Text_Edit_State,
+	window: ^sdl.Window,
+	font: ^Font,
+	frame: dagda.Frame,
+	cfg: Editable_Text_Config,
+	move_x: f32,
+	targets: []dagda.Object_Id = nil,
+) -> bool {
+	if !te.dragging || !te.focused || te.active_id != te.drag_target_id || dagda.is_composing(&te.session) {
+		return false
+	}
+	if !text_edit_is_target(cfg, targets, te.drag_target_id) {
+		text_edit_drag_end(te)
+		return false
+	}
+	el, found := dagda.find(frame, te.drag_target_id)
+	if !found {
+		text_edit_drag_end(te)
+		return false
+	}
+	if font == nil || !font.loaded {
+		return false
+	}
+	text_x, _, px := text_edit_layout(frame, el.bounds)
+	offset := font_hit_test_caret(font, el.text, px, move_x - text_x)
+	prev_caret := te.session.caret
+	dagda.set_caret(&te.session, el.text, offset, true)
+	if te.session.caret != prev_caret {
+		text_edit_update_ime_area(te, window, font, frame, cfg)
+		return true
+	}
+	return false
+}
+
+text_edit_drag_end :: proc(te: ^Text_Edit_State) {
+	te.dragging = false
+	te.drag_target_id = 0
+}
+
 text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	if !te.focused {
 		return false
@@ -283,6 +365,8 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	_ = dagda.cancel_composition(&te.session)
 	te.focused = false
 	te.active_id = 0
+	te.dragging = false
+	te.drag_target_id = 0
 	if window != nil {
 		_ = sdl.StopTextInput(window)
 	}
@@ -517,6 +601,7 @@ text_edit_handle_event :: proc(
 
 	#partial switch ev.type {
 	case .TEXT_EDITING:
+		text_edit_drag_end(te)
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
 		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
 		text_edit_update_ime_area(te, window, font, frame, cfg)
@@ -545,6 +630,7 @@ text_edit_handle_event :: proc(
 		alt_or_gui := (mod & (sdl.KMOD_ALT | sdl.KMOD_GUI)) != {}
 
 		if key == sdl.K_ESCAPE {
+			text_edit_drag_end(te)
 			if dagda.is_composing(&te.session) {
 				_ = dagda.cancel_composition(&te.session)
 				text_edit_update_ime_area(te, window, font, frame, cfg)
@@ -650,6 +736,7 @@ text_edit_handle_event :: proc(
 		}
 
 	case .WINDOW_FOCUS_LOST:
+		text_edit_drag_end(te)
 		if dagda.cancel_composition(&te.session) {
 			text_edit_update_ime_area(te, window, font, frame, cfg)
 			res.needs_redraw = true
