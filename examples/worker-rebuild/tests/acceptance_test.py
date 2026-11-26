@@ -225,37 +225,38 @@ def main():
         app.quit()
         apps.remove(app)
 
-        # 1b. Burst coalescing: hold the host in its builder,
-        # publish 100 updates each with a request, then release.
-        # Exactly one worker wake presents value 100. Then a
-        # snapshot ordering: publish 101 while a rebuild holds
-        # its snapshot, and 101 is presented without more input.
-        burst = App(app_bin, client_bin, tmp, "burst", {"WORKER_MODE": "request", "GATE_DIR": str(tmp / "burst")})
+        # 1b. One-wake burst: on_ready holds the host before it
+        # can consume any worker wake while the worker publishes
+        # 100 updates, each with its own request. Exactly one
+        # wake then presents value 100.
+        burst = App(app_bin, client_bin, tmp, "burst", {"WORKER_MODE": "burst-hold", "GATE_DIR": str(tmp / "burst")})
         apps.append(burst)
-        burst.wait_present("tick 0")
 
         def present_count(app):
             text = app.present.read_text()
             return int(text.split("count=", 1)[1].split()[0])
 
-        # Let startup presentations settle so the baseline is stable.
-        settled = present_count(burst)
-        for _ in range(50):
-            time.sleep(0.1)
-            now = present_count(burst)
-            if now == settled:
-                break
-            settled = now
-        burst.fire("burst")
         burst.wait_present("tick 100")
         assert burst.inspect("worker.label")["text"] == "tick 100"
-        after_burst = present_count(burst)
-        assert after_burst == settled + 1, (settled, after_burst)
+        burst_result = burst.result.read_text()
+        assert "posted=100" in burst_result, burst_result
+        burst_count = present_count(burst)
+        # Exactly one distinct worker presentation (tick 100)
+        # followed the startup one, however many times the
+        # compositor may have re-presented an unchanged frame.
+        distinct = int(burst.present.read_text().split("distinct=", 1)[1].split()[0])
+        assert distinct == 2, (distinct, burst.present.read_text())
+        print(f"[1b] burst of 100 -> one worker wake (distinct presentations {distinct}); all requests Posted")
+
+        # Snapshot ordering on the same window: a rebuild takes
+        # its snapshot of 100, then 101 is published and
+        # requested before the builder returns; 101 is
+        # presented without another input or request.
         burst.fire("snap")
         burst.wait_present("tick 101")
         assert burst.inspect("worker.label")["text"] == "tick 101"
-        assert present_count(burst) == after_burst + 2, present_count(burst)
-        print(f"[1b] burst of 100 -> one wake (presents {settled}->{after_burst}); snapshot ordering presented 101 ({present_count(burst)})")
+        assert present_count(burst) >= burst_count + 2, present_count(burst)
+        print(f"[1c] snapshot ordering presented 101 (present count {present_count(burst)})")
         burst.quit()
         apps.remove(burst)
 

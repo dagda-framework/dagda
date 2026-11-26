@@ -46,6 +46,10 @@ State :: struct {
 	mode:          string,
 	worker:        ^thread.Thread,
 	present_count: int,
+	distinct_presents: int,
+	last_presented: [64]u8,
+	last_presented_len: int,
+	posted_count:  int,
 	gate_armed:    bool,
 	snap_armed:    bool,
 	gate_dir:      string,
@@ -115,7 +119,12 @@ app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
 	s.present_count += 1
-	text := fmt.tprintf("present count=%d label=%q other=%q builder=%d host=%d\n", s.present_count, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
+	if string(s.built_label[:s.built_len]) != string(s.last_presented[:s.last_presented_len]) {
+		s.distinct_presents += 1
+		copy(s.last_presented[:], s.built_label[:s.built_len])
+		s.last_presented_len = s.built_len
+	}
+	text := fmt.tprintf("present count=%d distinct=%d label=%q other=%q builder=%d host=%d\n", s.present_count, s.distinct_presents, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -136,6 +145,29 @@ publish :: proc(s: ^State, trigger: string) {
 
 worker_main :: proc(data: rawptr) {
 	s := (^State)(data)
+	if s.mode == "burst-hold" {
+		// Dedicated burst mode: publish 100 updates, each with
+		// its own request, while on_ready holds the host before
+		// it can consume any wake.
+		for n in 1 ..= 100 {
+			sync.mutex_lock(&s.mu)
+			delete(s.label)
+			s.label = strings.clone(fmt.tprintf("tick %d", n))
+			s.tick = n
+			sync.mutex_unlock(&s.mu)
+			if sdlhost.request_rebuild(s.handle) == .Posted {
+				sync.mutex_lock(&s.mu)
+				s.posted_count += 1
+				sync.mutex_unlock(&s.mu)
+			}
+		}
+		sync.mutex_lock(&s.mu)
+		posted := s.posted_count
+		sync.mutex_unlock(&s.mu)
+		write_file(s.result_path, fmt.tprintf("burst posted=%d\n", posted))
+		write_file(fmt.tprintf("%s/burst_done", s.gate_dir), "1")
+		// fall through to the trigger loop for later phases
+	}
 	// Wait for the trigger file so the test controls timing.
 	for i in 0 ..< 500 {
 		sync.mutex_lock(&s.mu)
@@ -243,6 +275,23 @@ app_ready :: proc(user_data: rawptr, handle: sdlhost.Rebuild_Handle) {
 	write_file(env_or("HANDLE_FILE", ""), fmt.tprintf("%d,%d", handle.id, handle.event_type))
 	if s.mode != "idle" && s.mode != "" {
 		s.worker = thread.create_and_start_with_data(s, worker_main)
+	}
+	if s.mode == "burst-hold" {
+		// Hold the host here, before the event loop can consume
+		// any worker wake, until the burst has finished. A
+		// bounded wait names the missing stage on timeout.
+		done_path := fmt.tprintf("%s/burst_done", s.gate_dir)
+		seen := false
+		for i in 0 ..< 1000 {
+			if os.exists(done_path) {
+				seen = true
+				break
+			}
+			time.sleep(10 * time.Millisecond)
+		}
+		if !seen {
+			write_file(s.result_path, "gate timeout stage=burst_publish\n")
+		}
 	}
 }
 
