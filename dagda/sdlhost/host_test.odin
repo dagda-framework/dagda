@@ -726,20 +726,20 @@ test_canvas_editable_text_preedit_cancel_commit_undo_and_grapheme_backspace :: p
 	testing.expect_value(t, len(s.undo), 1)
 
 	// Ctrl+Shift+Z and repeated Ctrl+Z must NOT fire undo.
-	shift_undo := key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	shift_undo := key_ev(sdl.K_Z, (primary_modifier() | sdl.KMOD_LSHIFT))
 	dispatch_ev(&te, &frame, &s, cfg, &shift_undo)
 	testing.expect_value(t, s.text, "Slide é")
 	testing.expect_value(t, s.rev, u64(1))
 	testing.expect_value(t, len(s.undo), 1)
 
-	repeat_undo := key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	repeat_undo := key_ev(sdl.K_Z, primary_modifier(), true)
 	dispatch_ev(&te, &frame, &s, cfg, &repeat_undo)
 	testing.expect_value(t, s.text, "Slide é")
 	testing.expect_value(t, s.rev, u64(1))
 	testing.expect_value(t, len(s.undo), 1)
 
 	// Initial Ctrl+Z undoes once -> exact original bytes "Slide Canvas".
-	undo_ev := key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	undo_ev := key_ev(sdl.K_Z, primary_modifier())
 	dispatch_ev(&te, &frame, &s, cfg, &undo_ev)
 	testing.expect_value(t, s.text, "Slide Canvas")
 	testing.expect_value(t, s.rev, u64(2))
@@ -994,18 +994,18 @@ test_dual_undo_handlers_one_keypress_one_undo :: proc(t: ^testing.T) {
 
 	// 1. Focus the text field: one initial Ctrl+Z calls field_undo exactly once, app_undo 0 times.
 	testing.expect(t, text_edit_focus(&h.text_edit, nil, nil, h.frame, h.app.text_edit))
-	ev := key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	ev := key_ev(sdl.K_Z, primary_modifier())
 	rebuild, _, _ := host_dispatch_key_event(&h, &ev)
 	testing.expect_value(t, rebuild, true)
 	testing.expect_value(t, app_state.field_undo_calls, 1)
 	testing.expect_value(t, app_state.app_undo_calls, 0)
 
 	// 2. Modified/repeat Ctrl+Z while field is focused leave both callback counts unchanged.
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	ev = key_ev(sdl.K_Z, (primary_modifier() | sdl.KMOD_LSHIFT))
 	_, _, _ = host_dispatch_key_event(&h, &ev)
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LGUI)
+	ev = key_ev(sdl.K_Z, (primary_modifier() | non_primary_modifier()))
 	_, _, _ = host_dispatch_key_event(&h, &ev)
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	ev = key_ev(sdl.K_Z, primary_modifier(), true)
 	_, _, _ = host_dispatch_key_event(&h, &ev)
 	testing.expect_value(t, app_state.field_undo_calls, 1)
 	testing.expect_value(t, app_state.app_undo_calls, 0)
@@ -1019,7 +1019,7 @@ test_dual_undo_handlers_one_keypress_one_undo :: proc(t: ^testing.T) {
 	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &app_state, &pre)
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
 
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	ev = key_ev(sdl.K_Z, primary_modifier())
 	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
 	testing.expect_value(t, rebuild, false)
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
@@ -1039,18 +1039,18 @@ test_dual_undo_handlers_one_keypress_one_undo :: proc(t: ^testing.T) {
 	testing.expect_value(t, h.focus.focused_id, dagda.Object_Id(2))
 
 	// 4. With button focused, one initial Ctrl+Z calls app_undo exactly once, field_undo unchanged.
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL)
+	ev = key_ev(sdl.K_Z, primary_modifier())
 	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
 	testing.expect_value(t, rebuild, true)
 	testing.expect_value(t, app_state.field_undo_calls, 1)
 	testing.expect_value(t, app_state.app_undo_calls, 1)
 
 	// 5. Modified/repeat Ctrl+Z with button focused leave both callback counts unchanged.
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+	ev = key_ev(sdl.K_Z, (primary_modifier() | sdl.KMOD_LSHIFT))
 	_, _, _ = host_dispatch_key_event(&h, &ev)
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL | sdl.KMOD_LGUI)
+	ev = key_ev(sdl.K_Z, (primary_modifier() | non_primary_modifier()))
 	_, _, _ = host_dispatch_key_event(&h, &ev)
-	ev = key_ev(sdl.K_Z, sdl.KMOD_LCTRL, true)
+	ev = key_ev(sdl.K_Z, primary_modifier(), true)
 	_, _, _ = host_dispatch_key_event(&h, &ev)
 	testing.expect_value(t, app_state.field_undo_calls, 1)
 	testing.expect_value(t, app_state.app_undo_calls, 1)
@@ -1236,7 +1236,7 @@ test_two_editable_elements_shared_string_preedit_isolation_and_undo :: proc(t: ^
 	undo_ev: sdl.Event
 	undo_ev.type = .KEY_DOWN
 	undo_ev.key.key = sdl.K_Z
-	undo_ev.key.mod = sdl.KMOD_LCTRL
+	undo_ev.key.mod = primary_modifier()
 	rebuild, _, _ := host_dispatch_key_event(&h, &undo_ev)
 	testing.expect_value(t, rebuild, true)
 	testing.expect_value(t, s.title, "Slide! Title")
@@ -1811,7 +1811,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 
 	// 1. Focus view 1 (id=1). Ctrl+C with empty selection is a no-op.
 	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, nil, h.frame, h.app.text_edit, 1, s.editable[:]))
-	dispatch_key(&h, &s, sdl.K_C, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_C, primary_modifier())
 	testing.expect_value(t, h.mem_clipboard.text, "")
 	testing.expect_value(t, s.rev, u64(0))
 	testing.expect_value(t, s.commit_calls, 0)
@@ -1825,7 +1825,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	testing.expect_value(t, h.text_edit.session.anchor, 2)
 	testing.expect_value(t, h.text_edit.session.caret, 6)
 
-	dispatch_key(&h, &s, sdl.K_C, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_C, primary_modifier())
 	testing.expect_value(t, h.mem_clipboard.text, "fe\u0301")
 	testing.expect_value(t, s.rev, u64(0))
 	testing.expect_value(t, s.commit_calls, 0)
@@ -1839,7 +1839,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	sel_start, sel_end := dagda.selection_bounds(&h.text_edit.session)
 	testing.expect_value(t, s.title[sel_start:sel_end], "Title")
 
-	dispatch_key(&h, &s, sdl.K_V, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_V, primary_modifier())
 	testing.expect_value(t, s.title, "Cafe\u0301 fe\u0301")
 	testing.expect_value(t, s.rev, u64(1))
 	testing.expect_value(t, s.commit_calls, 1)
@@ -1847,7 +1847,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	testing.expect_value(t, s.last_id, dagda.Object_Id(2))
 
 	// 3. One Ctrl+Z restores the original title.
-	dispatch_key(&h, &s, sdl.K_Z, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_Z, primary_modifier())
 	testing.expect_value(t, s.title, "Cafe\u0301 Title")
 	testing.expect_value(t, s.rev, u64(2))
 	testing.expect_value(t, len(s.undo_stack), 0)
@@ -1861,7 +1861,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	want_caret := h.text_edit.session.caret
 
 	testing.expect(t, clipboard_set(h.clipboard, "Line1\nLine2"))
-	dispatch_key(&h, &s, sdl.K_V, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_V, primary_modifier())
 	testing.expect_value(t, s.title, "Cafe\u0301 Title")
 	testing.expect_value(t, s.rev, u64(2))
 	testing.expect_value(t, s.commit_calls, 1)
@@ -1870,7 +1870,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	testing.expect_value(t, h.text_edit.session.caret, want_caret)
 
 	testing.expect(t, clipboard_set(h.clipboard, "Line1\rLine2"))
-	dispatch_key(&h, &s, sdl.K_V, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_V, primary_modifier())
 	testing.expect_value(t, s.title, "Cafe\u0301 Title")
 	testing.expect_value(t, s.rev, u64(2))
 	testing.expect_value(t, s.commit_calls, 1)
@@ -1880,7 +1880,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	// 5. App-rejected proposal preserves text, selection, and history.
 	s.reject_commits = true
 	testing.expect(t, clipboard_set(h.clipboard, "Blocked"))
-	dispatch_key(&h, &s, sdl.K_V, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_V, primary_modifier())
 	testing.expect_value(t, s.title, "Cafe\u0301 Title")
 	testing.expect_value(t, s.rev, u64(2))
 	testing.expect_value(t, s.commit_calls, 2)
@@ -1899,7 +1899,7 @@ test_clipboard_copy_paste_combining_multiline_reject_and_preedit :: proc(t: ^tes
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
 
 	testing.expect(t, clipboard_set(h.clipboard, "PASTE"))
-	dispatch_key(&h, &s, sdl.K_V, sdl.KMOD_LCTRL)
+	dispatch_key(&h, &s, sdl.K_V, primary_modifier())
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
 	testing.expect_value(t, h.text_edit.session.preedit, "e")
 	testing.expect_value(t, s.title, "Cafe\u0301 Title")
@@ -2154,7 +2154,7 @@ test_mouse_drag_selection_grapheme_bounds_clamping_composition_and_canvas_drag :
 		ev: sdl.Event
 		ev.type = .KEY_DOWN
 		ev.key.key = sdl.K_C
-		ev.key.mod = sdl.KMOD_LCTRL
+		ev.key.mod = primary_modifier()
 		return ev
 	}
 
@@ -2903,7 +2903,7 @@ test_shift_click_extends_shrinks_reverses_switches_field_and_respects_ime_and_po
 	copy_ev: sdl.Event
 	copy_ev.type = .KEY_DOWN
 	copy_ev.key.key = sdl.K_C
-	copy_ev.key.mod = sdl.KMOD_LCTRL
+	copy_ev.key.mod = primary_modifier()
 	_, _, _ = host_dispatch_key_event(&h, &copy_ev)
 	testing.expect_value(t, h.mem_clipboard.text, "e\u0301")
 
@@ -3710,7 +3710,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	testing.expect(t, clipboard_set(cb, "seeded"))
 
 	// 1. Empty selection: Ctrl+X leaves document and seeded clipboard untouched.
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, s.title, "Ae\u0301B")
 	testing.expect_value(t, s.commit_calls, 0)
 	testing.expect_value(t, fc.mc.text, "seeded")
@@ -3720,7 +3720,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	h.text_edit.session.caret = 4
 
 	// 2. Repeated Ctrl+X keydown leaves document, selection, and clipboard untouched.
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL, repeat = true)
+	dispatch_key(&h, sdl.K_X, primary_modifier(), repeat = true)
 	testing.expect_value(t, s.title, "Ae\u0301B")
 	testing.expect_value(t, s.commit_calls, 0)
 	testing.expect_value(t, fc.mc.text, "seeded")
@@ -3729,7 +3729,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 
 	// 3. Failing clipboard setter: zero edit proposals to app, selection & clipboard survive.
 	fc.fail_set = true
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, s.title, "Ae\u0301B")
 	testing.expect_value(t, s.commit_calls, 0)
 	testing.expect_value(t, s.rev, u64(0))
@@ -3747,7 +3747,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	pre.edit.length = 0
 	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, &s, &pre, s.editable[:], cb)
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
 	testing.expect_value(t, h.text_edit.session.preedit, "pre")
 	testing.expect_value(t, s.title, "Ae\u0301B")
@@ -3759,7 +3759,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 
 	// 5. App rejection: document, rev, undo, and selection survive; clipboard may retain copied text.
 	s.reject_commits = true
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, s.title, "Ae\u0301B")
 	testing.expect_value(t, s.commit_calls, 1)
 	testing.expect_value(t, s.rev, u64(0))
@@ -3772,7 +3772,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	// 6. Accepted Ctrl+X: exact bytes 65 CC 81 copied, title becomes "AB", caret collapses to 1,
 	//    focus stays in field 1, 1 revision & 1 undo entry; one undo restores exact "Ae\u0301B".
 	testing.expect(t, clipboard_set(cb, "seeded2"))
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, len(fc.mc.text), 3)
 	testing.expect_value(t, fc.mc.text[0], u8(0x65))
 	testing.expect_value(t, fc.mc.text[1], u8(0xCC))
@@ -3786,7 +3786,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	testing.expect_value(t, h.text_edit.session.anchor, 1)
 	testing.expect_value(t, h.text_edit.session.caret, 1)
 
-	dispatch_key(&h, sdl.K_Z, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_Z, primary_modifier())
 	testing.expect_value(t, s.title, "Ae\u0301B")
 	testing.expect_value(t, s.rev, u64(2))
 	testing.expect_value(t, len(s.undo_stack), 0)
@@ -3799,7 +3799,7 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	h.text_edit.session.anchor = 0
 	h.text_edit.session.caret = 3
 	commits_before := s.commit_calls
-	dispatch_key(&h, sdl.K_X, sdl.KMOD_LCTRL)
+	dispatch_key(&h, sdl.K_X, primary_modifier())
 	testing.expect_value(t, s.commit_calls, commits_before)
 	testing.expect_value(t, s.title, "a\x00b")
 	testing.expect_value(t, fc.mc.text, "keep-nul")
