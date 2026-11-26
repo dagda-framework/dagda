@@ -125,3 +125,28 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
         run: python3 examples/action-origin/tests/e2e_action_origin.py
+
+  macos-arm64-checks:
+    name: macOS ARM64 counter
+    runs-on: macos-15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Log runner architecture and system
+        run: |
+          echo "arch: $(uname -m)"
+          sw_vers
+          uname -a
+
+      - name: Install SDL3 and FreeType
+        run: brew install sdl3 freetype
+
+      - name: Install the pinned Odin compiler
+        run: |
+          bash scripts/setup-odin.sh
+          ./scripts/odin.sh version
+          echo "compiler: $(./scripts/odin.sh version)"
+
+      - name: Run the first-app guide smoke test
+        run: python3 tests/docs/first_app_smoke.py
