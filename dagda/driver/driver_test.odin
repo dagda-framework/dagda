@@ -434,7 +434,7 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":10,"width":0.1,"height":50}`))
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":100,"width":1e-05,"height":50}`))
 	// Edge-touching and entirely outside objects report null (twice).
-	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":6.1035156e-05,"height":50}`) || strings.contains(rep, `"width":0006103515625`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":6.1035156e-05,"height":50}`) || strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":0.00006103515625,"height":50}`))
 	testing.expect_value(t, strings.count(rep, `"visible_canvas_bounds":null`), 4)
 	// Existing fields are still present.
 	testing.expect(t, strings.contains(rep, `"canvas_bounds":{"x":900,"y":480,"width":200,"height":120}`))

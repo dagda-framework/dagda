@@ -104,9 +104,17 @@ def main():
             sock = tmp / f"sock-{width}" / "app.sock"
             proc = start(host, sock, width, height)
             try:
-                over = inspect(client_bin, sock, "over")
-                b = over["bounds"]
-                centre = (b["x"] + b["width"] / 2, b["y"] + b["height"] / 2)
+                over = inspect(client_bin, sock, "over")["bounds"]
+                under_b = inspect(client_bin, sock, "under")["bounds"]
+                # Midpoint of the positive-area intersection of
+                # the two reported rectangles: strictly inside
+                # both, not on either exclusive edge.
+                ix = max(over["x"], under_b["x"])
+                iy = max(over["y"], under_b["y"])
+                ir = min(over["x"] + over["width"], under_b["x"] + under_b["width"])
+                ib = min(over["y"] + over["height"], under_b["y"] + under_b["height"])
+                assert ir > ix and ib > iy, (over, under_b)
+                centre = ((ix + ir) / 2, (iy + ib) / 2)
                 _, hit = client(client_bin, sock, "hit-test", str(centre[0]), str(centre[1]))
                 assert hit == {"ok": True, "id": 2}, hit  # overlap: topmost, same as a pointer
                 # A point only in the under element (ID 0 is valid):
