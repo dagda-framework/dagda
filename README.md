@@ -1,4 +1,9 @@
-# Dagda
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dagda-wordmark-dark.svg">
+    <img alt="Dagda" src="assets/brand/dagda-wordmark.svg" width="240">
+  </picture>
+</h1>
 
 Dagda is an experimental native UI framework for Odin, designed for applications that people and agents can operate together. In a slide editor, the headline on the canvas and the title in the outline represent the same object. The goal is for a person to edit it in either view, for an agent to propose a rename while the person works, and for either of them to undo the change.
 

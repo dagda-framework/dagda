@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 538.7 538.7">
+  <rect width="538.7" height="538.7" rx="118.5" fill="#121417"/>
+  <mask id="counter"><rect x="-200" y="-200" width="800" height="800" fill="#fff"/><circle cx="126" cy="220" r="60" fill="#000"/></mask>
+  <g transform="translate(140.4 102.4)" fill="#fff" mask="url(#counter)"><circle cx="120" cy="214" r="120"/><path d="M180 0H198L258 62V334H180Z"/></g>
+</svg>
