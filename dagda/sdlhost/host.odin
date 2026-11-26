@@ -44,6 +44,17 @@ App :: struct {
 	// On commit, the callback runs after on_commit returns and only if the
 	// composition has ended. A rejected edit can keep composing and retry.
 	on_composition: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool),
+	// Optional out-storage for this window's rebuild handle.
+	// The host fills it before on_ready and before the event
+	// loop; copy the value to a worker if needed. It stops
+	// waking anything once this window closes.
+	rebuild_handle: ^Rebuild_Handle,
+	// Optional callback invoked on the host thread once the
+	// window is live and its rebuild handle is available.
+	on_ready: proc(user_data: rawptr, handle: Rebuild_Handle),
+	// Optional callback invoked on the host thread after each
+	// successful presentation of a frame.
+	on_present: proc(user_data: rawptr),
 }
 
 Run_Options :: struct {
@@ -117,6 +128,7 @@ Host :: struct {
 	edit_cstr_buf: [256]u8,
 	text_cstr_buf: [256]u8,
 	needs_redraw:  bool,
+	rebuild:       Rebuild_Handle,
 	reported_composition: Active_Composition,
 }
 
@@ -279,6 +291,14 @@ host_draw :: proc(h: ^Host) {
 	}
 }
 
+host_present :: proc(h: ^Host) -> bool {
+	ok := host_render(h)
+	if ok && h.app.on_present != nil {
+		h.app.on_present(h.app.user_data)
+	}
+	return ok
+}
+
 host_save_screenshot :: proc(h: ^Host, path: string) -> bool {
 	surface := sdl.RenderReadPixels(h.renderer, nil)
 	if surface == nil {
@@ -301,7 +321,7 @@ host_render :: proc(h: ^Host, screenshot_path := "") -> bool {
 	if len(screenshot_path) > 0 {
 		ok = host_save_screenshot(h, screenshot_path)
 	}
-	sdl.RenderPresent(h.renderer)
+	ok = sdl.RenderPresent(h.renderer) && ok
 	h.needs_redraw = false
 	return ok
 }
@@ -1000,7 +1020,6 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	if !host_rebuild_frame(&h) {
 		return 1
 	}
-	_ = host_render(&h)
 
 	srv: driver.Server
 	if len(opts.socket_path) > 0 {
@@ -1009,6 +1028,22 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 	}
 	defer driver.server_stop(&srv)
+
+	// Publish readiness only once every fallible startup step
+	// has succeeded; a failed start leaves no live handle.
+	rebuild_handle, registered := rebuild_register()
+	if !registered {
+		fmt.eprintln("could not register rebuild event")
+		return 1
+	}
+	h.rebuild = rebuild_handle
+	if app.rebuild_handle != nil {
+		app.rebuild_handle^ = h.rebuild
+	}
+	_ = host_present(&h)
+	if app.on_ready != nil {
+		app.on_ready(app.user_data, h.rebuild)
+	}
 
 	control_buf: [dynamic]u8
 	defer delete(control_buf)
@@ -1021,6 +1056,18 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
+				if u32(ev.type) == h.rebuild.event_type && ev.user.data1 == rawptr(uintptr(h.rebuild.id)) {
+					if !host_rebuild_frame(&h) {
+						exit_code = 1
+						running = false
+					} else {
+						_ = host_present(&h)
+					}
+					if !running || !sdl.PollEvent(&ev) {
+						break
+					}
+					continue
+				}
 				#partial switch ev.type {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
 					running = false
@@ -1093,9 +1140,11 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 
 		if running && h.needs_redraw {
-			_ = host_render(&h)
+			_ = host_present(&h)
 		}
 	}
 
+	rebuild_mark_closing(h.rebuild)
+	rebuild_unregister(h.rebuild)
 	return exit_code
 }
