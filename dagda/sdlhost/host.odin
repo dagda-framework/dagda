@@ -133,6 +133,16 @@ App :: struct {
 	// Optional callback invoked on the host thread after each
 	// successful presentation of a frame.
 	on_present: proc(user_data: rawptr),
+	// Optional top-level menu bar menus and per-element context menus.
+	// Borrowed under the same slice-borrowing contract as edits and
+	// editable_text_targets: pass the slices once, keep their backing arrays
+	// (and each menu's items array and label/role strings) valid until run
+	// returns, and refresh existing item text/enabled slots only from the
+	// host-thread builder. Menu items are discoverable via driver inspect
+	// whether their popup is open or closed, are not Tab stops, and activate
+	// through App.handle with .Local or .Driver origin.
+	menus:         []Menu,
+	context_menus: []Context_Menu,
 }
 
 Run_Options :: struct {
@@ -209,6 +219,7 @@ Host :: struct {
 	renderer:      ^sdl.Renderer,
 	font:          Font,
 	frame:         dagda.Frame,
+	driver_frame:  dagda.Frame,
 	viewport:      dagda.Size,
 	has_hovered:   bool,
 	hovered_id:    dagda.Object_Id,
@@ -217,6 +228,7 @@ Host :: struct {
 	pointer:       Pointer_State,
 	focus:         Focus_State,
 	text_edit:     Text_Edit_State,
+	menu:          Menu_State,
 	lshift_held:   bool,
 	rshift_held:   bool,
 	clipboard:            Clipboard,
@@ -265,6 +277,8 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	h.frame = frame
 	_ = focus_reconcile(&h.focus, h.frame)
 	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+	menu_reconcile(h)
+	host_sync_driver_frame(h)
 	host_report_composition(h, host_active_composition(h))
 	h.needs_redraw = true
 	return true
@@ -413,6 +427,7 @@ host_draw :: proc(h: ^Host) {
 	if h.frame.has_canvas {
 		sdl.SetRenderClipRect(r, nil)
 	}
+	menu_draw(h, scale_x, scale_y)
 }
 
 host_present :: proc(h: ^Host) -> bool {
@@ -451,17 +466,21 @@ host_render :: proc(h: ^Host, screenshot_path := "") -> bool {
 	return ok
 }
 
-push_sdl_button :: proc(window: ^sdl.Window, x, y: f32, down: bool) -> bool {
+push_sdl_button_kind :: proc(window: ^sdl.Window, x, y: f32, down: bool, button: u8) -> bool {
 	win_id := sdl.GetWindowID(window)
 	ev: sdl.Event
 	ev.type = down ? .MOUSE_BUTTON_DOWN : .MOUSE_BUTTON_UP
 	ev.button.windowID = win_id
-	ev.button.button = sdl.BUTTON_LEFT
+	ev.button.button = button
 	ev.button.down = down
 	ev.button.clicks = 1
 	ev.button.x = x
 	ev.button.y = y
 	return sdl.PushEvent(&ev)
+}
+
+push_sdl_button :: proc(window: ^sdl.Window, x, y: f32, down: bool) -> bool {
+	return push_sdl_button_kind(window, x, y, down, sdl.BUTTON_LEFT)
 }
 
 // push_sdl_click injects a real mouse button down + up pair into SDL3's event
@@ -471,6 +490,13 @@ push_sdl_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
 		return false
 	}
 	return push_sdl_button(window, x, y, false)
+}
+
+push_sdl_right_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
+	if !push_sdl_button_kind(window, x, y, true, sdl.BUTTON_RIGHT) {
+		return false
+	}
+	return push_sdl_button_kind(window, x, y, false, sdl.BUTTON_RIGHT)
 }
 
 push_sdl_shift_key :: proc(window: ^sdl.Window, down: bool) -> bool {
@@ -610,8 +636,23 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
 		repeat_key = true
+	case "f10":
+		key = sdl.K_F10
+	case "shift+f10":
+		key = sdl.K_F10
+		mod = sdl.KMOD_LSHIFT
 	case:
-		return false
+		if strings.has_prefix(name, "alt+") && len(name) == 5 {
+			ch := ascii_lower(name[4])
+			if ch >= 'a' && ch <= 'z' {
+				key = sdl.Keycode(u32(sdl.K_A) + u32(ch - 'a'))
+				mod = sdl.KMOD_LALT
+			} else {
+				return false
+			}
+		} else {
+			return false
+		}
 	}
 
 	down: sdl.Event
@@ -710,6 +751,20 @@ poll_control_stdin :: proc(
 					_ = os.flush(os.stdout)
 				} else {
 					fmt.println("CONTROL_ERR invalid click")
+					_ = os.flush(os.stdout)
+				}
+			}
+		} else if strings.has_prefix(line, "right-click ") {
+			rest := line[len("right-click "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp >= 0 {
+				x, ok_x := strconv.parse_f32(rest[:sp])
+				y, ok_y := strconv.parse_f32(rest[sp + 1:])
+				if ok_x && ok_y && push_sdl_right_click(h.window, x, y) {
+					fmt.printf("CONTROL_OK right-click %.2f %.2f\n", x, y)
+					_ = os.flush(os.stdout)
+				} else {
+					fmt.println("CONTROL_ERR invalid right-click")
 					_ = os.flush(os.stdout)
 				}
 			}
@@ -1099,6 +1154,14 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
+	menu_consumed, menu_rebuild := menu_handle_key_event(h, ev)
+	if menu_rebuild {
+		needs_rebuild = true
+	}
+	if menu_consumed {
+		return
+	}
+
 	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
 	if tres.needs_redraw {
 		h.needs_redraw = true
@@ -1151,6 +1214,15 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 // rebuild failed so the host exits through its normal failure path.
 host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	defer host_report_composition(h, host_active_composition(h))
+	menu_consumed, menu_rebuild := menu_handle_mouse_event(h, ev)
+	if menu_rebuild {
+		if !host_rebuild_frame(h) {
+			return false
+		}
+	}
+	if menu_consumed {
+		return true
+	}
 	#partial switch ev.type {
 	case .MOUSE_MOTION:
 		if h.text_edit.dragging {
@@ -1271,6 +1343,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 
 	h: Host
 	h.app = app
+	h.menu.highlighted = -1
 	if !font_init(&h.font) {
 		return 1
 	}
@@ -1311,6 +1384,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	// Release cached glyph textures before DestroyRenderer frees the renderer.
 	defer font_destroy_textures(&h.font)
 	defer text_edit_destroy(&h.text_edit)
+	defer dagda.frame_destroy(&h.driver_frame)
 	defer dagda.frame_destroy(&h.frame)
 	defer host_report_composition(&h, {})
 
@@ -1380,6 +1454,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
+					if menu_is_open(&h.menu) {
+						break
+					}
 					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
 					host_report_composition(&h, host_active_composition(&h))
 					if tres.needs_redraw {
@@ -1424,9 +1501,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 			driver_handler: dagda.Action_Handler = h.app.handle != nil ? action_dispatch_trampoline : nil
 			applied, rebuild_failed: bool
 			if h.app.edits.handler != nil {
-				applied, rebuild_failed = driver.server_poll_edits(&srv, &h.frame, driver_handler, &driver_action, h.app.edits, &h, host_rebuild_cb)
+				applied, rebuild_failed = driver.server_poll_edits(&srv, host_driver_frame(&h), driver_handler, &driver_action, h.app.edits, &h, host_rebuild_cb)
 			} else {
-				applied, rebuild_failed = driver.server_poll(&srv, &h.frame, driver_handler, &driver_action, &h, host_rebuild_cb)
+				applied, rebuild_failed = driver.server_poll(&srv, host_driver_frame(&h), driver_handler, &driver_action, &h, host_rebuild_cb)
 			}
 			dispatch_host = prev_host
 			if rebuild_failed {

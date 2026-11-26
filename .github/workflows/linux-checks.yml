@@ -141,6 +141,20 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/action-origin/tests/e2e_action_origin.py
 
+      - name: Run the menu bar acceptance test
+        env:
+          MENUS: "1"
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/menu-bar/tests/e2e_menu_bar.py
+
+      - name: Run the slide context menu acceptance test
+        env:
+          MENUS: "1"
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/slide-menu/tests/e2e_slide_menu.py
+
   macos-arm64-checks:
     name: macOS ARM64 counter
     runs-on: macos-15
