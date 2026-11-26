@@ -150,3 +150,12 @@ jobs:
 
       - name: Run the first-app guide smoke test
         run: python3 tests/docs/first_app_smoke.py
+
+      - name: Run the SDL host test suite
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: ./scripts/odin.sh test dagda/sdlhost -collection:dagda=.
+
+      - name: Run the macOS shortcuts process check
+        run: python3 examples/shared-text/tests/macos_shortcuts_test.py

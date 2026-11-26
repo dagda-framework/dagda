@@ -510,6 +510,21 @@ push_sdl_key :: proc(window: ^sdl.Window, name: string) -> bool {
 	case "ctrl+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL
+	case "cmd+a":
+		key = sdl.K_A
+		mod = sdl.KMOD_LGUI
+	case "cmd+c":
+		key = sdl.K_C
+		mod = sdl.KMOD_LGUI
+	case "cmd+x":
+		key = sdl.K_X
+		mod = sdl.KMOD_LGUI
+	case "cmd+v":
+		key = sdl.K_V
+		mod = sdl.KMOD_LGUI
+	case "cmd+z":
+		key = sdl.K_Z
+		mod = sdl.KMOD_LGUI
 	case "ctrl+shift+z":
 		key = sdl.K_Z
 		mod = sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT
@@ -782,12 +797,39 @@ host_handle_pointer_cancel_event :: proc(h: ^Host, ev: ^sdl.Event) -> (res: Poin
 	return res
 }
 
+// The platform's primary shortcut modifier: Command (GUI) on
+// macOS, Control elsewhere. One rule serves every editable-field
+// shortcut and the app-level undo hook, always evaluated from
+// the modifier carried by the dispatched key event.
+primary_modifier :: proc() -> sdl.Keymod {
+	when ODIN_OS == .Darwin {
+		return sdl.KMOD_GUI
+	} else {
+		return sdl.KMOD_CTRL
+	}
+}
+
+non_primary_modifier :: proc() -> sdl.Keymod {
+	when ODIN_OS == .Darwin {
+		return sdl.KMOD_CTRL
+	} else {
+		return sdl.KMOD_GUI
+	}
+}
+
+// has_primary_modifier reports the platform primary modifier with
+// neither Alt nor the other platform's modifier also held.
+has_primary_modifier :: proc(mod: sdl.Keymod) -> bool {
+	return (mod & primary_modifier()) != {} &&
+		(mod & (sdl.KMOD_ALT | non_primary_modifier())) == {}
+}
+
 is_initial_ctrl_z :: proc(ev: ^sdl.Event) -> bool {
 	return ev.type == .KEY_DOWN &&
 		!ev.key.repeat &&
 		ev.key.key == sdl.K_Z &&
-		(ev.key.mod & sdl.KMOD_CTRL) != {} &&
-		(ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {}
+		has_primary_modifier(ev.key.mod) &&
+		(ev.key.mod & sdl.KMOD_SHIFT) == {}
 }
 
 // host_step_keyboard_focus moves the single keyboard target forward (Tab) or
