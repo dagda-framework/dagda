@@ -158,6 +158,20 @@ role, invoke it, and inspect again — the count reads `2`:
 # {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"2",...}]}
 ```
 
+Before invoking, an agent can ask what a pointer at a point
+would hit — for example the centre of the button it just
+inspected — without changing anything:
+
+```sh
+"$CLIENT" "$SOCK" hit-test 180 84
+# {"ok":true,"id":2}
+"$CLIENT" "$SOCK" inspect counter.value   # unchanged until a click or invoke lands
+```
+
+`hit-test` takes the same logical window coordinates that
+`inspect` reports as `bounds`, returns the topmost element's
+stable ID (or `null` for a miss), and never touches the app.
+
 Close the window when you are done; it removes its own socket
 file, and `rmdir "$SOCK_DIR"` in terminal 1 cleans up.
 
