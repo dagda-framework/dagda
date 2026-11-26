@@ -2942,7 +2942,10 @@ test_shift_click_extends_shrinks_reverses_switches_field_and_respects_ime_and_po
 }
 
 @(test)
-test_shift_click_reads_sdl_mod_state_under_dummy :: proc(t: ^testing.T) {
+test_shift_click_uses_event_stream_order_when_sdl_mod_state_is_ahead :: proc(t: ^testing.T) {
+	// Exercise both event-stream orders while SDL's live global mod state is
+	// ahead of the dispatched click (as happens when a click and a later Shift
+	// key event arrive in the same OS input batch before the host drains them).
 	sync.mutex_lock(&sdl_test_mu)
 	defer sync.mutex_unlock(&sdl_test_mu)
 	if !sdl.Init({.VIDEO}) {
@@ -2954,53 +2957,141 @@ test_shift_click_reads_sdl_mod_state_under_dummy :: proc(t: ^testing.T) {
 		return
 	}
 
-	els := [1]dagda.Canvas_Element{
-		{info = {id = 1, role = "field.a"}, kind = .Label, text = "Ae\u0301BC", bounds = {x = 40, y = 60, width = 500, height = 70}},
+	Order_App :: struct {
+		title:    string,
+		elements: [1]dagda.Canvas_Element,
 	}
-	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, {width = 800, height = 540})
-	testing.expect(t, ok)
-	defer dagda.frame_destroy(&frame)
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Order_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "field.a"}, kind = .Label, text = s.title, bounds = {x = 40, y = 60, width = 500, height = 70}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Order_App)(user_data)
+		if id != 1 {
+			return false
+		}
+		cloned, err := strings.clone(new_text)
+		if err != nil {
+			return false
+		}
+		delete(s.title)
+		s.title = cloned
+		return true
+	}
+
+	s := Order_App{title = strings.clone("Slide Title")}
+	defer delete(s.title)
 
 	h: Host
 	if !font_init(&h.font) {
 		return
 	}
 	defer font_destroy(&h.font)
-	h.frame = frame
-	h.app = App{text_edit = {enabled = true, target_id = 1}}
-	defer text_edit_destroy(&h.text_edit)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data = &s,
+		canvas    = make_canvas,
+		text_edit = {enabled = true, target_id = 1, on_commit = on_commit},
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
 
 	el1, found := dagda.find(h.frame, 1)
 	testing.expect(t, found)
-	tx, _, px := text_edit_layout(h.frame, el1.bounds)
+	tx, _, _ := text_edit_layout(h.frame, el1.bounds)
 	y1 := el1.bounds.y + el1.bounds.height * 0.5
-	x_after_a := tx + font_measure_width(&h.font, "A", px)
-	x_after_e := tx + font_measure_width(&h.font, "Ae\u0301", px)
+	x_start := tx - 4
+	x_end := el1.bounds.x + el1.bounds.width - 4
 
 	prev_mod := sdl.GetModState()
 	defer sdl.SetModState(prev_mod)
+
+	dispatch_click :: proc(h: ^Host, x, y: f32) {
+		d: sdl.Event
+		d.type = .MOUSE_BUTTON_DOWN
+		d.button.button = sdl.BUTTON_LEFT
+		d.button.down = true
+		d.button.x = x
+		d.button.y = y
+		u := d
+		u.type = .MOUSE_BUTTON_UP
+		u.button.down = false
+		_ = host_dispatch_mouse_event(h, &d)
+		_ = host_dispatch_mouse_event(h, &u)
+	}
+	dispatch_shift :: proc(h: ^Host, key: sdl.Keycode, down: bool) {
+		ev: sdl.Event
+		ev.type = down ? .KEY_DOWN : .KEY_UP
+		ev.key.key = key
+		ev.key.mod = down ? (key == sdl.K_RSHIFT ? sdl.KMOD_RSHIFT : sdl.KMOD_LSHIFT) : {}
+		ev.key.down = down
+		_, _, _ = host_dispatch_key_event(h, &ev)
+	}
+	dispatch_text :: proc(h: ^Host, s: ^Order_App, text: cstring) {
+		ti: sdl.Event
+		ti.type = .TEXT_INPUT
+		ti.text.text = text
+		tres := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, s, &ti)
+		if tres.needs_rebuild {
+			_ = host_rebuild_frame(h)
+			text_edit_apply_committed(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &tres.pending_edit)
+		}
+	}
+
+	// Order 1: Focus with caret at start (0). Global SDL mod state ALREADY has
+	// KMOD_LSHIFT set (from a later queued Shift-down), then plain click at end
+	// arrives BEFORE Shift-down -> must collapse caret to end, so typing "X"
+	// commits "Slide TitleX" (NOT "X").
+	sdl.SetModState({})
+	dispatch_click(&h, x_start, y1)
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	sdl.SetModState(sdl.KMOD_LSHIFT)
+	dispatch_click(&h, x_end, y1)
+	testing.expect_value(t, h.text_edit.session.anchor, len("Slide Title"))
+	testing.expect_value(t, h.text_edit.session.caret, len("Slide Title"))
+	dispatch_shift(&h, sdl.K_LSHIFT, true)
+	dispatch_shift(&h, sdl.K_LSHIFT, false)
 	sdl.SetModState({})
 
-	d: sdl.Event
-	d.type = .MOUSE_BUTTON_DOWN
-	d.button.button = sdl.BUTTON_LEFT
-	d.button.down = true
-	d.button.x = x_after_a
-	d.button.y = y1
-	u := d
-	u.type = .MOUSE_BUTTON_UP
-	u.button.down = false
-	testing.expect(t, host_dispatch_mouse_event(&h, &d))
-	testing.expect(t, host_dispatch_mouse_event(&h, &u))
-	testing.expect_value(t, h.text_edit.session.anchor, 1)
-	testing.expect_value(t, h.text_edit.session.caret, 1)
+	dispatch_text(&h, &s, "X")
+	testing.expect_value(t, s.title, "Slide TitleX")
 
-	// Set SDL modifier state directly (without KEY_DOWN) -> Shift-click still extends!
-	sdl.SetModState(sdl.KMOD_LSHIFT)
-	d.button.x = x_after_e
-	u.button.x = x_after_e
-	testing.expect(t, host_dispatch_mouse_event(&h, &d))
-	testing.expect(t, host_dispatch_mouse_event(&h, &u))
-	testing.expect_value(t, h.text_edit.session.anchor, 1)
-	testing.expect_value(t, h.text_edit.session.caret, 4)
+	// Reset title to "Slide Title" with caret at start (0).
+	delete(s.title)
+	s.title = strings.clone("Slide Title")
+	testing.expect(t, host_rebuild_frame(&h))
+	dispatch_click(&h, x_start, y1)
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	// Order 2: Shift-down -> click at end -> Shift-up, while SDL's live global
+	// mod state is ALREADY cleared (ahead of the click) -> must extend selection
+	// across "Slide Title", so typing "X" replaces it with "X".
+	sdl.SetModState({})
+	dispatch_shift(&h, sdl.K_RSHIFT, true)
+	dispatch_click(&h, x_end, y1)
+	testing.expect_value(t, h.text_edit.session.anchor, 0)
+	testing.expect_value(t, h.text_edit.session.caret, len("Slide Title"))
+	dispatch_shift(&h, sdl.K_RSHIFT, false)
+
+	dispatch_text(&h, &s, "X")
+	testing.expect_value(t, s.title, "X")
+
+	// Focus loss while both Shifts are held clears Shift tracking cleanly.
+	dispatch_shift(&h, sdl.K_LSHIFT, true)
+	dispatch_shift(&h, sdl.K_RSHIFT, true)
+	dispatch_shift(&h, sdl.K_LSHIFT, false)
+	testing.expect_value(t, host_shift_down(&h), true)
+	lost: sdl.Event
+	lost.type = .WINDOW_FOCUS_LOST
+	_, _, _ = host_dispatch_key_event(&h, &lost)
+	testing.expect_value(t, host_shift_down(&h), false)
 }

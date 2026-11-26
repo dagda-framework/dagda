@@ -736,11 +736,11 @@ host_step_keyboard_focus :: proc(h: ^Host, backward: bool) -> bool {
 	return c1 || c2
 }
 
+// host_shift_down reports Shift modifier state at the current point in the
+// dispatched event stream rather than SDL_GetModState(), which can already
+// reflect later queued key events before an earlier click is drained.
 host_shift_down :: proc(h: ^Host) -> bool {
-	if h.lshift_held || h.rshift_held {
-		return true
-	}
-	return (sdl.GetModState() & sdl.KMOD_SHIFT) != {}
+	return h.lshift_held || h.rshift_held
 }
 
 // host_dispatch_key_event routes KEY_DOWN, KEY_UP, and WINDOW_FOCUS_LOST in
