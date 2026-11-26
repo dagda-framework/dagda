@@ -82,8 +82,13 @@ commit :: proc(data: rawptr, id: dagda.Object_Id, value: string) -> bool {
 	f := &((^State)(data)).fields[int(id)-1]
 	if f.text == value { return false }
 	cloned, err := strings.clone(value)
-	if err != nil { return false }
-	if _, err := append(&f.history, f.text); err != nil {
+	if err != nil || len(cloned) != len(value) {
+		delete(cloned)
+		return false
+	}
+	previous_depth := len(f.history)
+	_, push_err := append(&f.history, f.text)
+	if push_err != nil || len(f.history) != previous_depth + 1 {
 		delete(cloned)
 		return false
 	}
