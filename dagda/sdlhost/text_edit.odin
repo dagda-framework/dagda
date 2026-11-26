@@ -299,29 +299,36 @@ text_edit_content_metrics :: proc(
 		total_lines = 1
 	}
 
-	for line_idx := 0; line_idx < raw_lines; line_idx += 1 {
-		span, ok := text_edit_line_span(committed, line_idx)
-		if !ok {
-			break
-		}
+	line_idx := 0
+	line_start := 0
+	for {
+		rel_nl := strings.index_byte(committed[line_start:], '\n')
+		line_end := rel_nl >= 0 ? line_start + rel_nl : len(committed)
+
 		if composing {
-			if line_idx > start_line && line_idx <= end_line {
-				continue
-			}
 			if line_idx == start_line {
-				end_span, _ := text_edit_line_span(committed, end_line)
-				prefix_w := font_measure_width(font, committed[span.start:sel_start], px)
+				end_line_end := dagda.line_end_offset(committed, sel_end)
+				prefix_w := font_measure_width(font, committed[line_start:sel_start], px)
 				preedit_w := font_measure_width(font, te.session.preedit, px)
-				suffix_w := font_measure_width(font, committed[sel_end:end_span.end], px)
+				suffix_w := font_measure_width(font, committed[sel_end:end_line_end], px)
 				content_w = max(content_w, prefix_w + preedit_w + suffix_w)
 				caret_bytes := text_edit_preedit_caret_bytes(&te.session)
 				caret_content_x = prefix_w + font_measure_width(font, te.session.preedit[:caret_bytes], px)
 				caret_line = start_line
-				continue
+			} else if line_idx < start_line || line_idx > end_line {
+				lw := font_measure_width(font, committed[line_start:line_end], px)
+				content_w = max(content_w, lw)
 			}
+		} else {
+			lw := font_measure_width(font, committed[line_start:line_end], px)
+			content_w = max(content_w, lw)
 		}
-		lw := font_measure_width(font, committed[span.start:span.end], px)
-		content_w = max(content_w, lw)
+
+		if rel_nl < 0 {
+			break
+		}
+		line_start = line_end + 1
+		line_idx += 1
 	}
 
 	if is_active && te != nil && !composing {
@@ -1243,10 +1250,13 @@ text_edit_handle_event :: proc(
 					to_insert := pasted
 					normalized := ""
 					if multiline {
-						if norm, norm_ok := dagda.normalize_multiline_newlines(pasted, clip_alloc); norm_ok {
-							normalized = norm
-							to_insert = normalized
+						norm, norm_ok := dagda.normalize_multiline_newlines(pasted, clip_alloc)
+						if !norm_ok {
+							res.consumed = true
+							return res
 						}
+						normalized = norm
+						to_insert = normalized
 					}
 					defer if len(normalized) > 0 { delete(normalized, clip_alloc) }
 					edit := dagda.insert_text(&te.session, el.text, to_insert)
@@ -1470,13 +1480,13 @@ text_edit_draw :: proc(
 	// Multiline painting: top-aligned lines clipped to the field interior,
 	// sharing layout, scroll, selection, preedit, and caret coordinates.
 	mtx, first_line_y, mpx, line_h, _, _ := text_edit_multiline_layout(h.frame, bounds)
+	vis := text_edit_visible_rect(h.frame, bounds)
 	if focused {
 		text_edit_sync_scroll(&h.text_edit, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 	}
 	sx, sy := text_edit_clamped_scroll_2d(&h.text_edit, &h.font, h.frame, id, bounds, committed, focused, true)
 	draw_x := mtx - sx
 	caret_h := mpx + 6
-	raw_lines := text_edit_line_count(committed)
 
 	composing := focused && dagda.is_composing(&h.text_edit.session)
 	sel_start, sel_end := 0, 0
@@ -1489,65 +1499,73 @@ text_edit_draw :: proc(
 	pre_end_line := composing ? text_edit_line_index_at(committed, sel_end) : -1
 
 	visual_line := 0
-	for line_idx := 0; line_idx < raw_lines; line_idx += 1 {
-		span, ok := text_edit_line_span(committed, line_idx)
-		if !ok {
+	line_idx := 0
+	line_start := 0
+	for {
+		rel_nl := strings.index_byte(committed[line_start:], '\n')
+		line_end := rel_nl >= 0 ? line_start + rel_nl : len(committed)
+
+		if !(composing && line_idx > pre_start_line && line_idx <= pre_end_line) {
+			line_y := first_line_y + f32(visual_line) * line_h - sy
+			visual_line += 1
+
+			// Skip offscreen lines without shaping or drawing glyphs.
+			if line_y + caret_h >= vis.y && line_y - 3 <= vis.y + vis.height {
+				if composing && line_idx == pre_start_line {
+					end_line_end := dagda.line_end_offset(committed, sel_end)
+					prefix := committed[line_start:sel_start]
+					preedit := h.text_edit.session.preedit
+					suffix := committed[sel_end:end_line_end]
+					prefix_w := font_measure_width(&h.font, prefix, mpx)
+					preedit_w := font_measure_width(&h.font, preedit, mpx)
+					pre_x := draw_x + prefix_w
+
+					pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = line_y - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
+					sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
+					sdl.RenderFillRect(r, &pre_bg)
+
+					underline := scale_frect(sdl.FRect{x = pre_x, y = line_y + mpx + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
+					sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+					sdl.RenderFillRect(r, &underline)
+
+					if len(prefix) > 0 {
+						font_draw_text(&h.font, r, prefix, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+					if len(preedit) > 0 {
+						font_draw_text(&h.font, r, preedit, pre_x, line_y, mpx, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
+					}
+					if len(suffix) > 0 {
+						font_draw_text(&h.font, r, suffix, pre_x + preedit_w, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+				} else {
+					if focused && !composing && sel_start < sel_end && sel_end > line_start && sel_start <= line_end {
+						hl_s := clamp(sel_start, line_start, line_end)
+						hl_e := clamp(sel_end, line_start, line_end)
+						sel_x := draw_x + font_measure_width(&h.font, committed[line_start:hl_s], mpx)
+						sel_w := font_measure_width(&h.font, committed[hl_s:hl_e], mpx)
+						if sel_end > line_end {
+							sel_w += max(mpx * 0.35, 6)
+						}
+						if sel_w > 0 {
+							sel_rect := scale_frect(sdl.FRect{x = sel_x, y = line_y - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
+							sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
+							sdl.RenderFillRect(r, &sel_rect)
+						}
+					}
+
+					line_text := committed[line_start:line_end]
+					if len(line_text) > 0 {
+						font_draw_text(&h.font, r, line_text, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+				}
+			}
+		}
+
+		if rel_nl < 0 {
 			break
 		}
-		if composing && line_idx > pre_start_line && line_idx <= pre_end_line {
-			continue
-		}
-		line_y := first_line_y + f32(visual_line) * line_h - sy
-		visual_line += 1
-
-		if composing && line_idx == pre_start_line {
-			end_span, _ := text_edit_line_span(committed, pre_end_line)
-			prefix := committed[span.start:sel_start]
-			preedit := h.text_edit.session.preedit
-			suffix := committed[sel_end:end_span.end]
-			prefix_w := font_measure_width(&h.font, prefix, mpx)
-			preedit_w := font_measure_width(&h.font, preedit, mpx)
-			pre_x := draw_x + prefix_w
-
-			pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = line_y - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
-			sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
-			sdl.RenderFillRect(r, &pre_bg)
-
-			underline := scale_frect(sdl.FRect{x = pre_x, y = line_y + mpx + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
-			sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-			sdl.RenderFillRect(r, &underline)
-
-			if len(prefix) > 0 {
-				font_draw_text(&h.font, r, prefix, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
-			}
-			if len(preedit) > 0 {
-				font_draw_text(&h.font, r, preedit, pre_x, line_y, mpx, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
-			}
-			if len(suffix) > 0 {
-				font_draw_text(&h.font, r, suffix, pre_x + preedit_w, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
-			}
-			continue
-		}
-
-		if focused && !composing && sel_start < sel_end && sel_end > span.start && sel_start <= span.end {
-			hl_s := clamp(sel_start, span.start, span.end)
-			hl_e := clamp(sel_end, span.start, span.end)
-			sel_x := draw_x + font_measure_width(&h.font, committed[span.start:hl_s], mpx)
-			sel_w := font_measure_width(&h.font, committed[hl_s:hl_e], mpx)
-			if sel_end > span.end {
-				sel_w += max(mpx * 0.35, 6)
-			}
-			if sel_w > 0 {
-				sel_rect := scale_frect(sdl.FRect{x = sel_x, y = line_y - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
-				sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
-				sdl.RenderFillRect(r, &sel_rect)
-			}
-		}
-
-		line_text := committed[span.start:span.end]
-		if len(line_text) > 0 {
-			font_draw_text(&h.font, r, line_text, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
-		}
+		line_start = line_end + 1
+		line_idx += 1
 	}
 
 	if focused {
@@ -1570,10 +1588,16 @@ host_clear_control_cstrs :: proc(h: ^Host) {
 
 push_sdl_preedit :: proc(h: ^Host, text: string) -> bool {
 	cstr, err := strings.clone_to_cstring(text)
-	if err != nil {
+	if err != nil || cstr == nil {
+		delete(cstr)
 		return false
 	}
-	append(&h.queued_control_cstrs, cstr)
+	prev_len := len(h.queued_control_cstrs)
+	_, append_err := append(&h.queued_control_cstrs, cstr)
+	if append_err != nil || len(h.queued_control_cstrs) != prev_len + 1 {
+		delete(cstr)
+		return false
+	}
 	ev: sdl.Event
 	ev.type = .TEXT_EDITING
 	ev.edit.windowID = sdl.GetWindowID(h.window)
@@ -1590,10 +1614,16 @@ push_sdl_preedit :: proc(h: ^Host, text: string) -> bool {
 
 push_sdl_text_input :: proc(h: ^Host, text: string) -> bool {
 	cstr, err := strings.clone_to_cstring(text)
-	if err != nil {
+	if err != nil || cstr == nil {
+		delete(cstr)
 		return false
 	}
-	append(&h.queued_control_cstrs, cstr)
+	prev_len := len(h.queued_control_cstrs)
+	_, append_err := append(&h.queued_control_cstrs, cstr)
+	if append_err != nil || len(h.queued_control_cstrs) != prev_len + 1 {
+		delete(cstr)
+		return false
+	}
 	ev: sdl.Event
 	ev.type = .TEXT_INPUT
 	ev.text.windowID = sdl.GetWindowID(h.window)

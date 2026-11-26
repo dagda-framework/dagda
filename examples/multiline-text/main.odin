@@ -81,6 +81,21 @@ note_init :: proc(n: ^Note_App, body: string, max_lines: int, allocator := conte
 	n.title.undo.allocator = allocator
 }
 
+note_destroy :: proc(n: ^Note_App) {
+	alloc := n.allocator.procedure != nil ? n.allocator : context.allocator
+	delete(n.body.text, alloc)
+	for prev in n.body.undo {
+		delete(prev, alloc)
+	}
+	delete(n.body.undo)
+	delete(n.title.text, alloc)
+	for prev in n.title.undo {
+		delete(prev, alloc)
+	}
+	delete(n.title.undo)
+	n^ = {}
+}
+
 field_of :: proc(n: ^Note_App, id: dagda.Object_Id) -> ^Field {
 	switch id {
 	case BODY_ID:
@@ -108,11 +123,24 @@ acceptable :: proc(n: ^Note_App, id: dagda.Object_Id, s: string) -> bool {
 	return id == BODY_ID ? body_acceptable(n, s) : dagda.valid_single_line(s)
 }
 
-// replace installs new_text as one undo step and one revision.
-replace :: proc(n: ^Note_App, field: ^Field, new_text: string) {
-	append(&field.undo, field.text)
-	field.text = strings.clone(new_text, n.allocator)
+// replace installs new_text as one undo step and one revision only after both
+// cloning new_text and appending the previous text to undo history succeed.
+replace :: proc(n: ^Note_App, field: ^Field, new_text: string) -> bool {
+	alloc := n.allocator.procedure != nil ? n.allocator : context.allocator
+	cloned, clone_err := strings.clone(new_text, alloc)
+	if clone_err != nil || (len(new_text) > 0 && len(cloned) != len(new_text)) {
+		delete(cloned, alloc)
+		return false
+	}
+	prev_len := len(field.undo)
+	_, push_err := append(&field.undo, field.text)
+	if push_err != nil || len(field.undo) != prev_len + 1 {
+		delete(cloned, alloc)
+		return false
+	}
+	field.text = cloned
 	field.rev += 1
+	return true
 }
 
 report :: proc(kind: string, id: dagda.Object_Id, rev: dagda.Revision, text: string, with_rev: bool) {
@@ -148,7 +176,10 @@ note_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) ->
 		report("REJECT", id, 0, new_text, false)
 		return false
 	}
-	replace(n, field, new_text)
+	if !replace(n, field, new_text) {
+		report("REJECT", id, 0, new_text, false)
+		return false
+	}
 	report("COMMIT", id, field.rev, field.text, true)
 	return true
 }
@@ -182,7 +213,9 @@ note_edit :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, 
 	if !acceptable(n, target.id, arg.text) || arg.text == field.text {
 		return .Not_Handled
 	}
-	replace(n, field, arg.text)
+	if !replace(n, field, arg.text) {
+		return .Not_Handled
+	}
 	report("EDIT", target.id, field.rev, field.text, true)
 	return .Applied
 }
@@ -277,6 +310,7 @@ main :: proc() {
 
 	state: Note_App
 	note_init(&state, body, max_lines)
+	defer note_destroy(&state)
 
 	app := sdlhost.App {
 		title                 = "Dagda — Multiline Text Fixture",

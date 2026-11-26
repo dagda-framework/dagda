@@ -281,21 +281,34 @@ valid_text_for_session :: proc(session: ^Text_Session, s: string) -> bool {
 // normalize_multiline_newlines converts CRLF and lone CR sequences to LF.
 // Returns (normalized, ok). Caller owns the returned string.
 normalize_multiline_newlines :: proc(s: string, allocator := context.allocator) -> (string, bool) {
-	b, err := strings.builder_make(0, len(s), allocator)
-	if err != nil {
+	out_len := 0
+	for i := 0; i < len(s); i += 1 {
+		if s[i] == '\r' && i + 1 < len(s) && s[i + 1] == '\n' {
+			i += 1
+		}
+		out_len += 1
+	}
+	if out_len == 0 {
+		return "", true
+	}
+	storage, alloc_err := make([]u8, out_len, allocator)
+	if alloc_err != nil || storage == nil || len(storage) != out_len {
+		delete(storage, allocator)
 		return "", false
 	}
+	dst := 0
 	for i := 0; i < len(s); i += 1 {
 		if s[i] == '\r' {
 			if i + 1 < len(s) && s[i + 1] == '\n' {
 				i += 1
 			}
-			strings.write_byte(&b, '\n')
+			storage[dst] = '\n'
 		} else {
-			strings.write_byte(&b, s[i])
+			storage[dst] = s[i]
 		}
+		dst += 1
 	}
-	return strings.to_string(b), true
+	return string(storage), true
 }
 
 // replace_range proposes replacing committed[start:end] with

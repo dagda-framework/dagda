@@ -279,6 +279,10 @@ test_multiline_session_validation_lines_and_newlines :: proc(t: ^testing.T) {
 	defer delete(norm)
 	testing.expect_value(t, norm, "a\nb\nc\nd")
 
+	norm_fail, ok_fail := normalize_multiline_newlines("a\r\nb", mem.nil_allocator())
+	testing.expect(t, !ok_fail)
+	testing.expect_value(t, norm_fail, "")
+
 	s := "one\ntwo\nthree\n"
 	testing.expect_value(t, line_start_offset(s, 0), 0)
 	testing.expect_value(t, line_end_offset(s, 0), 3)
