@@ -2,6 +2,8 @@
 
 Dagda is an experimental native UI framework for Odin, designed for applications that people and agents can operate together. In a slide editor, the headline on the canvas and the title in the outline represent the same object. The goal is for a person to edit it in either view, for an agent to propose a rename while the person works, and for either of them to undo the change.
 
+**New here?** [Build your first native Dagda app](docs/first-app.md) — a counter window from your own Odin project, clicked once by hand and once by an agent.
+
 Today, on Linux, one SDL3 window shows an editable slide title backed by a shared title model, and a terminal client can inspect, preview, and commit a rename over a local socket while a second client watches committed changes. Typing, text composition, and keyboard undo in the window operate on the same model, and the window keeps keyboard focus when an external edit lands.
 
 ## Quick start
