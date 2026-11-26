@@ -104,6 +104,8 @@ Host :: struct {
 	pointer:       Pointer_State,
 	focus:         Focus_State,
 	text_edit:     Text_Edit_State,
+	lshift_held:   bool,
+	rshift_held:   bool,
 	clipboard:     Clipboard,
 	mem_clipboard: Memory_Clipboard,
 	edit_cstr_buf: [256]u8,
@@ -303,6 +305,29 @@ push_sdl_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
 	return push_sdl_button(window, x, y, false)
 }
 
+push_sdl_shift_key :: proc(window: ^sdl.Window, down: bool) -> bool {
+	ev: sdl.Event
+	ev.type = down ? .KEY_DOWN : .KEY_UP
+	ev.key.windowID = sdl.GetWindowID(window)
+	ev.key.key = sdl.K_LSHIFT
+	ev.key.mod = down ? sdl.KMOD_LSHIFT : {}
+	ev.key.down = down
+	return sdl.PushEvent(&ev)
+}
+
+// push_sdl_shift_click injects real SDL Shift key-down, mouse click, and Shift
+// key-up events into SDL3's event queue so automated tests exercise the actual
+// host modifier and mouse dispatch path.
+push_sdl_shift_click :: proc(window: ^sdl.Window, x, y: f32) -> bool {
+	if !push_sdl_shift_key(window, true) {
+		return false
+	}
+	if !push_sdl_click(window, x, y) {
+		return false
+	}
+	return push_sdl_shift_key(window, false)
+}
+
 push_sdl_hover :: proc(window: ^sdl.Window, x, y: f32) -> bool {
 	win_id := sdl.GetWindowID(window)
 	motion: sdl.Event
@@ -476,6 +501,20 @@ poll_control_stdin :: proc(
 					_ = os.flush(os.stdout)
 				} else {
 					fmt.println("CONTROL_ERR invalid click")
+					_ = os.flush(os.stdout)
+				}
+			}
+		} else if strings.has_prefix(line, "shift+click ") {
+			rest := line[len("shift+click "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp >= 0 {
+				x, ok_x := strconv.parse_f32(rest[:sp])
+				y, ok_y := strconv.parse_f32(rest[sp + 1:])
+				if ok_x && ok_y && push_sdl_shift_click(h.window, x, y) {
+					fmt.printf("CONTROL_OK shift+click %.2f %.2f\n", x, y)
+					_ = os.flush(os.stdout)
+				} else {
+					fmt.println("CONTROL_ERR invalid shift+click")
 					_ = os.flush(os.stdout)
 				}
 			}
@@ -697,12 +736,37 @@ host_step_keyboard_focus :: proc(h: ^Host, backward: bool) -> bool {
 	return c1 || c2
 }
 
+host_shift_down :: proc(h: ^Host) -> bool {
+	if h.lshift_held || h.rshift_held {
+		return true
+	}
+	return (sdl.GetModState() & sdl.KMOD_SHIFT) != {}
+}
+
 // host_dispatch_key_event routes KEY_DOWN, KEY_UP, and WINDOW_FOCUS_LOST in
 // priority order: active pointer gesture cancellation, focused editable text
 // (including field-scoped Ctrl+Z and composition protection), unified Tab /
 // Shift+Tab traversal across editable fields and buttons, app-level Ctrl+Z
 // when the text field is not focused, and button keyboard activation.
 host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
+	#partial switch ev.type {
+	case .KEY_DOWN:
+		if ev.key.key == sdl.K_LSHIFT {
+			h.lshift_held = true
+		} else if ev.key.key == sdl.K_RSHIFT {
+			h.rshift_held = true
+		}
+	case .KEY_UP:
+		if ev.key.key == sdl.K_LSHIFT {
+			h.lshift_held = false
+		} else if ev.key.key == sdl.K_RSHIFT {
+			h.rshift_held = false
+		}
+	case .WINDOW_FOCUS_LOST:
+		h.lshift_held = false
+		h.rshift_held = false
+	}
+
 	pres := host_handle_pointer_cancel_event(h, ev)
 	if pres.changed {
 		needs_rebuild = true
@@ -788,7 +852,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 			if h.app.text_edit.enabled {
 				if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
 					_ = focus_clear(&h.focus)
-					started, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets)
+					started, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets, host_shift_down(h))
 					if changed {
 						h.needs_redraw = true
 					}

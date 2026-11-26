@@ -2760,3 +2760,247 @@ test_editable_canvas_press_preserves_full_pointer_gesture_lifecycle :: proc(t: ^
 	testing.expect_value(t, s.button_hits, 1)
 	testing.expect_value(t, s.holding_gesture, false)
 }
+
+@(test)
+test_shift_click_extends_shrinks_reverses_switches_field_and_respects_ime_and_pointer :: proc(t: ^testing.T) {
+	Recorded_Ev :: struct {
+		phase:      Pointer_Phase,
+		has_target: bool,
+		target_id:  dagda.Object_Id,
+	}
+	Shift_App :: struct {
+		title_a:         string,
+		title_b:         string,
+		rev:             u64,
+		undo_depth:      int,
+		events:          [dynamic]Recorded_Ev,
+		holding_gesture: bool,
+		editable:        [2]dagda.Object_Id,
+		elements:        [2]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Shift_App)(user_data)
+		s.elements = {
+			{info = {id = 1, role = "field.a"}, kind = .Label, text = s.title_a, bounds = {x = 40, y = 60, width = 500, height = 70}},
+			{info = {id = 2, role = "field.b"}, kind = .Label, text = s.title_b, bounds = {x = 40, y = 160, width = 500, height = 70}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_pointer :: proc(user_data: rawptr, ev: Pointer_Event) -> bool {
+		s := (^Shift_App)(user_data)
+		append(&s.events, Recorded_Ev{phase = ev.phase, has_target = ev.has_target, target_id = ev.target_id})
+		switch ev.phase {
+		case .Press:
+			s.holding_gesture = true
+		case .Move:
+		case .Release, .Cancel:
+			s.holding_gesture = false
+		}
+		return false
+	}
+
+	// "Ae\u0301BC": 'A'(0..1), 'e'+U+0301(1..4), 'B'(4..5), 'C'(5..6).
+	s := Shift_App{
+		title_a  = "Ae\u0301BC",
+		title_b  = "Hello World",
+		editable = {1, 2},
+	}
+	defer delete(s.events)
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data             = &s,
+		canvas                = make_canvas,
+		on_pointer            = on_pointer,
+		text_edit             = {enabled = true},
+		editable_text_targets = s.editable[:],
+	}
+	h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
+	testing.expect(t, host_rebuild_frame(&h))
+	defer {
+		memory_clipboard_destroy(&h.mem_clipboard)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	click_at :: proc(h: ^Host, x, y: f32, shift := false) {
+		if shift {
+			kd: sdl.Event
+			kd.type = .KEY_DOWN
+			kd.key.key = sdl.K_LSHIFT
+			kd.key.mod = sdl.KMOD_LSHIFT
+			_, _, _ = host_dispatch_key_event(h, &kd)
+		}
+		d: sdl.Event
+		d.type = .MOUSE_BUTTON_DOWN
+		d.button.button = sdl.BUTTON_LEFT
+		d.button.down = true
+		d.button.x = x
+		d.button.y = y
+		_ = host_dispatch_mouse_event(h, &d)
+		u: sdl.Event
+		u.type = .MOUSE_BUTTON_UP
+		u.button.button = sdl.BUTTON_LEFT
+		u.button.down = false
+		u.button.x = x
+		u.button.y = y
+		_ = host_dispatch_mouse_event(h, &u)
+		if shift {
+			ku: sdl.Event
+			ku.type = .KEY_UP
+			ku.key.key = sdl.K_LSHIFT
+			_, _, _ = host_dispatch_key_event(h, &ku)
+		}
+	}
+
+	el1, ok1 := dagda.find(h.frame, 1)
+	el2, ok2 := dagda.find(h.frame, 2)
+	testing.expect(t, ok1 && ok2)
+	tx1, _, px1 := text_edit_layout(h.frame, el1.bounds)
+	tx2, _, px2 := text_edit_layout(h.frame, el2.bounds)
+	y1 := el1.bounds.y + el1.bounds.height * 0.5
+	y2 := el2.bounds.y + el2.bounds.height * 0.5
+
+	x_0 := tx1 - 2
+	x_after_a := tx1 + font_measure_width(&h.font, "A", px1)
+	x_after_e := tx1 + font_measure_width(&h.font, "Ae\u0301", px1)
+	x_after_b := tx1 + font_measure_width(&h.font, "Ae\u0301B", px1)
+	x_after_c := tx1 + font_measure_width(&h.font, "Ae\u0301BC", px1)
+	x_b_after_hello := tx2 + font_measure_width(&h.font, "Hello", px2)
+
+	// 1. Ordinary click after 'A' sets anchor=1, caret=1.
+	click_at(&h, x_after_a, y1, false)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 1)
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, len(s.events), 2)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 1})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Release, true, 1})
+
+	// 2. Shift-click after 'B' extends forward across decomposed e+U+0301 -> [1, 5].
+	clear(&s.events)
+	click_at(&h, x_after_b, y1, true)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 5)
+	testing.expect_value(t, s.rev, u64(0))
+	testing.expect_value(t, s.undo_depth, 0)
+	testing.expect_value(t, s.holding_gesture, false)
+	testing.expect_value(t, len(s.events), 2)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 1})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Release, true, 1})
+
+	// 3. Later Shift-click after e+U+0301 shrinks selection -> [1, 4].
+	click_at(&h, x_after_e, y1, true)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+
+	copy_ev: sdl.Event
+	copy_ev.type = .KEY_DOWN
+	copy_ev.key.key = sdl.K_C
+	copy_ev.key.mod = sdl.KMOD_LCTRL
+	_, _, _ = host_dispatch_key_event(&h, &copy_ev)
+	testing.expect_value(t, h.mem_clipboard.text, "e\u0301")
+
+	// 4. Later Shift-click before 'A' reverses selection across original anchor -> anchor=1, caret=0.
+	click_at(&h, x_0, y1, true)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 0)
+
+	// 5. Ordinary click after 'C' collapses selection -> [6, 6].
+	click_at(&h, x_after_c, y1, false)
+	testing.expect_value(t, h.text_edit.session.anchor, 6)
+	testing.expect_value(t, h.text_edit.session.caret, 6)
+
+	// 6. Shift-click in a different field (id=2) starts a fresh collapsed selection in field 2.
+	clear(&s.events)
+	click_at(&h, x_b_after_hello, y2, true)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, h.text_edit.session.anchor, 5)
+	testing.expect_value(t, h.text_edit.session.caret, 5)
+	testing.expect_value(t, len(s.events), 2)
+	testing.expect_value(t, s.events[0], Recorded_Ev{.Press, true, 2})
+	testing.expect_value(t, s.events[1], Recorded_Ev{.Release, true, 2})
+
+	// 7. During active preedit in field 2, Shift-click in field 1 is blocked and fires no pointer event.
+	clear(&s.events)
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &s, &pre, s.editable[:], h.clipboard)
+	click_at(&h, x_after_a, y1, true)
+	testing.expect_value(t, len(s.events), 0)
+	testing.expect_value(t, h.text_edit.active_id, dagda.Object_Id(2))
+	testing.expect_value(t, dagda.is_composing(&h.text_edit.session), true)
+	testing.expect_value(t, h.text_edit.session.preedit, "e")
+}
+
+@(test)
+test_shift_click_reads_sdl_mod_state_under_dummy :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		return
+	}
+	defer sdl.Quit()
+	driver_cstr := sdl.GetCurrentVideoDriver()
+	if driver_cstr == nil || string(driver_cstr) != "dummy" {
+		return
+	}
+
+	els := [1]dagda.Canvas_Element{
+		{info = {id = 1, role = "field.a"}, kind = .Label, text = "Ae\u0301BC", bounds = {x = 40, y = 60, width = 500, height = 70}},
+	}
+	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, {width = 800, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	h: Host
+	if !font_init(&h.font) {
+		return
+	}
+	defer font_destroy(&h.font)
+	h.frame = frame
+	h.app = App{text_edit = {enabled = true, target_id = 1}}
+	defer text_edit_destroy(&h.text_edit)
+
+	el1, found := dagda.find(h.frame, 1)
+	testing.expect(t, found)
+	tx, _, px := text_edit_layout(h.frame, el1.bounds)
+	y1 := el1.bounds.y + el1.bounds.height * 0.5
+	x_after_a := tx + font_measure_width(&h.font, "A", px)
+	x_after_e := tx + font_measure_width(&h.font, "Ae\u0301", px)
+
+	prev_mod := sdl.GetModState()
+	defer sdl.SetModState(prev_mod)
+	sdl.SetModState({})
+
+	d: sdl.Event
+	d.type = .MOUSE_BUTTON_DOWN
+	d.button.button = sdl.BUTTON_LEFT
+	d.button.down = true
+	d.button.x = x_after_a
+	d.button.y = y1
+	u := d
+	u.type = .MOUSE_BUTTON_UP
+	u.button.down = false
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 1)
+
+	// Set SDL modifier state directly (without KEY_DOWN) -> Shift-click still extends!
+	sdl.SetModState(sdl.KMOD_LSHIFT)
+	d.button.x = x_after_e
+	u.button.x = x_after_e
+	testing.expect(t, host_dispatch_mouse_event(&h, &d))
+	testing.expect(t, host_dispatch_mouse_event(&h, &u))
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+}

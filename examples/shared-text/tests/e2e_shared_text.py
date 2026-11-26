@@ -437,6 +437,7 @@ def main() -> int:
         drag_sizes = ("800x540", "640x480") if os.environ.get("SDL_VIDEODRIVER") == "dummy" else ("800x540",)
         for sz in drag_sizes:
             verify_mouse_drag_selection(app_bin, client_bin, capture_dir, sz)
+        verify_shift_click_selection(app_bin, client_bin, capture_dir)
         print("All shared-text checks passed.")
         return 0
     finally:
@@ -787,6 +788,154 @@ def verify_mouse_drag_selection(app_bin: Path, client_bin: Path, capture_dir: Pa
             f"[shared-drag] requested={req_size} captured={png_w}x{png_h}: "
             f"ltr_copy('e\\u0301',rev_kept=1) -> rtl_copy+overwrite('AXB'->undo 'Ae\\u0301B') -> "
             f"clamp_ends('Z'->undo 'Ae\\u0301B')"
+        )
+
+        send_control(proc, reader, "quit")
+        proc.wait(timeout=5)
+        assert proc.returncode == 0 and not sock.exists()
+        proc = None
+    finally:
+        stop_process(proc)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def verify_shift_click_selection(app_bin: Path, client_bin: Path, capture_dir: Path) -> None:
+    """Shift-click selection through the actual SDL host modifier path:
+    extend forward across a decomposed accent, cross the original anchor in reverse,
+    copy and paste to verify exact UTF-8 bytes, replace and undo once, verify revision
+    and undo depth stay untouched by selection alone, and verify cross-field click
+    during active preedit leaves composition intact.
+    """
+    sock_dir = Path(tempfile.mkdtemp(prefix="dagda-shared-shift."))
+    os.chmod(sock_dir, 0o700)
+    sock = sock_dir / "shared-shift.sock"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=ROOT,
+        )
+        assert proc.stdout is not None
+        reader = DeadlineLineReader(proc.stdout)
+        ready = reader.read_line("shared-text shift-click startup", timeout=5.0)
+        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+
+        send_control(proc, reader, f"screenshot {capture_dir / '10-shift-init.png'}")
+        c1, el1_resp = run_client(client_bin, sock, "inspect", "outline.title")
+        c2, el2_resp = run_client(client_bin, sock, "inspect", "canvas.title")
+        assert c1 == 0 and c2 == 0
+        b1, b2 = el1_resp["elements"][0]["bounds"], el2_resp["elements"][0]["bounds"]
+
+        decomposed = "Ae\u0301BC"
+        assert decomposed.encode("utf-8") == b"Ae\xcc\x81BC"
+        y1 = b1["y"] + b1["height"] * 0.5
+        y2 = b2["y"] + b2["height"] * 0.5
+        send_control(proc, reader, f"click {b1['x'] + 2.0:.2f} {y1:.2f}")
+        send_control(proc, reader, "key ctrl+a")
+        send_control(proc, reader, f"text {decomposed}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Measure unfocused glyph span in outline.title to compute scale-independent grapheme stops.
+        send_control(proc, reader, "click 4.00 4.00")
+        span_png = capture_dir / "11-shift-span.png"
+        send_control(proc, reader, f"screenshot {span_png}")
+        png_w, png_h, rgb = decode_png_rgb(span_png)
+        g_min_x, g_max_x = glyph_x_span(png_w, png_h, rgb, b1)
+        span = g_max_x - g_min_x
+        x_after_a = g_min_x + span * 0.26
+        x_after_e = g_min_x + span * 0.48
+        x_after_b = g_min_x + span * 0.73
+
+        # 1. Forward Shift-click across decomposed é (anchor=1 -> caret=4): revision & undo untouched.
+        send_control(proc, reader, f"click {x_after_a:.2f} {y1:.2f}")
+        send_control(proc, reader, f"shift+click {x_after_e:.2f} {y1:.2f}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+
+        # Copy forward selection and paste at end of canvas.title -> exact bytes b"e\xcc\x81".
+        send_control(proc, reader, "key ctrl+c")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=1, undo=1, last_id=1, actions=0")
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        send_control(proc, reader, "key ctrl+v")
+        r_fwd = wait_for_role_text(client_bin, sock, "outline.title", "Ae\u0301BCe\u0301")
+        assert r_fwd["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81BCe\xcc\x81"
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=2, undo=2, last_id=2, actions=0")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # 2. Extend forward (anchor=4 -> caret=5), then Shift-click backward crossing anchor (caret=1):
+        #    selects decomposed é in reverse; selection alone leaves revision & undo untouched.
+        send_control(proc, reader, f"click {x_after_e:.2f} {y1:.2f}")
+        send_control(proc, reader, f"shift+click {x_after_b:.2f} {y1:.2f}")
+        send_control(proc, reader, f"shift+click {x_after_a:.2f} {y1:.2f}")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        send_control(proc, reader, "clipboard cleared")
+        send_control(proc, reader, "key ctrl+c")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=3, undo=1, last_id=2, actions=0")
+
+        # Replace reversed selection with "X" -> "AXBC", then undo once -> restores "Ae\u0301BC".
+        send_control(proc, reader, "text X")
+        wait_for_role_text(client_bin, sock, "outline.title", "AXBC")
+        wait_for_role_text(client_bin, sock, "canvas.title", "AXBC")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=4, undo=2, last_id=1, actions=0")
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "canvas.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=5, undo=1, last_id=1, actions=0")
+
+        # Verify copied reversed selection also held exact bytes b"e\xcc\x81".
+        send_control(proc, reader, f"click {b2['x'] + b2['width'] - 10.0:.2f} {y2:.2f}")
+        send_control(proc, reader, "key ctrl+v")
+        r_rev = wait_for_role_text(client_bin, sock, "canvas.title", "Ae\u0301BCe\u0301")
+        assert r_rev["elements"][0]["text"].encode("utf-8") == b"Ae\xcc\x81BCe\xcc\x81"
+        send_control(proc, reader, "key ctrl+z")
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=7, undo=1, last_id=2, actions=0")
+
+        # 3. Shift-click in outline.title during active preedit in canvas.title preserves preedit.
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, "preedit e")
+        send_control(proc, reader, f"shift+click {x_after_a:.2f} {y1:.2f}")
+
+        preedit_png = capture_dir / "12-shift-preedit-intact.png"
+        deadline = time.monotonic() + 2.0
+        pre2_bg = uline2_w = 0
+        while True:
+            send_control(proc, reader, f"screenshot {preedit_png}")
+            wp, hp, rgbp = decode_png_rgb(preedit_png)
+            pre1_bg, sel1_bg, amber1_w = inspect_visual_state(wp, hp, rgbp, b1)
+            pre2_bg, sel2_bg, amber2_w = inspect_visual_state(wp, hp, rgbp, b2)
+            if pre2_bg >= 50 and amber2_w >= 6 and pre1_bg == 0 and amber1_w == 0:
+                uline2_w = amber2_w
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"preedit did not survive cross-field Shift-click in {preedit_png}: "
+                    f"el1=(pre={pre1_bg},sel={sel1_bg},amber_w={amber1_w}) "
+                    f"el2=(pre={pre2_bg},sel={sel2_bg},amber_w={amber2_w})"
+                )
+            time.sleep(0.02)
+
+        wait_for_role_text(client_bin, sock, "outline.title", decomposed)
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=7, undo=1, last_id=2, actions=0")
+        send_control(proc, reader, "key enter")
+        send_control(proc, reader, "text é")
+        wait_for_role_text(client_bin, sock, "outline.title", f"{decomposed}é")
+        wait_for_role_text(client_bin, sock, "shared.status", "rev=8, undo=2, last_id=2, actions=0")
+
+        print(
+            f"[shared-shift] requested=800x540 captured={png_w}x{png_h}: "
+            f"fwd_copy('e\\u0301',rev_kept=1) -> cross_anchor_rev('AXBC'->undo 'Ae\\u0301BC') -> "
+            f"preedit_cross_field_blocked(bg={pre2_bg},uline_w={uline2_w}->'Ae\\u0301BCé',rev=8,id=2)"
         )
 
         send_control(proc, reader, "quit")
