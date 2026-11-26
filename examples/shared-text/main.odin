@@ -10,18 +10,21 @@ import "dagda:dagda/sdlhost"
 OUTLINE_TITLE_ID :: dagda.Object_Id(1)
 CANVAS_TITLE_ID :: dagda.Object_Id(2)
 STATUS_ID :: dagda.Object_Id(3)
+ACTION_ID :: dagda.Object_Id(4)
 
 // Shared_Text_App is a minimal native fixture with two distinct single-line
-// elements editing one app-owned string, revision, and undo history.
+// elements editing one app-owned string, revision, and undo history, plus a
+// passive status label and an actionable button for Tab traversal tests.
 Shared_Text_App :: struct {
 	title:          string,
 	rev:            u64,
 	last_editor_id: dagda.Object_Id,
+	actions:        int,
 	undo_stack:     [dynamic]string,
 	editable_ids:   [2]dagda.Object_Id,
 	allocator:      mem.Allocator,
 	status_buf:     [96]u8,
-	elements:       [3]dagda.Canvas_Element,
+	elements:       [4]dagda.Canvas_Element,
 }
 
 shared_init :: proc(s: ^Shared_Text_App, initial: string, allocator := context.allocator) -> bool {
@@ -51,10 +54,11 @@ shared_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
 	s := (^Shared_Text_App)(user_data)
 	status := fmt.bprintf(
 		s.status_buf[:],
-		"rev=%d, undo=%d, last_id=%d",
+		"rev=%d, undo=%d, last_id=%d, actions=%d",
 		s.rev,
 		len(s.undo_stack),
 		u64(s.last_editor_id),
+		s.actions,
 	)
 	s.elements = {
 		{
@@ -75,11 +79,26 @@ shared_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
 			text   = status,
 			bounds = {x = 80, y = 340, width = 640, height = 56},
 		},
+		{
+			info   = {id = ACTION_ID, role = "shared.action"},
+			kind   = .Button,
+			text   = "Apply",
+			bounds = {x = 740, y = 60, width = 140, height = 80},
+		},
 	}
 	return {
 		size     = {width = 960, height = 540},
 		elements = s.elements[:],
 	}
+}
+
+shared_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+	s := (^Shared_Text_App)(user_data)
+	if id == ACTION_ID && action == .Activate {
+		s.actions += 1
+		return true
+	}
+	return false
 }
 
 shared_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
@@ -135,6 +154,7 @@ main :: proc() {
 		height                = 540,
 		user_data             = &state,
 		canvas                = shared_canvas,
+		handle                = shared_handle,
 		text_edit             = {
 			enabled   = true,
 			on_commit = shared_commit,

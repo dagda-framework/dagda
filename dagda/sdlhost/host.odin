@@ -578,10 +578,85 @@ is_initial_ctrl_z :: proc(ev: ^sdl.Event) -> bool {
 		(ev.key.mod & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {}
 }
 
+// host_step_keyboard_focus moves the single keyboard target forward (Tab) or
+// backward (Shift+Tab) through buttons and configured editable text fields in
+// frame declaration order, skipping passive labels and wrapping at both ends.
+host_step_keyboard_focus :: proc(h: ^Host, backward: bool) -> bool {
+	has_cur := false
+	cur_id: dagda.Object_Id
+	if h.text_edit.focused {
+		has_cur = true
+		cur_id = h.text_edit.active_id
+	} else if h.focus.has_focus {
+		has_cur = true
+		cur_id = h.focus.focused_id
+	}
+
+	first_idx := -1
+	last_idx := -1
+	cur_idx := -1
+	for el, i in h.frame.elements {
+		if !is_tab_target(el, h.app.text_edit, h.app.editable_text_targets) {
+			continue
+		}
+		if first_idx < 0 {
+			first_idx = i
+		}
+		last_idx = i
+		if has_cur && el.info.id == cur_id {
+			cur_idx = i
+		}
+	}
+
+	if first_idx < 0 {
+		c1 := focus_clear(&h.focus)
+		c2 := text_edit_blur(&h.text_edit, h.ime_window)
+		return c1 || c2
+	}
+
+	next_idx := first_idx
+	if cur_idx < 0 {
+		next_idx = backward ? last_idx : first_idx
+	} else if !backward {
+		next_idx = first_idx
+		for i := cur_idx + 1; i < len(h.frame.elements); i += 1 {
+			if is_tab_target(h.frame.elements[i], h.app.text_edit, h.app.editable_text_targets) {
+				next_idx = i
+				break
+			}
+		}
+	} else {
+		next_idx = last_idx
+		for i := cur_idx - 1; i >= 0; i -= 1 {
+			if is_tab_target(h.frame.elements[i], h.app.text_edit, h.app.editable_text_targets) {
+				next_idx = i
+				break
+			}
+		}
+	}
+
+	next_el := h.frame.elements[next_idx]
+	if text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, next_el.info.id) {
+		c1 := focus_clear(&h.focus)
+		c2 := text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, next_el.info.id, h.app.editable_text_targets)
+		return c1 || c2
+	}
+
+	c1 := text_edit_blur(&h.text_edit, h.ime_window)
+	c2 := focus_cancel_pending_space(&h.focus)
+	if !h.focus.has_focus || h.focus.focused_id != next_el.info.id {
+		h.focus.has_focus = true
+		h.focus.focused_id = next_el.info.id
+		return true
+	}
+	return c1 || c2
+}
+
 // host_dispatch_key_event routes KEY_DOWN, KEY_UP, and WINDOW_FOCUS_LOST in
 // priority order: active pointer gesture cancellation, focused editable text
-// (including field-scoped Ctrl+Z and composition protection), app-level Ctrl+Z
-// when the text field is not focused, and button keyboard focus.
+// (including field-scoped Ctrl+Z and composition protection), unified Tab /
+// Shift+Tab traversal across editable fields and buttons, app-level Ctrl+Z
+// when the text field is not focused, and button keyboard activation.
 host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
 	pres := host_handle_pointer_cancel_event(h, ev)
 	if pres.changed {
@@ -606,6 +681,14 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
+	if ev.type == .KEY_DOWN && ev.key.key == sdl.K_TAB && (ev.key.mod & (sdl.KMOD_CTRL | sdl.KMOD_ALT | sdl.KMOD_GUI)) == {} {
+		shift := (ev.key.mod & sdl.KMOD_SHIFT) != {}
+		if host_step_keyboard_focus(h, shift) {
+			h.needs_redraw = true
+		}
+		return
+	}
+
 	if is_initial_ctrl_z(ev) && h.app.on_undo != nil {
 		if h.app.on_undo(h.app.user_data) {
 			needs_rebuild = true
@@ -615,8 +698,6 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 
 	applied, redraw := focus_handle_event(&h.focus, h.frame, ev, h.app.handle, h.app.user_data)
 	if h.focus.has_focus && h.text_edit.focused {
-		// Keyboard focus belongs to one element at a time:
-		// end the text-input session when Tab/Shift+Tab focuses a button.
 		_ = text_edit_blur(&h.text_edit, h.ime_window)
 		h.needs_redraw = true
 	}
