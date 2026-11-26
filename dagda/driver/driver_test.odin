@@ -307,7 +307,7 @@ test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
 	rep, applied := dispatch(frame, nil, nil, `{"op":"inspect","role":"slide.card"}`)
 	defer delete(rep)
 	testing.expect_value(t, applied, false)
-	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.08,"y":193.33,"width":133.38,"height":146.67},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.08,"y":193.33,"width":133.38,"height":146.67},"visible_canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
 }
 
 Wire_Doc :: struct {
@@ -400,4 +400,42 @@ test_preview_unknown_object_cases :: proc(t: ^testing.T) {
 	defer delete(rep2)
 	testing.expect_value(t, rep2, `{"ok":false,"error":"Unknown_Object"}`)
 	testing.expect_value(t, doc.calls, 0)
+}
+
+@(test)
+test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {
+			{info = {id = 1, role = "clipped"}, kind = .Button, text = "Clipped", bounds = {x = 900, y = 480, width = 200, height = 120}},
+			{info = {id = 2, role = "full"}, kind = .Label, text = "Full", bounds = {x = 10, y = 10, width = 100, height = 50}},
+			{info = {id = 3, role = "fractional"}, kind = .Label, text = "Frac", bounds = {x = 93.125, y = -40, width = 200.0625, height = 620}},
+			{info = {id = 4, role = "edge"}, kind = .Label, text = "Edge", bounds = {x = 960, y = 100, width = 50, height = 50}},
+			{info = {id = 5, role = "outside"}, kind = .Label, text = "Out", bounds = {x = 1000, y = 600, width = 50, height = 50}},
+			{info = {id = 6, role = "tiny1"}, kind = .Label, text = "Tiny1", bounds = {x = 900, y = 10, width = 0.1, height = 50}},
+			{info = {id = 7, role = "tiny2"}, kind = .Label, text = "Tiny2", bounds = {x = 900, y = 100, width = 0.00001, height = 50}},
+			{info = {id = 8, role = "pastx"}, kind = .Label, text = "PastX", bounds = {x = 960, y = 10, width = 0.00001, height = 50}},
+			{info = {id = 9, role = "pasty"}, kind = .Label, text = "PastY", bounds = {x = 10, y = 540, width = 50, height = 0.00001}},
+			{info = {id = 10, role = "thinclip"}, kind = .Label, text = "ThinClip", bounds = {x = 959.99993896484375, y = 10, width = 0.00008, height = 50}},
+		},
+	}
+	frame, ok := dagda.resolve_canvas(canvas, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	rep, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect"}`)
+	defer delete(rep)
+	testing.expect(t, strings.contains(rep, `"id":1`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":480,"width":60,"height":60}`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":10,"y":10,"width":100,"height":50}`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":93.125,"y":0,"width":200.0625,"height":540}`))
+	// Fully contained tiny widths are preserved exactly.
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":10,"width":0.1,"height":50}`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":100,"width":1e-05,"height":50}`))
+	// Edge-touching and entirely outside objects report null (twice).
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":6.1035156e-05,"height":50}`) || strings.contains(rep, `"width":0.00006103515625`))
+	testing.expect_value(t, strings.count(rep, `"visible_canvas_bounds":null`), 4)
+	// Existing fields are still present.
+	testing.expect(t, strings.contains(rep, `"canvas_bounds":{"x":900,"y":480,"width":200,"height":120}`))
 }

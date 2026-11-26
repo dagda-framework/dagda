@@ -91,7 +91,7 @@ write_f32_exact :: proc(b: ^strings.Builder, v: f32) {
 	strings.write_string(b, s)
 }
 
-write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, has_canvas := false) {
+write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, has_canvas := false, canvas: dagda.Size = {}) {
 	strings.write_string(b, "{\"id\":")
 	strings.write_u64(b, u64(el.info.id))
 	strings.write_string(b, ",\"role\":")
@@ -103,6 +103,54 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 	fmt.sbprintf(b, ",\"bounds\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}}",
 		el.bounds.x, el.bounds.y, el.bounds.width, el.bounds.height)
 	if has_canvas {
+		// visible_canvas_bounds is the read-only intersection of
+		// the element's canvas rectangle with the canvas sheet,
+		// or null when that intersection has no area. On any axis
+		// that fits inside the sheet, the declared origin and
+		// size are preserved exactly, even when the other axis
+		// is clipped.
+		cb := el.canvas_bounds
+		// Compare each extent with the space remaining on its
+		// axis instead of summing origin + size, whose rounding
+		// could hide a far-edge overrun.
+		vis_x, vis_w: f32
+		if cb.x >= 0 {
+			remaining := canvas.width - cb.x
+			if cb.width <= remaining {
+				vis_x, vis_w = cb.x, cb.width
+			} else {
+				vis_x, vis_w = cb.x, remaining
+			}
+		} else {
+			vis_x = 0
+			vis_w = min(cb.width + cb.x, canvas.width)
+		}
+		vis_y, vis_h: f32
+		if cb.y >= 0 {
+			remaining := canvas.height - cb.y
+			if cb.height <= remaining {
+				vis_y, vis_h = cb.y, cb.height
+			} else {
+				vis_y, vis_h = cb.y, remaining
+			}
+		} else {
+			vis_y = 0
+			vis_h = min(cb.height + cb.y, canvas.height)
+		}
+		strings.write_string(b, ",\"visible_canvas_bounds\":")
+		if vis_w <= 0 || vis_h <= 0 {
+			strings.write_string(b, "null")
+		} else {
+			strings.write_string(b, "{\"x\":")
+			write_f32_exact(b, vis_x)
+			strings.write_string(b, ",\"y\":")
+			write_f32_exact(b, vis_y)
+			strings.write_string(b, ",\"width\":")
+			write_f32_exact(b, vis_w)
+			strings.write_string(b, ",\"height\":")
+			write_f32_exact(b, vis_h)
+			strings.write_byte(b, '}')
+		}
 		strings.write_string(b, ",\"canvas_bounds\":{\"x\":")
 		write_f32_exact(b, el.canvas_bounds.x)
 		strings.write_string(b, ",\"y\":")
@@ -279,7 +327,7 @@ dispatch :: proc(
 				if i > 0 {
 					strings.write_byte(&b, ',')
 				}
-				write_resolved_element(&b, el, frame.has_canvas)
+				write_resolved_element(&b, el, frame.has_canvas, frame.transform.canvas)
 			}
 			strings.write_string(&b, "]}")
 			return strings.to_string(b), false
@@ -304,7 +352,7 @@ dispatch :: proc(
 			if emitted > 0 {
 				strings.write_byte(&b, ',')
 			}
-			write_resolved_element(&b, el, frame.has_canvas)
+			write_resolved_element(&b, el, frame.has_canvas, frame.transform.canvas)
 			emitted += 1
 		}
 		if emitted == 0 {
