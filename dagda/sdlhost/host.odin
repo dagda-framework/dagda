@@ -38,6 +38,17 @@ App :: struct {
 	// Optional list of editable element IDs when multiple distinct single-line
 	// elements share text_edit; when empty, text_edit.target_id is used.
 	editable_text_targets: []dagda.Object_Id,
+	// Optional out-storage for this window's rebuild handle.
+	// The host fills it before on_ready and before the event
+	// loop; copy the value to a worker if needed. It stops
+	// waking anything once this window closes.
+	rebuild_handle: ^Rebuild_Handle,
+	// Optional callback invoked on the host thread once the
+	// window is live and its rebuild handle is available.
+	on_ready: proc(user_data: rawptr, handle: Rebuild_Handle),
+	// Optional callback invoked on the host thread after each
+	// successful presentation of a frame.
+	on_present: proc(user_data: rawptr),
 }
 
 Run_Options :: struct {
@@ -109,6 +120,7 @@ Host :: struct {
 	edit_cstr_buf: [256]u8,
 	text_cstr_buf: [256]u8,
 	needs_redraw:  bool,
+	rebuild:       Rebuild_Handle,
 }
 
 host_rebuild_frame :: proc(h: ^Host) -> bool {
@@ -252,6 +264,14 @@ host_draw :: proc(h: ^Host) {
 	if h.frame.has_canvas {
 		sdl.SetRenderClipRect(r, nil)
 	}
+}
+
+host_present :: proc(h: ^Host) -> bool {
+	ok := host_render(h)
+	if ok && h.app.on_present != nil {
+		h.app.on_present(h.app.user_data)
+	}
+	return ok
 }
 
 host_save_screenshot :: proc(h: ^Host, path: string) -> bool {
@@ -910,7 +930,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	if !host_rebuild_frame(&h) {
 		return 1
 	}
-	_ = host_render(&h)
+	h.rebuild = rebuild_register()
+	if app.rebuild_handle != nil {
+		app.rebuild_handle^ = h.rebuild
+	}
+	_ = host_present(&h)
+	if app.on_ready != nil {
+		app.on_ready(app.user_data, h.rebuild)
+	}
 
 	srv: driver.Server
 	if len(opts.socket_path) > 0 {
@@ -931,6 +958,18 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
+				if u32(ev.type) == h.rebuild.event_type && ev.user.data1 == rawptr(uintptr(h.rebuild.id)) {
+					if !host_rebuild_frame(&h) {
+						exit_code = 1
+						running = false
+					} else {
+						_ = host_present(&h)
+					}
+					if !running || !sdl.PollEvent(&ev) {
+						break
+					}
+					continue
+				}
 				#partial switch ev.type {
 				case .QUIT, .WINDOW_CLOSE_REQUESTED:
 					running = false
@@ -1002,9 +1041,11 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 
 		if running && h.needs_redraw {
-			_ = host_render(&h)
+			_ = host_present(&h)
 		}
 	}
 
+	rebuild_mark_closing(h.rebuild)
+	rebuild_unregister(h.rebuild)
 	return exit_code
 }
