@@ -266,3 +266,49 @@ test_set_caret_clamps_to_grapheme_boundaries_and_extends_both_directions :: proc
 	testing.expect_value(t, session.anchor, 1)
 	testing.expect_value(t, session.caret, 0)
 }
+
+@(test)
+test_multiline_session_validation_lines_and_newlines :: proc(t: ^testing.T) {
+	testing.expect(t, valid_multiline(""))
+	testing.expect(t, valid_multiline("one\ntwo\n"))
+	testing.expect(t, !valid_multiline("one\r\ntwo"))
+	testing.expect(t, !valid_multiline("one\rtwo"))
+
+	norm, ok := normalize_multiline_newlines("a\r\nb\rc\nd")
+	testing.expect(t, ok)
+	defer delete(norm)
+	testing.expect_value(t, norm, "a\nb\nc\nd")
+
+	norm_fail, ok_fail := normalize_multiline_newlines("a\r\nb", mem.nil_allocator())
+	testing.expect(t, !ok_fail)
+	testing.expect_value(t, norm_fail, "")
+
+	s := "one\ntwo\nthree\n"
+	testing.expect_value(t, line_start_offset(s, 0), 0)
+	testing.expect_value(t, line_end_offset(s, 0), 3)
+	testing.expect_value(t, line_start_offset(s, 5), 4)
+	testing.expect_value(t, line_end_offset(s, 5), 7)
+	testing.expect_value(t, line_start_offset(s, len(s)), len(s))
+	testing.expect_value(t, line_end_offset(s, len(s)), len(s))
+
+	session: Text_Session
+	text_session_init(&session, s, context.allocator, multiline = true)
+	defer text_session_destroy(&session)
+
+	set_caret(&session, s, 5, false)
+	move_line_home(&session, s, false)
+	testing.expect_value(t, session.caret, 4)
+	move_line_end(&session, s, true)
+	testing.expect_value(t, session.anchor, 4)
+	testing.expect_value(t, session.caret, 7)
+
+	// Enter inside middle of line "abcd" at byte 2 proposes "ab\ncd" with caret at 3.
+	s2 := "abcd"
+	set_caret(&session, s2, 2, false)
+	e1 := insert_text(&session, s2, "\n")
+	defer edit_destroy(&session, &e1)
+	testing.expect_value(t, e1.err, Edit_Error.None)
+	testing.expect(t, e1.changed)
+	testing.expect_value(t, e1.text, "ab\ncd")
+	testing.expect_value(t, e1.caret, 3)
+}

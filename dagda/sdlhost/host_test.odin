@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -4285,4 +4286,583 @@ test_host_draw_2x_canvas_clip_pixel_centers :: proc(t: ^testing.T) {
 	testing.expect_value(t, read_rgb(cap, 1400, 991), sheet)
 	testing.expect_value(t, read_rgb(cap, 1400, 992), sheet)
 	testing.expect_value(t, read_rgb(cap, 1400, 993), letterbox)
+}
+
+@(test)
+test_multiline_eligibility_id_zero_middle_enter_kp_enter_focus_loss_and_refused_composition :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		testing.fail_now(t, "SDL_Init failed")
+	}
+	defer sdl.Quit()
+
+	// 1. Listing an ID in multiline_text_targets alone does not enable editing.
+	cfg_disabled := Editable_Text_Config{enabled = false, target_id = 0}
+	m_only := [1]dagda.Object_Id{0}
+	testing.expect(t, !text_edit_is_multiline(cfg_disabled, nil, m_only[:], 0))
+
+	cfg_other := Editable_Text_Config{enabled = true, target_id = 2}
+	testing.expect(t, !text_edit_is_multiline(cfg_other, nil, m_only[:], 0))
+	testing.expect(t, !text_edit_is_multiline(cfg_other, nil, nil, 2))
+
+	// 2. Single-target fallback with ID 0 is valid and opts into multiline.
+	cfg_zero := Editable_Text_Config{enabled = true, target_id = 0}
+	testing.expect(t, text_edit_is_multiline(cfg_zero, nil, m_only[:], 0))
+
+	// 3. Exercise middle-of-line Enter + queued text X + marker, keypad Enter,
+	//    focus-loss cancellation, and refused proposal during composition on ID 0.
+	ML_State :: struct {
+		text:          string,
+		reject_next:   bool,
+		proposals:     [dynamic]string,
+		comp_events:   [dynamic]bool,
+		elements:      [1]dagda.Canvas_Element,
+	}
+	ml_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^ML_State)(user_data)
+		s.elements = {
+			{
+				info   = {id = 0, role = "body"},
+				kind   = .Label,
+				text   = s.text,
+				bounds = {x = 40, y = 40, width = 600, height = 240},
+			},
+		}
+		return {size = {width = 800, height = 400}, elements = s.elements[:]}
+	}
+	ml_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^ML_State)(user_data)
+		if id != 0 {
+			return false
+		}
+		append(&s.proposals, strings.clone(new_text))
+		if s.reject_next {
+			s.reject_next = false
+			return false
+		}
+		delete(s.text)
+		s.text = strings.clone(new_text)
+		return true
+	}
+	ml_comp :: proc(user_data: rawptr, id: dagda.Object_Id, composing: bool) {
+		s := (^ML_State)(user_data)
+		if id == 0 {
+			append(&s.comp_events, composing)
+		}
+	}
+
+	state := ML_State{text = strings.clone("abcd")}
+	defer {
+		delete(state.text)
+		for p in state.proposals {
+			delete(p)
+		}
+		delete(state.proposals)
+		delete(state.comp_events)
+	}
+
+	win: ^sdl.Window
+	ren: ^sdl.Renderer
+	testing.expect(t, sdl.CreateWindowAndRenderer("ml-test", 800, 400, {}, &win, &ren))
+	defer sdl.DestroyWindow(win)
+	defer sdl.DestroyRenderer(ren)
+
+	h: Host
+	h.window = win
+	h.ime_window = win
+	h.renderer = ren
+	h.app = {
+		user_data              = &state,
+		canvas                 = ml_canvas,
+		text_edit              = {enabled = true, target_id = 0, on_commit = ml_commit},
+		multiline_text_targets = m_only[:],
+		on_composition         = ml_comp,
+	}
+	testing.expect(t, font_init(&h.font))
+	defer font_destroy(&h.font)
+	defer font_destroy_textures(&h.font)
+	defer text_edit_destroy(&h.text_edit)
+	defer dagda.frame_destroy(&h.frame)
+	defer {
+		host_clear_control_cstrs(&h)
+		delete(h.queued_control_cstrs)
+	}
+
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect(t, text_edit_focus_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 0, nil, m_only[:]))
+	// Park caret at ab|cd (byte 2).
+	dagda.set_caret(&h.text_edit.session, state.text, 2, false)
+
+	drain_events :: proc(h: ^Host, t: ^testing.T) {
+		ev: sdl.Event
+		for sdl.PollEvent(&ev) {
+			#partial switch ev.type {
+			case .TEXT_EDITING, .TEXT_INPUT:
+				tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
+				host_report_composition(h, host_active_composition(h))
+				if tres.needs_rebuild {
+					testing.expect(t, host_rebuild_frame(h))
+					if tres.has_pending_edit {
+						text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+					}
+				}
+			case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
+				needs_rebuild, has_pending_edit, pending_edit := host_dispatch_key_event(h, &ev)
+				if needs_rebuild {
+					testing.expect(t, host_rebuild_frame(h))
+					if has_pending_edit {
+						text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+					}
+				}
+			}
+		}
+		host_clear_control_cstrs(h)
+	}
+
+	// Queue Enter + text X + marker '|' in one batch (simulating one write).
+	testing.expect(t, push_sdl_key(win, "enter"))
+	testing.expect(t, push_sdl_text_input(&h, "X"))
+	testing.expect(t, push_sdl_text_input(&h, "|"))
+	drain_events(&h, t)
+
+	testing.expect_value(t, len(state.proposals), 3)
+	if len(state.proposals) == 3 {
+		testing.expect_value(t, state.proposals[0], "ab\ncd")
+		testing.expect_value(t, state.proposals[1], "ab\nXcd")
+		testing.expect_value(t, state.proposals[2], "ab\nX|cd")
+	}
+	testing.expect_value(t, state.text, "ab\nX|cd")
+
+	// Keypad Enter splits line at caret and lands caret on new line.
+	testing.expect(t, push_sdl_key(win, "kp_enter"))
+	testing.expect(t, push_sdl_text_input(&h, "Y"))
+	drain_events(&h, t)
+	testing.expect_value(t, state.text, "ab\nX|\nYcd")
+
+	// Refused proposal during composition preserves caret, selection, and active preedit for retry.
+	testing.expect(t, push_sdl_preedit(&h, "niho"))
+	drain_events(&h, t)
+	testing.expect(t, dagda.is_composing(&h.text_edit.session))
+	testing.expect_value(t, len(state.comp_events), 1)
+	testing.expect_value(t, state.comp_events[0], true)
+
+	state.reject_next = true
+	testing.expect(t, push_sdl_text_input(&h, "日本"))
+	drain_events(&h, t)
+	testing.expect_value(t, state.text, "ab\nX|\nYcd")
+	testing.expect(t, dagda.is_composing(&h.text_edit.session))
+	testing.expect_value(t, h.text_edit.session.preedit, "niho")
+	testing.expect_value(t, len(state.comp_events), 1) // still composing
+
+	// Focus-loss cancels active composition without committing and fires on_composition(false).
+	fl: sdl.Event
+	fl.type = .WINDOW_FOCUS_LOST
+	fl.window.windowID = sdl.GetWindowID(win)
+	testing.expect(t, sdl.PushEvent(&fl))
+	drain_events(&h, t)
+	testing.expect(t, !dagda.is_composing(&h.text_edit.session))
+	testing.expect_value(t, state.text, "ab\nX|\nYcd")
+	testing.expect_value(t, len(state.comp_events), 2)
+	testing.expect_value(t, state.comp_events[1], false)
+}
+
+@(test)
+test_multiline_paint_clip_selection_hit_test_and_ime_anchor_at_two_scales :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		testing.fail_now(t, "SDL_Init failed")
+	}
+	defer sdl.Quit()
+
+	Paint_State :: struct {
+		text:     string,
+		elements: [1]dagda.Canvas_Element,
+	}
+	paint_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Paint_State)(user_data)
+		s.elements = {
+			{
+				info   = {id = 1, role = "note.body"},
+				kind   = .Label,
+				text   = s.text,
+				bounds = {x = 80, y = 40, width = 260, height = 140},
+			},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+
+	read_rgb :: proc(surf: ^sdl.Surface, x, y: i32) -> [3]u8 {
+		r, g, b, a: u8
+		ok := sdl.ReadSurfacePixel(surf, c.int(x), c.int(y), &r, &g, &b, &a)
+		assert(ok)
+		return {r, g, b}
+	}
+
+	count_color_in_band :: proc(surf: ^sdl.Surface, x0, y0, x1, y1: i32, target: [3]u8) -> int {
+		hits := 0
+		cx0 := max(i32(0), x0)
+		cy0 := max(i32(0), y0)
+		cx1 := min(i32(surf.w), x1)
+		cy1 := min(i32(surf.h), y1)
+		for y := cy0; y < cy1; y += 1 {
+			for x := cx0; x < cx1; x += 1 {
+				rgb := read_rgb(surf, x, y)
+				if abs(int(rgb[0]) - int(target[0])) <= 10 &&
+				   abs(int(rgb[1]) - int(target[1])) <= 10 &&
+				   abs(int(rgb[2]) - int(target[2])) <= 10 {
+					hits += 1
+				}
+			}
+		}
+		return hits
+	}
+
+	glyph_ink_in_band :: proc(surf: ^sdl.Surface, x0, y0, x1, y1: i32) -> (hits: int, max_x: i32) {
+		max_x = -1
+		cx0 := max(i32(0), x0)
+		cy0 := max(i32(0), y0)
+		cx1 := min(i32(surf.w), x1)
+		cy1 := min(i32(surf.h), y1)
+		for y := cy0; y < cy1; y += 1 {
+			for x := cx0; x < cx1; x += 1 {
+				rgb := read_rgb(surf, x, y)
+				// Near-white committed text glyph pixels (b >= 160 excludes amber caret RGB(255,206,84)).
+				if rgb[0] >= 160 && rgb[1] >= 160 && rgb[2] >= 160 {
+					hits += 1
+					if x > max_x {
+						max_x = x
+					}
+				}
+			}
+		}
+		return hits, max_x
+	}
+
+	find_amber_caret_in_band :: proc(surf: ^sdl.Surface, x0, y0, x1, y1: i32, min_hits: int) -> (col: i32, found: bool) {
+		cx0 := max(i32(0), x0)
+		cy0 := max(i32(0), y0)
+		cx1 := min(i32(surf.w), x1)
+		cy1 := min(i32(surf.h), y1)
+		for x := cx0; x < cx1; x += 1 {
+			hits := 0
+			for y := cy0; y < cy1; y += 1 {
+				rgb := read_rgb(surf, x, y)
+				if abs(int(rgb[0]) - 255) <= 10 && abs(int(rgb[1]) - 206) <= 10 && abs(int(rgb[2]) - 84) <= 10 {
+					hits += 1
+				}
+			}
+			if hits >= min_hits {
+				return x, true
+			}
+		}
+		return -1, false
+	}
+
+	// Run at two scales: 1x (800x540 -> 800x540) and 2x (800x540 -> 1600x1080).
+	Scale_Case :: struct {
+		out_w, out_h: c.int,
+		scale:        f32,
+	}
+	cases := [2]Scale_Case{
+		{out_w = 800, out_h = 540, scale = 1.0},
+		{out_w = 1600, out_h = 1080, scale = 2.0},
+	}
+
+	// Dummy window solely to exercise real SDL_SetTextInputArea / SDL_GetTextInputArea.
+	ime_win := sdl.CreateWindow("ml-ime", 800, 540, {})
+	testing.expect(t, ime_win != nil)
+	defer sdl.DestroyWindow(ime_win)
+
+	editable_ids := [1]dagda.Object_Id{1}
+	multiline_ids := [1]dagda.Object_Id{1}
+
+	for sc in cases {
+		surf := sdl.CreateSurface(sc.out_w, sc.out_h, .ABGR8888)
+		testing.expect(t, surf != nil)
+		defer sdl.DestroySurface(surf)
+		ren := sdl.CreateSoftwareRenderer(surf)
+		testing.expect(t, ren != nil)
+		defer sdl.DestroyRenderer(ren)
+
+		// 1. Line painting, clipping, cross-line selection, and grapheme click/drag.
+		state := Paint_State{
+			text = "ii\nCaf" + "e\u0301" + " WWWWWWWWWWWWWWWWWWWW\n\nFourth\nFifth\nSixth_Very_Long_Line_For_Scroll",
+		}
+		h: Host
+		h.ime_window = ime_win
+		h.renderer = ren
+		h.viewport = {width = 800, height = 540}
+		h.app = {
+			user_data              = &state,
+			canvas                 = paint_canvas,
+			text_edit              = {enabled = true, target_id = 1},
+			editable_text_targets  = editable_ids[:],
+			multiline_text_targets = multiline_ids[:],
+		}
+		testing.expect(t, font_init(&h.font))
+		defer font_destroy(&h.font)
+		defer font_destroy_textures(&h.font)
+		defer text_edit_destroy(&h.text_edit)
+		defer dagda.frame_destroy(&h.frame)
+
+		testing.expect(t, host_rebuild_frame(&h))
+		el, ok_el := dagda.find(h.frame, 1)
+		testing.expect(t, ok_el)
+		tx, first_y, px, line_h, _, _ := text_edit_multiline_layout(h.frame, el.bounds)
+
+		// Verify committed text glyphs actually paint on lines 0 ("ii") and 1 ("Café WWW...") at both 1x and 2x,
+		// and that editing line 0 to "WWWWWW" visibly shifts the painted glyph ink on row 0.
+		bx0 := i32(math.floor(el.bounds.x * sc.scale)) + i32(math.ceil(4 * sc.scale))
+		bx1 := i32(math.ceil((el.bounds.x + el.bounds.width) * sc.scale)) - i32(math.ceil(4 * sc.scale))
+		row0_y0 := i32(math.floor(first_y * sc.scale))
+		row0_y1 := i32(math.ceil((first_y + px) * sc.scale))
+		row1_y0 := i32(math.floor((first_y + line_h) * sc.scale))
+		row1_y1 := i32(math.ceil((first_y + line_h + px) * sc.scale))
+
+		host_draw(&h)
+		cap0 := sdl.RenderReadPixels(h.renderer, nil)
+		testing.expect(t, cap0 != nil)
+		defer sdl.DestroySurface(cap0)
+		ink0_hits, ink0_max_x := glyph_ink_in_band(cap0, bx0, row0_y0, bx1, row0_y1)
+		ink1_hits, ink1_max_x := glyph_ink_in_band(cap0, bx0, row1_y0, bx1, row1_y1)
+		testing.expect(t, ink0_hits > 10)
+		testing.expect(t, ink1_hits > 50)
+		testing.expect(t, ink1_max_x > ink0_max_x + i32(math.floor(40 * sc.scale)))
+
+		state.text = "WWWWWW\nCaf" + "e\u0301" + " WWWWWWWWWWWWWWWWWWWW\n\nFourth\nFifth\nSixth_Very_Long_Line_For_Scroll"
+		testing.expect(t, host_rebuild_frame(&h))
+		host_draw(&h)
+		cap0_edited := sdl.RenderReadPixels(h.renderer, nil)
+		testing.expect(t, cap0_edited != nil)
+		defer sdl.DestroySurface(cap0_edited)
+		ink0_ed_hits, ink0_ed_max_x := glyph_ink_in_band(cap0_edited, bx0, row0_y0, bx1, row0_y1)
+		testing.expect(t, ink0_ed_hits > ink0_hits)
+		testing.expect(t, ink0_ed_max_x > ink0_max_x + i32(math.floor(40 * sc.scale)))
+
+		// Restore line 0 to "First" for the grapheme click/drag assertions below.
+		state.text = "First\nCaf" + "e\u0301" + " WWWWWWWWWWWWWWWWWWWW\n\nFourth\nFifth\nSixth_Very_Long_Line_For_Scroll"
+		testing.expect(t, host_rebuild_frame(&h))
+		el, ok_el = dagda.find(h.frame, 1)
+		testing.expect(t, ok_el)
+
+		// Click left and right of decomposed e+U+0301 on line 1.
+		w_caf := font_measure_width(&h.font, "Caf", px)
+		w_cafe := font_measure_width(&h.font, "Cafe\u0301", px)
+		line1_mid_y := first_y + line_h + px * 0.5
+		_ = text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 1, tx + w_caf + (w_cafe - w_caf) * 0.25, editable_ids[:], false, line1_mid_y, multiline_ids[:])
+		// "First\n" is 6 bytes, "Caf" is 3 bytes -> offset 9.
+		testing.expect_value(t, h.text_edit.session.caret, 9)
+
+		_ = text_edit_click_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 1, tx + w_caf + (w_cafe - w_caf) * 0.75, editable_ids[:], false, line1_mid_y, multiline_ids[:])
+		// "e\u0301" is 3 bytes -> offset 12.
+		testing.expect_value(t, h.text_edit.session.caret, 12)
+
+		// Drag from line 0 ("Fi|rst") across empty line 2 to line 3 ("Fo|urth").
+		w_fi := font_measure_width(&h.font, "Fi", px)
+		w_fo := font_measure_width(&h.font, "Fo", px)
+		started, _ := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, 1, tx + w_fi, editable_ids[:], false, first_y + px * 0.5, multiline_ids[:])
+		testing.expect(t, started)
+		_ = text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, tx + w_fo, editable_ids[:], first_y + 3 * line_h + px * 0.5, multiline_ids[:])
+		text_edit_drag_end(&h.text_edit)
+
+		sel_s, sel_e := dagda.selection_bounds(&h.text_edit.session)
+		testing.expect_value(t, sel_s, 2)
+		testing.expect(t, sel_e > sel_s)
+
+		// Paint selection across lines and verify SEL_BG on lines 0, 1, and empty line 2, plus clipping outside right edge.
+		host_draw(&h)
+		cap1 := sdl.RenderReadPixels(h.renderer, nil)
+		testing.expect(t, cap1 != nil)
+		defer sdl.DestroySurface(cap1)
+		testing.expect_value(t, cap1.w, sc.out_w)
+		testing.expect_value(t, cap1.h, sc.out_h)
+
+		sel_rgb := [3]u8{58, 108, 190}
+		_, sy_sel := text_edit_clamped_scroll_2d(&h.text_edit, &h.font, h.frame, 1, el.bounds, state.text, true, true)
+		bx0_full := i32(math.floor(el.bounds.x * sc.scale))
+		bx1_full := i32(math.ceil((el.bounds.x + el.bounds.width) * sc.scale))
+		for line_i in 0 ..< 3 {
+			ly0 := i32(math.floor((first_y + f32(line_i) * line_h - sy_sel) * sc.scale))
+			ly1 := i32(math.ceil((first_y + f32(line_i) * line_h - sy_sel + px) * sc.scale))
+			if ly1 > i32(math.floor(el.bounds.y * sc.scale)) && ly0 < i32(math.ceil((el.bounds.y + el.bounds.height) * sc.scale)) {
+				testing.expect(t, count_color_in_band(cap1, bx0_full, ly0, bx1_full, ly1, sel_rgb) > 0)
+			}
+		}
+		// Right-edge clip: sheet color (26, 31, 42) just outside field right edge.
+		outside_x := i32(math.ceil((el.bounds.x + el.bounds.width) * sc.scale)) + i32(math.ceil(8 * sc.scale))
+		testing.expect_value(t, read_rgb(cap1, outside_x, i32(math.floor(line1_mid_y * sc.scale))), [3]u8{26, 31, 42})
+
+		// 2. Move caret to end of last (6th) long line -> scrolls both horizontally and vertically,
+		//    start preedit, and verify painted preedit, painted caret, and SDL_GetTextInputArea agree.
+		dagda.set_caret(&h.text_edit.session, state.text, len(state.text), false)
+		_ = dagda.begin_composition(&h.text_edit.session, "niho", 0, 4)
+		text_edit_update_ime_area(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, editable_ids[:], multiline_ids[:])
+
+		sx_scroll := text_edit_scroll_x(&h.text_edit, 1)
+		sy_scroll := text_edit_scroll_y(&h.text_edit, 1)
+		testing.expect(t, sx_scroll > 0)
+		testing.expect(t, sy_scroll > 0)
+
+		host_draw(&h)
+		cap2 := sdl.RenderReadPixels(h.renderer, nil)
+		testing.expect(t, cap2 != nil)
+		defer sdl.DestroySurface(cap2)
+
+		caret_x, caret_y, _ := text_edit_caret_pos(&h.text_edit, &h.font, h.frame, el.bounds, state.text, true)
+		pre_y0 := i32(math.floor((caret_y - 3) * sc.scale))
+		pre_y1 := i32(math.ceil((caret_y + px) * sc.scale))
+		testing.expect(t, count_color_in_band(cap2, bx0, pre_y0, bx1, pre_y1, [3]u8{62, 78, 118}) > 10)
+
+		// Find painted amber caret in the upper half of the scrolled caret line.
+		caret_col, found_caret := find_amber_caret_in_band(cap2, bx0 + 2, pre_y0 + 1, bx1 - 2, i32(math.floor((caret_y + px * 0.6) * sc.scale)), max(6, int(math.round(6 * sc.scale))))
+		testing.expect(t, found_caret)
+		if found_caret {
+			testing.expect(t, math.abs(f32(caret_col) / sc.scale - caret_x) <= 2.0)
+		}
+
+		// Verify SDL_GetTextInputArea agrees with painted caret X and scrolled line Y.
+		ime_area: sdl.Rect
+		ime_cursor: c.int
+		testing.expect(t, sdl.GetTextInputArea(ime_win, &ime_area, &ime_cursor))
+		testing.expect(t, abs(int(ime_area.x + ime_cursor) - int(math.round(caret_x))) <= 2)
+		testing.expect(t, abs(int(ime_area.y) - int(math.floor(caret_y - 3))) <= 2)
+	}
+}
+
+@(test)
+test_multiline_paste_normalization_failure_and_control_push_growth_failure :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		testing.fail_now(t, "SDL_Init failed")
+	}
+	defer sdl.Quit()
+
+	Paste_State :: struct {
+		text:     string,
+		commits:  int,
+		elements: [1]dagda.Canvas_Element,
+	}
+	paste_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Paste_State)(user_data)
+		s.elements = {
+			{
+				info   = {id = 1, role = "body"},
+				kind   = .Label,
+				text   = s.text,
+				bounds = {x = 40, y = 40, width = 600, height = 240},
+			},
+		}
+		return {size = {width = 800, height = 400}, elements = s.elements[:]}
+	}
+	paste_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+		s := (^Paste_State)(user_data)
+		if id != 1 {
+			return false
+		}
+		delete(s.text)
+		s.text = strings.clone(new_text)
+		s.commits += 1
+		return true
+	}
+
+	win: ^sdl.Window
+	ren: ^sdl.Renderer
+	testing.expect(t, sdl.CreateWindowAndRenderer("ml-paste-fail", 800, 400, {}, &win, &ren))
+	defer sdl.DestroyWindow(win)
+	defer sdl.DestroyRenderer(ren)
+
+	state := Paste_State{text = strings.clone("hello\nworld")}
+	defer delete(state.text)
+
+	ml_ids := [1]dagda.Object_Id{1}
+	h: Host
+	h.window = win
+	h.renderer = ren
+	h.clipboard = memory_clipboard_interface(&h.mem_clipboard)
+	defer memory_clipboard_destroy(&h.mem_clipboard)
+	h.app = {
+		user_data              = &state,
+		canvas                 = paste_canvas,
+		text_edit              = {enabled = true, target_id = 1, on_commit = paste_commit},
+		multiline_text_targets = ml_ids[:],
+	}
+	testing.expect(t, font_init(&h.font))
+	defer font_destroy(&h.font)
+	defer font_destroy_textures(&h.font)
+	defer text_edit_destroy(&h.text_edit)
+	defer dagda.frame_destroy(&h.frame)
+	defer {
+		host_clear_control_cstrs(&h)
+		delete(h.queued_control_cstrs)
+	}
+
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 1, nil, ml_ids[:]))
+
+	// Select "lo\nwo" (bytes 3..8) and attempt paste with a failing session allocator.
+	dagda.set_caret(&h.text_edit.session, state.text, 3, false)
+	dagda.set_caret(&h.text_edit.session, state.text, 8, true)
+	testing.expect(t, clipboard_set(h.clipboard, "x\r\ny"))
+
+	// The clipboard owns the first clone. Fail only the normalization buffer
+	// and allow later allocations so a mistaken deletion could still commit.
+	Paste_Allocator :: struct {
+		backing: mem.Allocator,
+		attempts: int,
+	}
+	paste_alloc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+		a := (^Paste_Allocator)(data)
+		if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+			a.attempts += 1
+			if a.attempts == 2 {
+				return nil, .Out_Of_Memory
+			}
+		}
+		return a.backing.procedure(a.backing.data, mode, size, alignment, old_memory, old_size, loc)
+	}
+	orig_alloc := h.text_edit.session.allocator
+	alloc := Paste_Allocator{backing = orig_alloc}
+	h.text_edit.session.allocator = {procedure = paste_alloc, data = &alloc}
+	paste_ev: sdl.Event
+	paste_ev.type = .KEY_DOWN
+	paste_ev.key.windowID = sdl.GetWindowID(win)
+	paste_ev.key.key = sdl.K_V
+	paste_ev.key.mod = sdl.KMOD_LGUI when ODIN_OS == .Darwin else sdl.KMOD_LCTRL
+	paste_ev.key.down = true
+	res := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &state, &paste_ev, nil, h.clipboard, ml_ids[:])
+	h.text_edit.session.allocator = orig_alloc
+	testing.expect_value(t, alloc.attempts, 2)
+
+	// Atomic failure: zero commits, no deletion, selection [3..8] untouched.
+	testing.expect(t, res.consumed)
+	testing.expect(t, !res.needs_rebuild)
+	testing.expect_value(t, state.commits, 0)
+	testing.expect_value(t, state.text, "hello\nworld")
+	sel_s, sel_e := dagda.selection_bounds(&h.text_edit.session)
+	testing.expect_value(t, sel_s, 3)
+	testing.expect_value(t, sel_e, 8)
+
+	// With a working allocator, CRLF and lone-CR pastes both succeed.
+	res_ok := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &state, &paste_ev, nil, h.clipboard, ml_ids[:])
+	testing.expect(t, res_ok.needs_rebuild && res_ok.has_pending_edit)
+	testing.expect(t, host_rebuild_frame(&h))
+	text_edit_apply_committed(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &res_ok.pending_edit, nil, ml_ids[:])
+	testing.expect_value(t, state.text, "helx\nyrld")
+
+	testing.expect(t, clipboard_set(h.clipboard, "p\rq"))
+	res_cr := text_edit_handle_event(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &state, &paste_ev, nil, h.clipboard, ml_ids[:])
+	testing.expect(t, res_cr.needs_rebuild && res_cr.has_pending_edit)
+	testing.expect(t, host_rebuild_frame(&h))
+	text_edit_apply_committed(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, &res_cr.pending_edit, nil, ml_ids[:])
+	testing.expect_value(t, state.text, "helx\nyp\nqrld")
+
+	// Control event push helpers must free the cloned cstring and return false when
+	// the tracking array cannot grow, without pushing any SDL event.
+	ev_drain: sdl.Event
+	for sdl.PollEvent(&ev_drain) {}
+	h.queued_control_cstrs.allocator = mem.nil_allocator()
+	testing.expect(t, !push_sdl_text_input(&h, "abc"))
+	testing.expect(t, !push_sdl_preedit(&h, "xyz"))
+	testing.expect_value(t, len(h.queued_control_cstrs), 0)
+	testing.expect(t, !sdl.PollEvent(&ev_drain))
 }

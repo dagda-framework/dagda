@@ -28,12 +28,14 @@ Editable_Text_Config :: struct {
 }
 
 Text_Edit_State :: struct {
-	focused:        bool,
-	active_id:      dagda.Object_Id,
-	dragging:       bool,
-	drag_target_id: dagda.Object_Id,
-	scroll_offsets: map[dagda.Object_Id]f32,
-	session:        dagda.Text_Session,
+	focused:         bool,
+	active_id:       dagda.Object_Id,
+	dragging:        bool,
+	drag_target_id:  dagda.Object_Id,
+	has_preferred_x: bool,
+	preferred_x:     f32,
+	scroll_offsets:  map[dagda.Object_Id][2]f32,
+	session:         dagda.Text_Session,
 }
 
 // Active_Composition identifies which visual field in the current host window
@@ -77,6 +79,64 @@ text_edit_is_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_I
 		return false
 	}
 	return id == cfg.target_id
+}
+
+text_edit_is_multiline :: proc(
+	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id,
+	multiline_targets: []dagda.Object_Id,
+	id: dagda.Object_Id,
+) -> bool {
+	if !text_edit_is_target(cfg, targets, id) || len(multiline_targets) == 0 {
+		return false
+	}
+	for mid in multiline_targets {
+		if mid == id {
+			return true
+		}
+	}
+	return false
+}
+
+Line_Span :: struct {
+	start: int,
+	end:   int,
+}
+
+text_edit_line_count :: proc(s: string) -> int {
+	return strings.count(s, "\n") + 1
+}
+
+text_edit_line_index_at :: proc(s: string, offset: int) -> int {
+	pos := clamp(offset, 0, len(s))
+	line := 0
+	for i in 0 ..< pos {
+		if s[i] == '\n' {
+			line += 1
+		}
+	}
+	return line
+}
+
+text_edit_line_span :: proc(s: string, target_line: int) -> (span: Line_Span, ok: bool) {
+	if target_line < 0 {
+		return {}, false
+	}
+	line := 0
+	start := 0
+	for i := 0; i < len(s); i += 1 {
+		if s[i] == '\n' {
+			if line == target_line {
+				return {start = start, end = i}, true
+			}
+			line += 1
+			start = i + 1
+		}
+	}
+	if line == target_line {
+		return {start = start, end = len(s)}, true
+	}
+	return {}, false
 }
 
 text_edit_default_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_Id = nil) -> dagda.Object_Id {
@@ -144,11 +204,46 @@ text_edit_view_width :: proc(frame: dagda.Frame, rect: dagda.Rect) -> f32 {
 	return max(vis.width - 2 * pad, 0)
 }
 
+// text_edit_multiline_layout returns the shared top-aligned line geometry for
+// multiline painting, click/drag hit-testing, vertical navigation, scrolling,
+// and IME candidate placement.
+text_edit_multiline_layout :: proc(frame: dagda.Frame, rect: dagda.Rect) -> (
+	text_x: f32,
+	first_line_y: f32,
+	px: f32,
+	line_h: f32,
+	view_w: f32,
+	view_h: f32,
+) {
+	text_scale: f32 = frame.has_canvas ? clamp(frame.transform.scale, 0.4, 2.0) : 1.0
+	px = max(24 * text_scale, 12)
+	line_h = math.ceil(px * 1.35)
+	pad_x := max(16 * text_scale, 10)
+	pad_y := max(12 * text_scale, 8)
+	vis := text_edit_visible_rect(frame, rect)
+	pad := min(pad_x, max((vis.width - TEXT_EDIT_CARET_WIDTH) * 0.5, 0))
+	pad_top := min(pad_y, max((vis.height - line_h) * 0.5, 0))
+	text_x = vis.x + pad
+	first_line_y = vis.y + pad_top
+	view_w = max(vis.width - 2 * pad, 0)
+	view_h = max(vis.height - 2 * pad_top, 0)
+	return
+}
+
 text_edit_scroll_x :: proc(te: ^Text_Edit_State, id: dagda.Object_Id) -> f32 {
 	if te == nil {
 		return 0
 	}
-	return te.scroll_offsets[id]
+	v := te.scroll_offsets[id]
+	return v[0]
+}
+
+text_edit_scroll_y :: proc(te: ^Text_Edit_State, id: dagda.Object_Id) -> f32 {
+	if te == nil {
+		return 0
+	}
+	v := te.scroll_offsets[id]
+	return v[1]
 }
 
 text_edit_content_metrics :: proc(
@@ -158,28 +253,116 @@ text_edit_content_metrics :: proc(
 	bounds: dagda.Rect,
 	committed: string,
 	is_active: bool,
-) -> (content_w: f32, caret_content_x: f32) {
+	multiline := false,
+) -> (content_w: f32, caret_content_x: f32, total_lines: int, caret_line: int) {
+	total_lines = 1
+	caret_line = 0
+	if font == nil || !font.loaded {
+		return 0, 0, 1, 0
+	}
+	_, _, px := text_edit_layout(frame, bounds)
+	if !multiline {
+		if is_active && te != nil && dagda.is_composing(&te.session) {
+			sel_start, sel_end := dagda.selection_bounds(&te.session)
+			sel_start = clamp(sel_start, 0, len(committed))
+			sel_end = clamp(sel_end, sel_start, len(committed))
+			prefix_w := font_measure_width(font, committed[:sel_start], px)
+			preedit_w := font_measure_width(font, te.session.preedit, px)
+			suffix_w := font_measure_width(font, committed[sel_end:], px)
+			caret_bytes := text_edit_preedit_caret_bytes(&te.session)
+			caret_pre_w := font_measure_width(font, te.session.preedit[:caret_bytes], px)
+			return prefix_w + preedit_w + suffix_w, prefix_w + caret_pre_w, 1, 0
+		}
+		content_w = font_measure_width(font, committed, px)
+		if is_active && te != nil {
+			caret_off := clamp(te.session.caret, 0, len(committed))
+			caret_content_x = font_measure_width(font, committed[:caret_off], px)
+		}
+		return content_w, caret_content_x, 1, 0
+	}
+
+	// Multiline metrics: measure max visual line width, total visual lines,
+	// and caret (x, line) using the exact same line decomposition as drawing.
+	composing := is_active && te != nil && dagda.is_composing(&te.session)
+	sel_start, sel_end := 0, 0
+	if composing {
+		sel_start, sel_end = dagda.selection_bounds(&te.session)
+		sel_start = clamp(sel_start, 0, len(committed))
+		sel_end = clamp(sel_end, sel_start, len(committed))
+	}
+	start_line := composing ? text_edit_line_index_at(committed, sel_start) : -1
+	end_line := composing ? text_edit_line_index_at(committed, sel_end) : -1
+
+	raw_lines := text_edit_line_count(committed)
+	total_lines = composing ? (raw_lines - (end_line - start_line)) : raw_lines
+	if total_lines < 1 {
+		total_lines = 1
+	}
+
+	line_idx := 0
+	line_start := 0
+	for {
+		rel_nl := strings.index_byte(committed[line_start:], '\n')
+		line_end := rel_nl >= 0 ? line_start + rel_nl : len(committed)
+
+		if composing {
+			if line_idx == start_line {
+				end_line_end := dagda.line_end_offset(committed, sel_end)
+				prefix_w := font_measure_width(font, committed[line_start:sel_start], px)
+				preedit_w := font_measure_width(font, te.session.preedit, px)
+				suffix_w := font_measure_width(font, committed[sel_end:end_line_end], px)
+				content_w = max(content_w, prefix_w + preedit_w + suffix_w)
+				caret_bytes := text_edit_preedit_caret_bytes(&te.session)
+				caret_content_x = prefix_w + font_measure_width(font, te.session.preedit[:caret_bytes], px)
+				caret_line = start_line
+			} else if line_idx < start_line || line_idx > end_line {
+				lw := font_measure_width(font, committed[line_start:line_end], px)
+				content_w = max(content_w, lw)
+			}
+		} else {
+			lw := font_measure_width(font, committed[line_start:line_end], px)
+			content_w = max(content_w, lw)
+		}
+
+		if rel_nl < 0 {
+			break
+		}
+		line_start = line_end + 1
+		line_idx += 1
+	}
+
+	if is_active && te != nil && !composing {
+		caret_off := clamp(te.session.caret, 0, len(committed))
+		caret_line = text_edit_line_index_at(committed, caret_off)
+		ls := dagda.line_start_offset(committed, caret_off)
+		caret_content_x = font_measure_width(font, committed[ls:caret_off], px)
+	}
+	return content_w, caret_content_x, total_lines, caret_line
+}
+
+text_edit_clamped_scroll_2d :: proc(
+	te: ^Text_Edit_State,
+	font: ^Font,
+	frame: dagda.Frame,
+	id: dagda.Object_Id,
+	bounds: dagda.Rect,
+	committed: string,
+	is_active: bool,
+	multiline := false,
+) -> (scroll_x: f32, scroll_y: f32) {
 	if font == nil || !font.loaded {
 		return 0, 0
 	}
-	_, _, px := text_edit_layout(frame, bounds)
-	if is_active && te != nil && dagda.is_composing(&te.session) {
-		sel_start, sel_end := dagda.selection_bounds(&te.session)
-		sel_start = clamp(sel_start, 0, len(committed))
-		sel_end = clamp(sel_end, sel_start, len(committed))
-		prefix_w := font_measure_width(font, committed[:sel_start], px)
-		preedit_w := font_measure_width(font, te.session.preedit, px)
-		suffix_w := font_measure_width(font, committed[sel_end:], px)
-		caret_bytes := text_edit_preedit_caret_bytes(&te.session)
-		caret_pre_w := font_measure_width(font, te.session.preedit[:caret_bytes], px)
-		return prefix_w + preedit_w + suffix_w, prefix_w + caret_pre_w
+	content_w, _, total_lines, _ := text_edit_content_metrics(te, font, frame, bounds, committed, is_active, multiline)
+	if !multiline {
+		view_w := text_edit_view_width(frame, bounds)
+		max_scroll_x := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
+		return clamp(text_edit_scroll_x(te, id), 0, max_scroll_x), 0
 	}
-	content_w = font_measure_width(font, committed, px)
-	if is_active && te != nil {
-		caret_off := clamp(te.session.caret, 0, len(committed))
-		caret_content_x = font_measure_width(font, committed[:caret_off], px)
-	}
-	return content_w, caret_content_x
+	_, _, _, line_h, view_w, view_h := text_edit_multiline_layout(frame, bounds)
+	max_scroll_x := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
+	max_scroll_y := max(f32(total_lines) * line_h - view_h, 0)
+	return clamp(text_edit_scroll_x(te, id), 0, max_scroll_x), clamp(text_edit_scroll_y(te, id), 0, max_scroll_y)
 }
 
 text_edit_clamped_scroll :: proc(
@@ -191,13 +374,8 @@ text_edit_clamped_scroll :: proc(
 	committed: string,
 	is_active: bool,
 ) -> f32 {
-	if font == nil || !font.loaded {
-		return 0
-	}
-	view_w := text_edit_view_width(frame, bounds)
-	content_w, _ := text_edit_content_metrics(te, font, frame, bounds, committed, is_active)
-	max_scroll := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
-	return clamp(text_edit_scroll_x(te, id), 0, max_scroll)
+	sx, _ := text_edit_clamped_scroll_2d(te, font, frame, id, bounds, committed, is_active, false)
+	return sx
 }
 
 text_edit_sync_scroll :: proc(
@@ -205,6 +383,8 @@ text_edit_sync_scroll :: proc(
 	font: ^Font,
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) {
 	if !cfg.enabled || !te.focused || font == nil || !font.loaded {
 		return
@@ -213,17 +393,42 @@ text_edit_sync_scroll :: proc(
 	if !found {
 		return
 	}
-	view_w := text_edit_view_width(frame, el.bounds)
-	content_w, caret_content_x := text_edit_content_metrics(te, font, frame, el.bounds, el.text, true)
-	max_scroll := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
-	scroll := clamp(text_edit_scroll_x(te, te.active_id), 0, max_scroll)
-	if caret_content_x < scroll {
-		scroll = caret_content_x
-	} else if caret_content_x + TEXT_EDIT_CARET_WIDTH > scroll + view_w {
-		scroll = caret_content_x + TEXT_EDIT_CARET_WIDTH - view_w
+	multiline := te.session.multiline || text_edit_is_multiline(cfg, targets, multiline_targets, te.active_id)
+	content_w, caret_content_x, total_lines, caret_line := text_edit_content_metrics(te, font, frame, el.bounds, el.text, true, multiline)
+	if !multiline {
+		view_w := text_edit_view_width(frame, el.bounds)
+		max_scroll := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
+		scroll := clamp(text_edit_scroll_x(te, te.active_id), 0, max_scroll)
+		if caret_content_x < scroll {
+			scroll = caret_content_x
+		} else if caret_content_x + TEXT_EDIT_CARET_WIDTH > scroll + view_w {
+			scroll = caret_content_x + TEXT_EDIT_CARET_WIDTH - view_w
+		}
+		scroll = clamp(scroll, 0, max_scroll)
+		te.scroll_offsets[te.active_id] = {scroll, 0}
+		return
 	}
-	scroll = clamp(scroll, 0, max_scroll)
-	te.scroll_offsets[te.active_id] = scroll
+	_, _, _, line_h, view_w, view_h := text_edit_multiline_layout(frame, el.bounds)
+	max_scroll_x := max(content_w + TEXT_EDIT_CARET_WIDTH - view_w, 0)
+	sx := clamp(text_edit_scroll_x(te, te.active_id), 0, max_scroll_x)
+	if caret_content_x < sx {
+		sx = caret_content_x
+	} else if caret_content_x + TEXT_EDIT_CARET_WIDTH > sx + view_w {
+		sx = caret_content_x + TEXT_EDIT_CARET_WIDTH - view_w
+	}
+	sx = clamp(sx, 0, max_scroll_x)
+
+	max_scroll_y := max(f32(total_lines) * line_h - view_h, 0)
+	sy := clamp(text_edit_scroll_y(te, te.active_id), 0, max_scroll_y)
+	caret_top := f32(caret_line) * line_h
+	caret_bot := caret_top + line_h
+	if caret_top < sy {
+		sy = caret_top
+	} else if caret_bot > sy + view_h {
+		sy = caret_bot - view_h
+	}
+	sy = clamp(sy, 0, max_scroll_y)
+	te.scroll_offsets[te.active_id] = {sx, sy}
 }
 
 // text_edit_preedit_caret_bytes returns the byte offset of the caret within
@@ -239,6 +444,41 @@ text_edit_preedit_caret_bytes :: proc(session: ^dagda.Text_Session) -> int {
 	return rune_offset_to_bytes(preedit, caret_runes)
 }
 
+// text_edit_caret_pos computes the exact window-space (x, y) and font px height
+// of the caret using the same scrolled line geometry used by text_edit_draw and
+// SDL_SetTextInputArea.
+text_edit_caret_pos :: proc(
+	te: ^Text_Edit_State,
+	font: ^Font,
+	frame: dagda.Frame,
+	bounds: dagda.Rect,
+	committed: string,
+	multiline := false,
+) -> (caret_x: f32, caret_y: f32, px: f32) {
+	if !multiline {
+		tx, ty, single_px := text_edit_layout(frame, bounds)
+		if font == nil || !font.loaded {
+			return tx, ty, single_px
+		}
+		sx: f32 = 0
+		if te != nil && te.focused {
+			sx, _ = text_edit_clamped_scroll_2d(te, font, frame, te.active_id, bounds, committed, true, false)
+		}
+		_, caret_content_x, _, _ := text_edit_content_metrics(te, font, frame, bounds, committed, true, false)
+		return tx - sx + caret_content_x, ty, single_px
+	}
+	tx, first_line_y, multi_px, line_h, _, _ := text_edit_multiline_layout(frame, bounds)
+	if font == nil || !font.loaded {
+		return tx, first_line_y, multi_px
+	}
+	sx, sy: f32 = 0, 0
+	if te != nil && te.focused {
+		sx, sy = text_edit_clamped_scroll_2d(te, font, frame, te.active_id, bounds, committed, true, true)
+	}
+	_, caret_content_x, _, caret_line := text_edit_content_metrics(te, font, frame, bounds, committed, true, true)
+	return tx - sx + caret_content_x, first_line_y + f32(caret_line) * line_h - sy, multi_px
+}
+
 // text_edit_caret_x computes the exact window-space X coordinate of the caret
 // using the same scrolled text origin and font metrics used by text_edit_draw
 // and SDL_SetTextInputArea.
@@ -249,13 +489,9 @@ text_edit_caret_x :: proc(
 	bounds: dagda.Rect,
 	committed: string,
 ) -> f32 {
-	tx, _, _ := text_edit_layout(frame, bounds)
-	if font == nil || !font.loaded {
-		return tx
-	}
-	scroll := te != nil && te.focused ? text_edit_clamped_scroll(te, font, frame, te.active_id, bounds, committed, true) : 0
-	_, caret_content_x := text_edit_content_metrics(te, font, frame, bounds, committed, true)
-	return tx - scroll + caret_content_x
+	multiline := te != nil && te.session.multiline
+	cx, _, _ := text_edit_caret_pos(te, font, frame, bounds, committed, multiline)
+	return cx
 }
 
 text_edit_destroy :: proc(te: ^Text_Edit_State) {
@@ -266,6 +502,8 @@ text_edit_destroy :: proc(te: ^Text_Edit_State) {
 	te.active_id = 0
 	te.dragging = false
 	te.drag_target_id = 0
+	te.has_preferred_x = false
+	te.preferred_x = 0
 }
 
 text_edit_update_ime_area :: proc(
@@ -274,11 +512,13 @@ text_edit_update_ime_area :: proc(
 	font: ^Font,
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
+	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) {
 	if !cfg.enabled || !te.focused {
 		return
 	}
-	text_edit_sync_scroll(te, font, frame, cfg)
+	text_edit_sync_scroll(te, font, frame, cfg, targets, multiline_targets)
 	if window == nil {
 		return
 	}
@@ -287,13 +527,27 @@ text_edit_update_ime_area :: proc(
 		return
 	}
 	vis := text_edit_visible_rect(frame, el.bounds)
-	area := sdl.Rect{
-		x = c.int(math.floor(vis.x)),
-		y = c.int(math.floor(vis.y)),
-		w = max(c.int(math.ceil(vis.width)), 1),
-		h = max(c.int(math.ceil(vis.height)), 1),
+	multiline := te.session.multiline || text_edit_is_multiline(cfg, targets, multiline_targets, te.active_id)
+	caret_x, caret_y, px := text_edit_caret_pos(te, font, frame, el.bounds, el.text, multiline)
+	area: sdl.Rect
+	if !multiline {
+		area = sdl.Rect{
+			x = c.int(math.floor(vis.x)),
+			y = c.int(math.floor(vis.y)),
+			w = max(c.int(math.ceil(vis.width)), 1),
+			h = max(c.int(math.ceil(vis.height)), 1),
+		}
+	} else {
+		caret_h := px + 6
+		band_y := clamp(caret_y - 3, vis.y, vis.y + vis.height)
+		band_h := max(min(caret_h, vis.y + vis.height - band_y), 1)
+		area = sdl.Rect{
+			x = c.int(math.floor(vis.x)),
+			y = c.int(math.floor(band_y)),
+			w = max(c.int(math.ceil(vis.width)), 1),
+			h = max(c.int(math.ceil(band_h)), 1),
+		}
 	}
-	caret_x := text_edit_caret_x(te, font, frame, el.bounds, el.text)
 	cursor := c.int(math.round(caret_x)) - area.x
 	_ = sdl.SetTextInputArea(window, &area, cursor)
 }
@@ -306,6 +560,7 @@ text_edit_focus_id :: proc(
 	cfg: Editable_Text_Config,
 	target_id: dagda.Object_Id,
 	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> bool {
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
@@ -319,22 +574,28 @@ text_edit_focus_id :: proc(
 	if !found {
 		return false
 	}
+	multiline := text_edit_is_multiline(cfg, targets, multiline_targets, target_id)
 	was_focused := te.focused
 	switched := !te.focused || te.active_id != target_id
 	if switched {
 		dagda.text_session_destroy(&te.session)
-		dagda.text_session_init(&te.session, el.text)
+		dagda.text_session_init(&te.session, el.text, context.allocator, multiline)
 		te.focused = true
 		te.active_id = target_id
 		te.dragging = false
 		te.drag_target_id = 0
+		te.has_preferred_x = false
+		te.preferred_x = 0
 		if window != nil && !was_focused {
 			_ = sdl.StartTextInput(window)
 		}
-		text_edit_update_ime_area(te, window, font, frame, cfg)
-	} else if !dagda.is_composing(&te.session) {
-		dagda.text_session_sync(&te.session, el.text)
-		text_edit_update_ime_area(te, window, font, frame, cfg)
+		text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+	} else {
+		te.session.multiline = multiline
+		if !dagda.is_composing(&te.session) {
+			dagda.text_session_sync(&te.session, el.text)
+			text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+		}
 	}
 	return switched
 }
@@ -346,8 +607,37 @@ text_edit_focus :: proc(
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> bool {
-	return text_edit_focus_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), targets)
+	return text_edit_focus_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), targets, multiline_targets)
+}
+
+text_edit_hit_test_offset :: proc(
+	font: ^Font,
+	frame: dagda.Frame,
+	bounds: dagda.Rect,
+	text: string,
+	scroll_x, scroll_y: f32,
+	point_x, point_y: f32,
+	multiline: bool,
+) -> int {
+	if font == nil || !font.loaded {
+		return 0
+	}
+	if !multiline {
+		text_x, _, px := text_edit_layout(frame, bounds)
+		return font_hit_test_caret(font, text, px, point_x - (text_x - scroll_x))
+	}
+	text_x, first_line_y, px, line_h, _, _ := text_edit_multiline_layout(frame, bounds)
+	num_lines := text_edit_line_count(text)
+	raw_line := line_h > 0 ? int(math.floor((point_y - (first_line_y - scroll_y)) / line_h)) : 0
+	line_idx := clamp(raw_line, 0, num_lines - 1)
+	span, ok := text_edit_line_span(text, line_idx)
+	if !ok {
+		return len(text)
+	}
+	rel := font_hit_test_caret(font, text[span.start:span.end], px, point_x - (text_x - scroll_x))
+	return span.start + rel
 }
 
 // text_edit_click_id focuses target_id and places the caret at the clicked
@@ -364,6 +654,8 @@ text_edit_click_id :: proc(
 	click_x: f32,
 	targets: []dagda.Object_Id = nil,
 	extend_selection := false,
+	click_y: f32 = 0,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> bool {
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
@@ -375,26 +667,27 @@ text_edit_click_id :: proc(
 	if !found {
 		return false
 	}
+	multiline := text_edit_is_multiline(cfg, targets, multiline_targets, target_id)
 	was_same_field := te.focused && te.active_id == target_id
 	// Hit-test against the exact scroll offset currently painted for target_id
 	// before focus switching can scroll to the default end caret.
-	click_scroll := text_edit_clamped_scroll(te, font, frame, target_id, el.bounds, el.text, was_same_field)
-	changed := text_edit_focus_id(te, window, font, frame, cfg, target_id, targets)
+	click_sx, click_sy := text_edit_clamped_scroll_2d(te, font, frame, target_id, el.bounds, el.text, was_same_field, multiline)
+	changed := text_edit_focus_id(te, window, font, frame, cfg, target_id, targets, multiline_targets)
 	if dagda.cancel_composition(&te.session) {
 		changed = true
 	}
+	te.has_preferred_x = false
 	if font != nil && font.loaded {
-		text_x, _, px := text_edit_layout(frame, el.bounds)
-		offset := font_hit_test_caret(font, el.text, px, click_x - (text_x - click_scroll))
+		offset := text_edit_hit_test_offset(font, frame, el.bounds, el.text, click_sx, click_sy, click_x, click_y, multiline)
 		prev_caret := te.session.caret
 		prev_anchor := te.session.anchor
 		dagda.set_caret(&te.session, el.text, offset, extend_selection && was_same_field)
 		if te.session.caret != prev_caret || te.session.anchor != prev_anchor {
 			changed = true
 		}
-		te.scroll_offsets[target_id] = click_scroll
+		te.scroll_offsets[target_id] = {click_sx, click_sy}
 	}
-	text_edit_update_ime_area(te, window, font, frame, cfg)
+	text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 	return changed
 }
 
@@ -406,8 +699,10 @@ text_edit_click :: proc(
 	cfg: Editable_Text_Config,
 	click_x: f32,
 	targets: []dagda.Object_Id = nil,
+	click_y: f32 = 0,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> bool {
-	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), click_x, targets)
+	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), click_x, targets, false, click_y, multiline_targets)
 }
 
 // text_edit_press_id focuses target_id, places the caret at press_x using the
@@ -427,6 +722,8 @@ text_edit_press_id :: proc(
 	press_x: f32,
 	targets: []dagda.Object_Id = nil,
 	extend_selection := false,
+	press_y: f32 = 0,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> (started: bool, changed: bool) {
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false, false
@@ -437,7 +734,7 @@ text_edit_press_id :: proc(
 	if _, found := dagda.find(frame, target_id); !found {
 		return false, false
 	}
-	changed = text_edit_click_id(te, window, font, frame, cfg, target_id, press_x, targets, extend_selection)
+	changed = text_edit_click_id(te, window, font, frame, cfg, target_id, press_x, targets, extend_selection, press_y, multiline_targets)
 	if te.focused && te.active_id == target_id && !dagda.is_composing(&te.session) {
 		te.dragging = true
 		te.drag_target_id = target_id
@@ -457,6 +754,8 @@ text_edit_drag_move :: proc(
 	cfg: Editable_Text_Config,
 	move_x: f32,
 	targets: []dagda.Object_Id = nil,
+	move_y: f32 = 0,
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> bool {
 	if !te.dragging || !te.focused || te.active_id != te.drag_target_id || dagda.is_composing(&te.session) {
 		return false
@@ -473,22 +772,34 @@ text_edit_drag_move :: proc(
 	if font == nil || !font.loaded {
 		return false
 	}
-	text_x, _, px := text_edit_layout(frame, el.bounds)
+	multiline := te.session.multiline || text_edit_is_multiline(cfg, targets, multiline_targets, te.drag_target_id)
 	vis := text_edit_visible_rect(frame, el.bounds)
-	scroll := text_edit_clamped_scroll(te, font, frame, te.drag_target_id, el.bounds, el.text, true)
+	sx, sy := text_edit_clamped_scroll_2d(te, font, frame, te.drag_target_id, el.bounds, el.text, true, multiline)
 	offset: int
-	if move_x <= vis.x {
-		offset = 0
-	} else if move_x >= vis.x + vis.width {
-		offset = len(el.text)
+	if !multiline {
+		text_x, _, px := text_edit_layout(frame, el.bounds)
+		if move_x <= vis.x {
+			offset = 0
+		} else if move_x >= vis.x + vis.width {
+			offset = len(el.text)
+		} else {
+			offset = font_hit_test_caret(font, el.text, px, move_x - (text_x - sx))
+		}
 	} else {
-		offset = font_hit_test_caret(font, el.text, px, move_x - (text_x - scroll))
+		if move_y <= vis.y && move_x <= vis.x {
+			offset = 0
+		} else if move_y >= vis.y + vis.height && move_x >= vis.x + vis.width {
+			offset = len(el.text)
+		} else {
+			offset = text_edit_hit_test_offset(font, frame, el.bounds, el.text, sx, sy, move_x, move_y, true)
+		}
 	}
+	te.has_preferred_x = false
 	prev_caret := te.session.caret
-	prev_scroll := scroll
+	prev_sx, prev_sy := sx, sy
 	dagda.set_caret(&te.session, el.text, offset, true)
-	text_edit_update_ime_area(te, window, font, frame, cfg)
-	if te.session.caret != prev_caret || text_edit_scroll_x(te, te.drag_target_id) != prev_scroll {
+	text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+	if te.session.caret != prev_caret || text_edit_scroll_x(te, te.drag_target_id) != prev_sx || text_edit_scroll_y(te, te.drag_target_id) != prev_sy {
 		return true
 	}
 	return false
@@ -508,6 +819,8 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	te.active_id = 0
 	te.dragging = false
 	te.drag_target_id = 0
+	te.has_preferred_x = false
+	te.preferred_x = 0
 	if window != nil {
 		_ = sdl.StopTextInput(window)
 	}
@@ -550,6 +863,7 @@ text_edit_reconcile :: proc(
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) {
 	text_edit_prune_scroll_offsets(te, frame, cfg, targets)
 	if !te.focused {
@@ -564,10 +878,11 @@ text_edit_reconcile :: proc(
 		_ = text_edit_blur(te, window)
 		return
 	}
+	te.session.multiline = text_edit_is_multiline(cfg, targets, multiline_targets, te.active_id)
 	if !dagda.is_composing(&te.session) {
 		dagda.text_session_sync(&te.session, el.text)
 	}
-	text_edit_update_ime_area(te, window, font, frame, cfg)
+	text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 }
 
 text_edit_apply_committed :: proc(
@@ -577,10 +892,13 @@ text_edit_apply_committed :: proc(
 	frame: dagda.Frame,
 	cfg: Editable_Text_Config,
 	edit: ^dagda.Text_Edit,
+	targets: []dagda.Object_Id = nil,
+	multiline_targets: []dagda.Object_Id = nil,
 ) {
 	if el, found := dagda.find(frame, te.active_id); found {
 		dagda.apply_edit(&te.session, edit^, el.text)
-		text_edit_update_ime_area(te, window, font, frame, cfg)
+		te.has_preferred_x = false
+		text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 	}
 	dagda.edit_destroy(&te.session, edit)
 }
@@ -709,6 +1027,49 @@ clipboard_get :: proc(cb: Clipboard, allocator := context.allocator) -> (string,
 	return cloned, true
 }
 
+text_edit_move_vertical :: proc(
+	te: ^Text_Edit_State,
+	font: ^Font,
+	frame: dagda.Frame,
+	bounds: dagda.Rect,
+	text: string,
+	delta_line: int,
+	extend_selection: bool,
+) -> bool {
+	if font == nil || !font.loaded {
+		return false
+	}
+	_, _, px, _, _, _ := text_edit_multiline_layout(frame, bounds)
+	base_off := clamp(te.session.caret, 0, len(text))
+	if !extend_selection && dagda.has_selection(&te.session) {
+		sel_s, sel_e := dagda.selection_bounds(&te.session)
+		base_off = delta_line < 0 ? sel_s : sel_e
+		te.has_preferred_x = false
+	}
+	cur_line := text_edit_line_index_at(text, base_off)
+	if !te.has_preferred_x {
+		cur_start := dagda.line_start_offset(text, base_off)
+		te.preferred_x = font_measure_width(font, text[cur_start:base_off], px)
+		te.has_preferred_x = true
+	}
+	num_lines := text_edit_line_count(text)
+	target_line := cur_line + delta_line
+	if target_line < 0 || target_line >= num_lines {
+		if !extend_selection && dagda.has_selection(&te.session) {
+			dagda.set_caret(&te.session, text, base_off, false)
+			return true
+		}
+		return false
+	}
+	span, ok := text_edit_line_span(text, target_line)
+	if !ok {
+		return false
+	}
+	rel := font_hit_test_caret(font, text[span.start:span.end], px, te.preferred_x)
+	dagda.set_caret(&te.session, text, span.start + rel, extend_selection)
+	return true
+}
+
 text_edit_handle_event :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
@@ -719,6 +1080,7 @@ text_edit_handle_event :: proc(
 	ev: ^sdl.Event,
 	targets: []dagda.Object_Id = nil,
 	clipboard: Clipboard = {},
+	multiline_targets: []dagda.Object_Id = nil,
 ) -> (res: Text_Edit_Result) {
 	if !cfg.enabled || !te.focused {
 		return {}
@@ -732,6 +1094,8 @@ text_edit_handle_event :: proc(
 		_ = text_edit_blur(te, window)
 		return {needs_redraw = true}
 	}
+	multiline := text_edit_is_multiline(cfg, targets, multiline_targets, te.active_id)
+	te.session.multiline = multiline
 
 	commit_proposal :: proc(
 		te: ^Text_Edit_State,
@@ -758,6 +1122,7 @@ text_edit_handle_event :: proc(
 			if clear_composition_on_accept {
 				_ = dagda.cancel_composition(&te.session)
 			}
+			te.has_preferred_x = false
 			res.needs_rebuild = true
 			res.needs_redraw = true
 			res.has_pending_edit = true
@@ -773,14 +1138,16 @@ text_edit_handle_event :: proc(
 	#partial switch ev.type {
 	case .TEXT_EDITING:
 		text_edit_drag_end(te)
+		te.has_preferred_x = false
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
 		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
-		text_edit_update_ime_area(te, window, font, frame, cfg)
+		text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 		res.consumed = true
 		res.needs_redraw = true
 		return res
 
 	case .TEXT_INPUT:
+		te.has_preferred_x = false
 		text := ev.text.text != nil ? string(ev.text.text) : ""
 		// Propose replacing the selection with the IME's final text without
 		// clearing composition first; clear composition only if accepted so a
@@ -788,7 +1155,7 @@ text_edit_handle_event :: proc(
 		edit := dagda.insert_text(&te.session, el.text, text)
 		commit_proposal(te, cfg, user_data, &edit, true, &res)
 		if !res.needs_rebuild {
-			text_edit_update_ime_area(te, window, font, frame, cfg)
+			text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 		}
 		res.consumed = true
 		return res
@@ -804,7 +1171,7 @@ text_edit_handle_event :: proc(
 			text_edit_drag_end(te)
 			if dagda.is_composing(&te.session) {
 				_ = dagda.cancel_composition(&te.session)
-				text_edit_update_ime_area(te, window, font, frame, cfg)
+				text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 				res.needs_redraw = true
 			}
 			res.consumed = true
@@ -819,13 +1186,21 @@ text_edit_handle_event :: proc(
 		}
 
 		if key == sdl.K_RETURN || key == sdl.K_KP_ENTER {
+			if multiline && !ctrl && !alt_or_gui {
+				edit := dagda.insert_text(&te.session, el.text, "\n")
+				commit_proposal(te, cfg, user_data, &edit, false, &res)
+				if !res.needs_rebuild {
+					text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+				}
+			}
 			res.consumed = true
 			return res
 		}
 
 		if ctrl && !shift && !alt_or_gui && key == sdl.K_A {
+			te.has_preferred_x = false
 			dagda.select_all(&te.session, el.text)
-			text_edit_update_ime_area(te, window, font, frame, cfg)
+			text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 			res.consumed = true
 			res.needs_redraw = true
 			return res
@@ -853,7 +1228,7 @@ text_edit_handle_event :: proc(
 						if clipboard_set(clipboard, el.text[start:end]) {
 							commit_proposal(te, cfg, user_data, &edit, false, &res)
 							if !res.needs_rebuild {
-								text_edit_update_ime_area(te, window, font, frame, cfg)
+								text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 							}
 						} else {
 							dagda.edit_destroy(&te.session, &edit)
@@ -872,10 +1247,22 @@ text_edit_handle_event :: proc(
 			if pasted, ok := clipboard_get(clipboard, clip_alloc); ok {
 				defer delete(pasted, clip_alloc)
 				if len(pasted) > 0 {
-					edit := dagda.insert_text(&te.session, el.text, pasted)
+					to_insert := pasted
+					normalized := ""
+					if multiline {
+						norm, norm_ok := dagda.normalize_multiline_newlines(pasted, clip_alloc)
+						if !norm_ok {
+							res.consumed = true
+							return res
+						}
+						normalized = norm
+						to_insert = normalized
+					}
+					defer if len(normalized) > 0 { delete(normalized, clip_alloc) }
+					edit := dagda.insert_text(&te.session, el.text, to_insert)
 					commit_proposal(te, cfg, user_data, &edit, false, &res)
 					if !res.needs_rebuild {
-						text_edit_update_ime_area(te, window, font, frame, cfg)
+						text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 					}
 				}
 			}
@@ -885,6 +1272,7 @@ text_edit_handle_event :: proc(
 
 		if ctrl && !shift && !alt_or_gui && !ev.key.repeat && key == sdl.K_Z {
 			if cfg.on_undo != nil && cfg.on_undo(user_data, te.active_id) {
+				te.has_preferred_x = false
 				res.needs_rebuild = true
 				res.needs_redraw = true
 			}
@@ -895,26 +1283,46 @@ text_edit_handle_event :: proc(
 		if !ctrl && !alt_or_gui {
 			switch key {
 			case sdl.K_LEFT:
+				te.has_preferred_x = false
 				dagda.move_left(&te.session, el.text, shift)
-				text_edit_update_ime_area(te, window, font, frame, cfg)
+				text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
 			case sdl.K_RIGHT:
+				te.has_preferred_x = false
 				dagda.move_right(&te.session, el.text, shift)
-				text_edit_update_ime_area(te, window, font, frame, cfg)
+				text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
+			case sdl.K_UP:
+				if multiline {
+					_ = text_edit_move_vertical(te, font, frame, el.bounds, el.text, -1, shift)
+					text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+					res.consumed = true
+					res.needs_redraw = true
+					return res
+				}
+			case sdl.K_DOWN:
+				if multiline {
+					_ = text_edit_move_vertical(te, font, frame, el.bounds, el.text, 1, shift)
+					text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
+					res.consumed = true
+					res.needs_redraw = true
+					return res
+				}
 			case sdl.K_HOME:
-				dagda.move_home(&te.session, shift)
-				text_edit_update_ime_area(te, window, font, frame, cfg)
+				te.has_preferred_x = false
+				dagda.move_line_home(&te.session, el.text, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
 			case sdl.K_END:
-				dagda.move_end(&te.session, el.text, shift)
-				text_edit_update_ime_area(te, window, font, frame, cfg)
+				te.has_preferred_x = false
+				dagda.move_line_end(&te.session, el.text, shift)
+				text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 				res.consumed = true
 				res.needs_redraw = true
 				return res
@@ -934,7 +1342,7 @@ text_edit_handle_event :: proc(
 	case .WINDOW_FOCUS_LOST:
 		text_edit_drag_end(te)
 		if dagda.cancel_composition(&te.session) {
-			text_edit_update_ime_area(te, window, font, frame, cfg)
+			text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 			res.needs_redraw = true
 		}
 		return res
@@ -1000,86 +1408,194 @@ text_edit_draw :: proc(
 	_ = sdl.SetRenderClipRect(r, &inner_clip)
 	defer _ = sdl.SetRenderClipRect(r, prev_clip_enabled ? &prev_clip : nil)
 
-	if !focused {
-		scroll := text_edit_clamped_scroll(&h.text_edit, &h.font, h.frame, id, bounds, committed, false)
-		draw_x := tx - scroll
-		if len(committed) > 0 {
-			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+	multiline := text_edit_is_multiline(h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets, id)
+
+	if !multiline {
+		if !focused {
+			scroll := text_edit_clamped_scroll(&h.text_edit, &h.font, h.frame, id, bounds, committed, false)
+			draw_x := tx - scroll
+			if len(committed) > 0 {
+				font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+			}
+			return
 		}
+
+		text_edit_sync_scroll(&h.text_edit, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+		scroll := text_edit_clamped_scroll(&h.text_edit, &h.font, h.frame, id, bounds, committed, true)
+		draw_x := tx - scroll
+
+		caret_h := px + 6
+
+		sel_start, sel_end := dagda.selection_bounds(&h.text_edit.session)
+		sel_start = clamp(sel_start, 0, len(committed))
+		sel_end = clamp(sel_end, sel_start, len(committed))
+		prefix := committed[:sel_start]
+		selected := committed[sel_start:sel_end]
+		suffix := committed[sel_end:]
+
+		prefix_w := font_measure_width(&h.font, prefix, px)
+
+		if dagda.is_composing(&h.text_edit.session) {
+			preedit := h.text_edit.session.preedit
+			preedit_w := font_measure_width(&h.font, preedit, px)
+			pre_x := draw_x + prefix_w
+
+			// Preedit highlight background + underline.
+			pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = ty - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
+			sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
+			sdl.RenderFillRect(r, &pre_bg)
+
+			underline := scale_frect(sdl.FRect{x = pre_x, y = ty + px + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
+			sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+			sdl.RenderFillRect(r, &underline)
+
+			if len(prefix) > 0 {
+				font_draw_text(&h.font, r, prefix, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+			}
+			if len(preedit) > 0 {
+				font_draw_text(&h.font, r, preedit, pre_x, ty, px, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
+			}
+			if len(suffix) > 0 {
+				font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+			}
+		} else {
+			if len(selected) > 0 {
+				sel_w := font_measure_width(&h.font, selected, px)
+				sel_rect := scale_frect(sdl.FRect{x = draw_x + prefix_w, y = ty - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
+				sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
+				sdl.RenderFillRect(r, &sel_rect)
+			}
+			if len(committed) > 0 {
+				font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+			}
+		}
+
+		caret_x := text_edit_caret_x(&h.text_edit, &h.font, h.frame, bounds, committed)
+		caret_rect := scale_frect(sdl.FRect{x = caret_x, y = ty - 3, w = TEXT_EDIT_CARET_WIDTH, h = caret_h}, scale_x, scale_y)
+		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+		sdl.RenderFillRect(r, &caret_rect)
 		return
 	}
 
-	text_edit_sync_scroll(&h.text_edit, &h.font, h.frame, h.app.text_edit)
-	scroll := text_edit_clamped_scroll(&h.text_edit, &h.font, h.frame, id, bounds, committed, true)
-	draw_x := tx - scroll
+	// Multiline painting: top-aligned lines clipped to the field interior,
+	// sharing layout, scroll, selection, preedit, and caret coordinates.
+	mtx, first_line_y, mpx, line_h, _, _ := text_edit_multiline_layout(h.frame, bounds)
+	vis := text_edit_visible_rect(h.frame, bounds)
+	if focused {
+		text_edit_sync_scroll(&h.text_edit, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+	}
+	sx, sy := text_edit_clamped_scroll_2d(&h.text_edit, &h.font, h.frame, id, bounds, committed, focused, true)
+	draw_x := mtx - sx
+	caret_h := mpx + 6
 
-	caret_h := px + 6
+	composing := focused && dagda.is_composing(&h.text_edit.session)
+	sel_start, sel_end := 0, 0
+	if focused {
+		sel_start, sel_end = dagda.selection_bounds(&h.text_edit.session)
+		sel_start = clamp(sel_start, 0, len(committed))
+		sel_end = clamp(sel_end, sel_start, len(committed))
+	}
+	pre_start_line := composing ? text_edit_line_index_at(committed, sel_start) : -1
+	pre_end_line := composing ? text_edit_line_index_at(committed, sel_end) : -1
 
-	sel_start, sel_end := dagda.selection_bounds(&h.text_edit.session)
-	sel_start = clamp(sel_start, 0, len(committed))
-	sel_end = clamp(sel_end, sel_start, len(committed))
-	prefix := committed[:sel_start]
-	selected := committed[sel_start:sel_end]
-	suffix := committed[sel_end:]
+	visual_line := 0
+	line_idx := 0
+	line_start := 0
+	for {
+		rel_nl := strings.index_byte(committed[line_start:], '\n')
+		line_end := rel_nl >= 0 ? line_start + rel_nl : len(committed)
 
-	prefix_w := font_measure_width(&h.font, prefix, px)
+		if !(composing && line_idx > pre_start_line && line_idx <= pre_end_line) {
+			line_y := first_line_y + f32(visual_line) * line_h - sy
+			visual_line += 1
 
-	if dagda.is_composing(&h.text_edit.session) {
-		preedit := h.text_edit.session.preedit
-		preedit_w := font_measure_width(&h.font, preedit, px)
-		pre_x := draw_x + prefix_w
+			// Skip offscreen lines without shaping or drawing glyphs.
+			if line_y + caret_h >= vis.y && line_y - 3 <= vis.y + vis.height {
+				if composing && line_idx == pre_start_line {
+					end_line_end := dagda.line_end_offset(committed, sel_end)
+					prefix := committed[line_start:sel_start]
+					preedit := h.text_edit.session.preedit
+					suffix := committed[sel_end:end_line_end]
+					prefix_w := font_measure_width(&h.font, prefix, mpx)
+					preedit_w := font_measure_width(&h.font, preedit, mpx)
+					pre_x := draw_x + prefix_w
 
-		// Preedit highlight background + underline.
-		pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = ty - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
-		sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
-		sdl.RenderFillRect(r, &pre_bg)
+					pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = line_y - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
+					sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
+					sdl.RenderFillRect(r, &pre_bg)
 
-		underline := scale_frect(sdl.FRect{x = pre_x, y = ty + px + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
-		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-		sdl.RenderFillRect(r, &underline)
+					underline := scale_frect(sdl.FRect{x = pre_x, y = line_y + mpx + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
+					sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+					sdl.RenderFillRect(r, &underline)
 
-		if len(prefix) > 0 {
-			font_draw_text(&h.font, r, prefix, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					if len(prefix) > 0 {
+						font_draw_text(&h.font, r, prefix, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+					if len(preedit) > 0 {
+						font_draw_text(&h.font, r, preedit, pre_x, line_y, mpx, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
+					}
+					if len(suffix) > 0 {
+						font_draw_text(&h.font, r, suffix, pre_x + preedit_w, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+				} else {
+					if focused && !composing && sel_start < sel_end && sel_end > line_start && sel_start <= line_end {
+						hl_s := clamp(sel_start, line_start, line_end)
+						hl_e := clamp(sel_end, line_start, line_end)
+						sel_x := draw_x + font_measure_width(&h.font, committed[line_start:hl_s], mpx)
+						sel_w := font_measure_width(&h.font, committed[hl_s:hl_e], mpx)
+						if sel_end > line_end {
+							sel_w += max(mpx * 0.35, 6)
+						}
+						if sel_w > 0 {
+							sel_rect := scale_frect(sdl.FRect{x = sel_x, y = line_y - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
+							sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
+							sdl.RenderFillRect(r, &sel_rect)
+						}
+					}
+
+					line_text := committed[line_start:line_end]
+					if len(line_text) > 0 {
+						font_draw_text(&h.font, r, line_text, draw_x, line_y, mpx, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
+					}
+				}
+			}
 		}
-		if len(preedit) > 0 {
-			font_draw_text(&h.font, r, preedit, pre_x, ty, px, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
+
+		if rel_nl < 0 {
+			break
 		}
-		if len(suffix) > 0 {
-			font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
-		}
-	} else {
-		if len(selected) > 0 {
-			sel_w := font_measure_width(&h.font, selected, px)
-			sel_rect := scale_frect(sdl.FRect{x = draw_x + prefix_w, y = ty - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
-			sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
-			sdl.RenderFillRect(r, &sel_rect)
-		}
-		if len(committed) > 0 {
-			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
-		}
+		line_start = line_end + 1
+		line_idx += 1
 	}
 
-	caret_x := text_edit_caret_x(&h.text_edit, &h.font, h.frame, bounds, committed)
-	caret_rect := scale_frect(sdl.FRect{x = caret_x, y = ty - 3, w = TEXT_EDIT_CARET_WIDTH, h = caret_h}, scale_x, scale_y)
-	sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
-	sdl.RenderFillRect(r, &caret_rect)
+	if focused {
+		caret_x, caret_y, _ := text_edit_caret_pos(&h.text_edit, &h.font, h.frame, bounds, committed, true)
+		caret_rect := scale_frect(sdl.FRect{x = caret_x, y = caret_y - 3, w = TEXT_EDIT_CARET_WIDTH, h = caret_h}, scale_x, scale_y)
+		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
+		sdl.RenderFillRect(r, &caret_rect)
+	}
 }
 
-// copy_to_cstr_buf copies s into a NUL-terminated fixed buffer for SDL_PushEvent.
-copy_to_cstr_buf :: proc(buf: []u8, s: string) -> (cstring, bool) {
-	if len(s) + 1 > len(buf) {
-		return nil, false
+host_clear_control_cstrs :: proc(h: ^Host) {
+	if h == nil {
+		return
 	}
-	if len(s) > 0 {
-		copy(buf[:len(s)], s)
+	for cstr in h.queued_control_cstrs {
+		delete(cstr)
 	}
-	buf[len(s)] = 0
-	return cstring(raw_data(buf)), true
+	clear(&h.queued_control_cstrs)
 }
 
 push_sdl_preedit :: proc(h: ^Host, text: string) -> bool {
-	cstr, ok := copy_to_cstr_buf(h.edit_cstr_buf[:], text)
-	if !ok {
+	cstr, err := strings.clone_to_cstring(text)
+	if err != nil || cstr == nil {
+		delete(cstr)
+		return false
+	}
+	prev_len := len(h.queued_control_cstrs)
+	_, append_err := append(&h.queued_control_cstrs, cstr)
+	if append_err != nil || len(h.queued_control_cstrs) != prev_len + 1 {
+		delete(cstr)
 		return false
 	}
 	ev: sdl.Event
@@ -1088,17 +1604,34 @@ push_sdl_preedit :: proc(h: ^Host, text: string) -> bool {
 	ev.edit.text = cstr
 	ev.edit.start = 0
 	ev.edit.length = c.int(utf8.rune_count_in_string(text))
-	return sdl.PushEvent(&ev)
+	if !sdl.PushEvent(&ev) {
+		_ = pop(&h.queued_control_cstrs)
+		delete(cstr)
+		return false
+	}
+	return true
 }
 
 push_sdl_text_input :: proc(h: ^Host, text: string) -> bool {
-	cstr, ok := copy_to_cstr_buf(h.text_cstr_buf[:], text)
-	if !ok {
+	cstr, err := strings.clone_to_cstring(text)
+	if err != nil || cstr == nil {
+		delete(cstr)
+		return false
+	}
+	prev_len := len(h.queued_control_cstrs)
+	_, append_err := append(&h.queued_control_cstrs, cstr)
+	if append_err != nil || len(h.queued_control_cstrs) != prev_len + 1 {
+		delete(cstr)
 		return false
 	}
 	ev: sdl.Event
 	ev.type = .TEXT_INPUT
 	ev.text.windowID = sdl.GetWindowID(h.window)
 	ev.text.text = cstr
-	return sdl.PushEvent(&ev)
+	if !sdl.PushEvent(&ev) {
+		_ = pop(&h.queued_control_cstrs)
+		delete(cstr)
+		return false
+	}
+	return true
 }
