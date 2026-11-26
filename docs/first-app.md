@@ -147,30 +147,42 @@ CLIENT=/path/to/dagda/build/dagda-client   # paste your line
 # {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"1",...}]}
 ```
 
-Now let the agent press the same button. Discover its ID by
-role, invoke it, and inspect again — the count reads `2`:
+Now let the agent press the same button. First discover its
+ID and bounds by role:
 
 ```sh
 "$CLIENT" "$SOCK" inspect counter.increment
-# {"ok":true,"elements":[{"id":2,"role":"counter.increment","kind":"button","text":"Increment",...}]}
-"$CLIENT" "$SOCK" invoke 2 activate
-"$CLIENT" "$SOCK" inspect counter.value
-# {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"2",...}]}
+# {"ok":true,"elements":[{"id":2,"role":"counter.increment","kind":"button","text":"Increment","bounds":{"x":16,"y":64,"width":328,"height":40},...}]}
 ```
 
-Before invoking, an agent can ask what a pointer at a point
-would hit — for example the centre of the button it just
-inspected — without changing anything:
+Before invoking, the agent can ask what a pointer at a point
+would hit, without changing anything. Calculate the centre
+from the returned bounds — centre = (x + width ÷ 2,
+y + height ÷ 2). For the default 360×180 window above that is
+(16 + 164, 64 + 20) = `180 84`:
 
 ```sh
 "$CLIENT" "$SOCK" hit-test 180 84
 # {"ok":true,"id":2}
-"$CLIENT" "$SOCK" inspect counter.value   # unchanged until a click or invoke lands
+"$CLIENT" "$SOCK" inspect counter.value   # still 1: hit-test changed nothing
 ```
 
 `hit-test` takes the same logical window coordinates that
 `inspect` reports as `bounds`, returns the topmost element's
 stable ID (or `null` for a miss), and never touches the app.
+Always derive the point from the live bounds rather than
+copying an example: in a narrower 160×180 window the centre
+is `80 84` (which hits ID 2), while `180 84` falls outside
+and returns `null`.
+
+Now invoke the discovered ID, and inspect again — the count
+reads `2`:
+
+```sh
+"$CLIENT" "$SOCK" invoke 2 activate
+"$CLIENT" "$SOCK" inspect counter.value
+# {"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"2",...}]}
+```
 
 Close the window when you are done; it removes its own socket
 file, and `rmdir "$SOCK_DIR"` in terminal 1 cleans up.

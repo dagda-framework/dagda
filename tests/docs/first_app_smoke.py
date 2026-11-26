@@ -141,8 +141,9 @@ def run_counter(app_bin, client_bin, tmp):
         client("invoke", str(button["id"]), "activate")
         assert count() == "2", count()
         control("quit")
-        proc.wait(timeout=10)
-        assert proc.poll() is not None and not sock.exists()
+        status = proc.wait(timeout=10)
+        assert status == 0, f"guide app exited with status {status} after quit"
+        assert not sock.exists()
         print(f"first-app runtime: hit-test id={button['id']}, click -> 1, invoke -> 2, clean shutdown")
     finally:
         cleanup()
