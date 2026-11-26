@@ -159,3 +159,6 @@ jobs:
 
       - name: Run the macOS shortcuts process check
         run: python3 examples/shared-text/tests/macos_shortcuts_test.py
+
+      - name: Run the Cocoa caret and grapheme hit-test probe
+        run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa

@@ -778,6 +778,42 @@ poll_control_stdin :: proc(
 				fmt.println("CONTROL_ERR ime-area failed")
 			}
 			_ = os.flush(os.stdout)
+		} else if line == "window-info" {
+			drv := sdl.GetCurrentVideoDriver()
+			drv_str := drv != nil ? string(drv) : "unknown"
+			win_w, win_h: c.int
+			out_w, out_h: c.int
+			_ = sdl.GetWindowSize(h.window, &win_w, &win_h)
+			_ = sdl.GetCurrentRenderOutputSize(h.renderer, &out_w, &out_h)
+			density := sdl.GetWindowPixelDensity(h.window)
+			display_scale := sdl.GetWindowDisplayScale(h.window)
+			fmt.printf(
+				"CONTROL_OK window-info driver=%s win=%dx%d output=%dx%d density=%.4f display_scale=%.4f\n",
+				drv_str,
+				win_w,
+				win_h,
+				out_w,
+				out_h,
+				density,
+				display_scale,
+			)
+			_ = os.flush(os.stdout)
+		} else if strings.has_prefix(line, "measure ") {
+			rest := line[len("measure "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp > 0 {
+				px, ok_px := strconv.parse_f32(rest[:sp])
+				text := rest[sp + 1:]
+				if ok_px && px > 0 {
+					width := font_measure_width(&h.font, text, px)
+					fmt.printf("CONTROL_OK measure %.4f\n", width)
+				} else {
+					fmt.println("CONTROL_ERR invalid measure")
+				}
+			} else {
+				fmt.println("CONTROL_ERR invalid measure")
+			}
+			_ = os.flush(os.stdout)
 		} else if line == "quit" {
 			fmt.println("CONTROL_OK quit")
 			_ = os.flush(os.stdout)
