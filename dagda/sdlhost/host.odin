@@ -54,6 +54,67 @@ action_dispatch_trampoline :: proc(user_data: rawptr, id: dagda.Object_Id, actio
 	return d.handler(d.user_data, id, action)
 }
 
+// Composition_Remap_Handler is the prototype host-thread
+// handoff for an external replacement of the composing
+// field's committed text. During a rebuild, after the builder
+// has produced the new frame and before that field is painted
+// or any queued final input is dispatched, the host calls it
+// with the previous committed text (a snapshot clone valid
+// only for this call), the new committed text (borrowed; do
+// not retain either slice), and the session's directional
+// committed byte anchor and caret. The app returns one
+// decision through its own document operation:
+//
+//   .Mapped    map anchor and caret directionally; both are
+//              validated as grapheme boundaries in the new
+//              text, and the live preedit is kept.
+//   .Cancel_At cancel the composition and collapse the
+//              selection to caret, a single grapheme
+//              boundary in the new text chosen by the app
+//              (for example the deletion site). The next
+//              input then inserts there instead of
+//              replacing whatever the stale endpoints would
+//              have spanned in the new text.
+//   .Cancel    cancel and collapse the selection to the
+//              clamped selection start: the start of the
+//              old selection (the smaller of anchor and
+//              caret), clamped to a grapheme boundary in
+//              the new text. This is the zero-value
+//              decision, so returning {} safely cancels
+//              this way. Every cancellation fallback — no
+//              mapper, an invalid mapped or Cancel_At
+//              endpoint, and a failed snapshot advance —
+//              collapses the same way, never by clamping
+//              the two old endpoints independently.
+//
+// An invalid decision is treated as .Cancel. On a
+// successful map the live preedit and its rune-relative
+// cursor are kept.
+//
+// SDL limitation: cancellation cannot recall text input
+// that is already on its way. After either cancellation,
+// the next bare text event inserts at the collapsed caret
+// and may be either a trailing IME final for the cancelled
+// composition or the person's fresh typing — SDL delivers
+// both as identical text-input events, and the host does
+// not distinguish them (no timing heuristic, no discarded
+// event). Apps that cannot accept that ambiguity can hold
+// an external replacement in their own model until the
+// composition ends instead of cancelling into it.
+Composition_Remap_Kind :: enum {
+	Cancel,
+	Mapped,
+	Cancel_At,
+}
+
+Composition_Remap_Decision :: struct {
+	kind:   Composition_Remap_Kind,
+	anchor: int, // mapped anchor for .Mapped
+	caret:  int, // mapped caret for .Mapped; collapsed caret for .Cancel_At
+}
+
+Composition_Remap_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id, old_text: string, new_text: string, anchor: int, caret: int) -> Composition_Remap_Decision
+
 // App describes a native Dagda application hosted in an SDL3 window.
 // Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
 App :: struct {
@@ -122,6 +183,18 @@ App :: struct {
 	// On commit, the callback runs after on_commit returns and only if the
 	// composition has ended. A rejected edit can keep composing and retry.
 	on_composition: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool),
+	// Optional composition anchor mapper (prototype). Apps
+	// without a mapper get the safe default: when a rebuild
+	// replaces the composing field's committed text, the
+	// composition is cancelled before the new field is
+	// painted and the selection collapses to the clamped
+	// selection start (the plain .Cancel caret), rather than
+	// letting stale byte offsets be reinterpreted against
+	// the new text. A host's own
+	// accepted commit never reaches this handler: accepting
+	// final input ends the composition first, so only a
+	// still-composing rebuild can be an external replacement.
+	on_composition_remap: Composition_Remap_Handler,
 	// Optional out-storage for this window's rebuild handle.
 	// The host fills it before on_ready and before the event
 	// loop; copy the value to a worker if needed. It stops
@@ -230,6 +303,11 @@ Host :: struct {
 @(private="package")
 host_report_composition :: proc(h: ^Host, current: Active_Composition) {
 	previous := h.reported_composition
+	if previous.active && !current.active {
+		// The snapshot's lifetime ends with the composition,
+		// whether or not the app observes the transition.
+		text_edit_snapshot_clear(&h.text_edit)
+	}
 	if previous == current || h.app.on_composition == nil {
 		return
 	}
@@ -242,12 +320,84 @@ host_report_composition :: proc(h: ^Host, current: Active_Composition) {
 	}
 }
 
+@(private="package")
+host_apply_composition_remap :: proc(h: ^Host, field_id: dagda.Object_Id, old_text: string, new_text: string) {
+	// Documented plain-Cancel caret: the old selection's
+	// start, clamped to a grapheme boundary in the new text.
+	selection_start, _ := dagda.selection_bounds(&h.text_edit.session)
+	collapse_at := dagda.clamp_grapheme_boundary(new_text, selection_start)
+	if h.app.on_composition_remap != nil {
+		decision := h.app.on_composition_remap(
+			h.app.user_data, field_id, old_text, new_text, h.text_edit.session.anchor, h.text_edit.session.caret)
+		boundary :: proc(text: string, offset: int) -> bool {
+			return offset >= 0 && offset <= len(text) && dagda.clamp_grapheme_boundary(text, offset) == offset
+		}
+		switch decision.kind {
+		case .Mapped:
+			if boundary(new_text, decision.anchor) && boundary(new_text, decision.caret) {
+				// Advance the session-owned snapshot before
+				// moving the endpoints. If that allocation
+				// fails, fall through to cancellation: a final
+				// edit must never run against stale offsets.
+				if text_edit_snapshot_set(&h.text_edit, new_text) {
+					// Keep the live preedit and its rune-relative
+					// cursor; only the committed endpoints move.
+					h.text_edit.session.anchor = decision.anchor
+					h.text_edit.session.caret = decision.caret
+					return
+				}
+			}
+		case .Cancel_At:
+			if boundary(new_text, decision.caret) {
+				collapse_at = decision.caret
+			}
+		case .Cancel:
+		}
+	}
+	// Cancellation: end the composition here and collapse
+	// both endpoints to the single caret — the app-chosen
+	// one for a valid .Cancel_At, otherwise the documented
+	// plain-Cancel position above. Every fallback (no
+	// mapper, invalid endpoints, failed snapshot advance,
+	// and the zero-value decision) lands here, so the next
+	// input inserts at one boundary and cannot replace a
+	// span of the new text.
+	_ = dagda.cancel_composition(&h.text_edit.session)
+	text_edit_snapshot_clear(&h.text_edit)
+	h.text_edit.session.anchor = collapse_at
+	h.text_edit.session.caret = collapse_at
+}
+
 host_rebuild_frame :: proc(h: ^Host) -> bool {
 	if h.window != nil {
 		w, height: c.int
 		sdl.GetWindowSize(h.window, &w, &height)
 		h.viewport = {width = f32(w), height = f32(height)}
 	}
+	// The mapper's old text is the session-owned snapshot
+	// taken at composition start (and advanced after each
+	// successful remap), so it stays valid even when the
+	// builder below replaces and frees the app-owned storage
+	// the previous frame borrowed. If a composition somehow
+	// has no snapshot, try to establish one from the previous
+	// frame now; if that allocation fails, cancel before the
+	// builder runs rather than proceed on stale offsets.
+	remap_field: dagda.Object_Id
+	remap_pending := false
+	if h.text_edit.focused && dagda.is_composing(&h.text_edit.session) {
+		remap_field, remap_pending = h.text_edit.active_id, true
+		if !h.text_edit.has_composition_snapshot {
+			established := false
+			if el, found := dagda.find(h.frame, remap_field); found {
+				established = text_edit_snapshot_set(&h.text_edit, el.text)
+			}
+			if !established {
+				_ = dagda.cancel_composition(&h.text_edit.session)
+				remap_pending = false
+			}
+		}
+	}
+
 	// Release the previous frame before rebuilding the app view/canvas so no
 	// frame outlives borrowed label/role storage.
 	dagda.frame_destroy(&h.frame)
@@ -263,6 +413,15 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 		return false
 	}
 	h.frame = frame
+	// An external replacement of the composing field's text
+	// is decided here, synchronously on the host thread,
+	// before focus/session reconciliation, painting, or any
+	// queued final input that follows this rebuild.
+	if remap_pending && dagda.is_composing(&h.text_edit.session) {
+		if el, found := dagda.find(h.frame, remap_field); found && el.text != h.text_edit.composition_snapshot {
+			host_apply_composition_remap(h, remap_field, h.text_edit.composition_snapshot, el.text)
+		}
+	}
 	_ = focus_reconcile(&h.focus, h.frame)
 	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 	host_report_composition(h, host_active_composition(h))

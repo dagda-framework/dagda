@@ -36,6 +36,36 @@ Text_Edit_State :: struct {
 	preferred_x:     f32,
 	scroll_offsets:  map[dagda.Object_Id][2]f32,
 	session:         dagda.Text_Session,
+	// Session-owned snapshot of the composing field's
+	// committed text, cloned at composition start and
+	// advanced only after a successful remap. It keeps the
+	// old bytes alive when the app builder replaces its own
+	// storage, and is released when composition ends.
+	composition_snapshot:     string,
+	has_composition_snapshot: bool,
+	snapshot_allocator:       mem.Allocator,
+}
+
+text_edit_snapshot_clear :: proc(te: ^Text_Edit_State) {
+	if te.has_composition_snapshot {
+		delete(te.composition_snapshot, te.snapshot_allocator)
+		te.composition_snapshot = ""
+		te.has_composition_snapshot = false
+	}
+}
+
+text_edit_snapshot_set :: proc(te: ^Text_Edit_State, text: string) -> bool {
+	alloc := te.session.allocator
+	cloned, err := strings.clone(text, alloc)
+	if err != nil || (len(text) > 0 && len(cloned) != len(text)) {
+		delete(cloned, alloc)
+		return false
+	}
+	text_edit_snapshot_clear(te)
+	te.composition_snapshot = cloned
+	te.has_composition_snapshot = true
+	te.snapshot_allocator = alloc
+	return true
 }
 
 // Active_Composition identifies which visual field in the current host window
@@ -495,6 +525,7 @@ text_edit_caret_x :: proc(
 }
 
 text_edit_destroy :: proc(te: ^Text_Edit_State) {
+	text_edit_snapshot_clear(te)
 	dagda.text_session_destroy(&te.session)
 	delete(te.scroll_offsets)
 	te.scroll_offsets = nil
@@ -815,6 +846,7 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 		return false
 	}
 	_ = dagda.cancel_composition(&te.session)
+	text_edit_snapshot_clear(te)
 	te.focused = false
 	te.active_id = 0
 	te.dragging = false
@@ -1139,8 +1171,20 @@ text_edit_handle_event :: proc(
 	case .TEXT_EDITING:
 		text_edit_drag_end(te)
 		te.has_preferred_x = false
+		was_composing := dagda.is_composing(&te.session)
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
-		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		begin_err := dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		if begin_err == .None && !was_composing && dagda.is_composing(&te.session) {
+			// Establish the session-owned snapshot of the
+			// committed text this composition is anchored
+			// against. If it cannot be established, cancel:
+			// a later final must never run against stale
+			// offsets with no trustworthy old text.
+			if !text_edit_snapshot_set(te, el.text) {
+				_ = dagda.cancel_composition(&te.session)
+				text_edit_snapshot_clear(te)
+			}
+		}
 		text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 		res.consumed = true
 		res.needs_redraw = true
