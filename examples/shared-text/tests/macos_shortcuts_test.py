@@ -29,18 +29,48 @@ ODIN = base.ODIN
 DECOMPOSED = "Cafe\u0301"
 
 
+class StartupFailure(AssertionError):
+    """Startup failed after Popen; carries the reaped child."""
+
+    def __init__(self, message, proc):
+        super().__init__(message)
+        self.proc = proc
+
+
+def launch(argv, expected, timeout=10.0, env=None):
+    # Cleanup is established immediately after Popen, so a host
+    # that prints a wrong readiness line (or stalls) and stays
+    # alive is terminated, escalated if needed, and reaped here
+    # instead of escaping to a caller that never receives it.
+    proc = subprocess.Popen(argv,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            bufsize=0, env=env, cwd=ROOT)
+    try:
+        reader = base.DeadlineLineReader(proc.stdout)
+        line = reader.read_line("startup", timeout=timeout)
+        if line != expected:
+            raise AssertionError(f"unexpected startup line: {line!r} (expected {expected!r})")
+        return proc, reader
+    except BaseException as exc:
+        base.stop_process(proc)
+        raise StartupFailure(str(exc), proc) from exc
+
+
 def start(app_bin, client_bin, tmp, name, size="800x540", env_extra=None):
     sock_dir = tmp / name
     sock_dir.mkdir()
     os.chmod(sock_dir, 0o700)
     sock = sock_dir / "app.sock"
     env = {**os.environ, "SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy", **(env_extra or {})}
-    proc = subprocess.Popen([str(app_bin), "--size", size, "--socket", str(sock), "--control-stdin"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            bufsize=0, env=env, cwd=ROOT)
-    reader = base.DeadlineLineReader(proc.stdout)
-    assert reader.read_line("startup", timeout=10.0) == f"Listening {sock}"
+    proc, reader = launch([str(app_bin), "--size", size, "--socket", str(sock), "--control-stdin"],
+                          f"Listening {sock}", env=env)
     return proc, reader, sock
+
+
+def quit_and_check(proc, reader, name):
+    base.send_control(proc, reader, "quit")
+    status = proc.wait(timeout=10)
+    assert status == 0, f"{name} exited with status {status} after quit acknowledgement"
 
 
 def inspect(client_bin, sock, role):
@@ -56,6 +86,18 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="dagda-macos-shortcuts."))
     proc = None
     try:
+        # A host that prints a wrong readiness line and stays
+        # alive must be reaped by the failed start itself, not
+        # escape cleanup because start() never returned it.
+        wrong_src = "import sys, time; sys.stdout.write('wrong\\n'); sys.stdout.flush(); time.sleep(30)"
+        try:
+            launch([sys.executable, "-c", wrong_src], "Listening /nonexistent/app.sock", timeout=5.0)
+            raise AssertionError("wrong-line host should have failed startup validation")
+        except StartupFailure as exc:
+            assert "unexpected startup line" in str(exc), exc
+            assert exc.proc.poll() is not None, "wrong-line host was not reaped by the failed start"
+        print("[mac] wrong-line host reaped by failed startup")
+
         shared_bin, rect_bin, client_bin = tmp / "shared-text", tmp / "rect-app", tmp / "dagda-client"
         for src, out in [("examples/shared-text", shared_bin), ("examples/rect-app", rect_bin), ("examples/dagda-client", client_bin)]:
             subprocess.check_call([str(ODIN), "build", src, "-collection:dagda=.", f"-out:{out}"], cwd=ROOT)
@@ -85,8 +127,14 @@ def main():
         base.send_control(proc, reader, "key cmd+z")
         base.wait_for_role_text(client_bin, sock, "outline.title", "Ca")
         assert status(client_bin, sock).endswith("rev=4, undo=2, last_id=1, actions=0"), status(client_bin, sock)
-        base.send_control(proc, reader, "quit")
-        proc.wait(timeout=10)
+        # A second focused Command+Z undoes the cut itself and
+        # restores the exact decomposed bytes in both views.
+        base.send_control(proc, reader, "key cmd+z")
+        restored = base.wait_for_role_text(client_bin, sock, "outline.title", DECOMPOSED)
+        assert restored["elements"][0]["text"].encode("utf-8") == DECOMPOSED.encode("utf-8")
+        assert inspect(client_bin, sock, "canvas.title")["text"].encode("utf-8") == DECOMPOSED.encode("utf-8")
+        assert status(client_bin, sock).endswith("rev=5, undo=1, last_id=1, actions=0"), status(client_bin, sock)
+        quit_and_check(proc, reader, "shared-text")
         proc = None
         print("[mac] Command select/cut/paste/undo with decomposed text passed")
 
@@ -129,8 +177,7 @@ def main():
         _, again = base.run_client(client_bin, sock, "edits", "7")
         assert again["revision"] == 2, again
         assert inspect(client_bin, sock, "slide.rect")["canvas_bounds"] == original
-        base.send_control(proc, reader, "quit")
-        proc.wait(timeout=10)
+        quit_and_check(proc, reader, "rect-app")
         proc = None
         print("[mac] app-level Command+Z restored the committed rectangle exactly once")
         print("macos shortcuts process check passed (SDL dummy driver, injected SDL events, no physical IME)")
