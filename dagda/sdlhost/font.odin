@@ -237,16 +237,36 @@ font_add_fallback_face :: proc(font: ^Font, path: string) -> bool {
 			return false
 		}
 	}
-	cpath := strings.clone_to_cstring(path)
-	defer delete(cpath)
+	cpath_buf, cpath_err := make([]u8, len(path) + 1)
+	if cpath_err != nil || len(cpath_buf) != len(path) + 1 {
+		delete(cpath_buf)
+		return false
+	}
+	defer delete(cpath_buf)
+	copy(cpath_buf, path)
+	cpath_buf[len(path)] = 0
+	cpath := cstring(raw_data(cpath_buf))
 	face: FT_Face
 	if FT_New_Face(font.lib, cpath, 0, &face) != 0 {
 		return false
 	}
-	append(&font.fallbacks, Fallback_Face{
+	path_buf, path_err := make([]u8, len(path))
+	if path_err != nil || len(path_buf) != len(path) {
+		delete(path_buf)
+		FT_Done_Face(face)
+		return false
+	}
+	copy(path_buf, path)
+	cloned_path := string(path_buf)
+	prev_len := len(font.fallbacks)
+	if _, append_err := append(&font.fallbacks, Fallback_Face{
 		face = face,
-		path = strings.clone(path),
-	})
+		path = cloned_path,
+	}); append_err != nil || len(font.fallbacks) != prev_len + 1 {
+		delete(cloned_path)
+		FT_Done_Face(face)
+		return false
+	}
 	return true
 }
 

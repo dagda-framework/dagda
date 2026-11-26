@@ -3,6 +3,7 @@ package sdlhost
 import "core:bytes"
 import "core:c"
 import "core:math"
+import "core:mem"
 import "core:os"
 import "core:sync"
 import "core:testing"
@@ -378,4 +379,44 @@ test_font_fallback_mixed_caret_and_ime_anchor :: proc(t: ^testing.T) {
 	testing.expect(t, math.abs(com_cx - want_com_cx) < 0.001, "committed caret/IME anchor X must use resolved Hangul advance")
 
 	font_destroy_textures(&combined)
+}
+
+@(test)
+test_font_add_fallback_face_alloc_failure :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	primary_path, secondary_path, found := find_primary_and_hangul_pair()
+	if !testing.expect(t, found, "expected a Latin-only primary font and a Hangul-capable secondary font") {
+		return
+	}
+
+	font, ref_primary: Font
+	if !testing.expect(t, font_init_with_paths(&font, primary_path)) { return }
+	defer font_destroy(&font)
+	if !testing.expect(t, font_init_with_paths(&ref_primary, primary_path)) { return }
+	defer font_destroy(&ref_primary)
+
+	// 1. Failing fallbacks array growth must return false, leave zero fallbacks,
+	//    and release both the cloned path and FreeType face without leaking.
+	orig_fb_alloc := font.fallbacks.allocator
+	font.fallbacks.allocator = mem.nil_allocator()
+	testing.expect(t, !font_add_fallback_face(&font, secondary_path), "fallback addition must fail when array growth fails")
+	testing.expect_value(t, len(font.fallbacks), 0)
+	font.fallbacks.allocator = orig_fb_alloc
+
+	// 2. Failing path cloning must also return false with zero fallbacks and no leaks.
+	{
+		context.allocator = mem.nil_allocator()
+		testing.expect(t, !font_add_fallback_face(&font, secondary_path), "fallback addition must fail when path cloning fails")
+	}
+	testing.expect_value(t, len(font.fallbacks), 0)
+
+	// 3. Primary font remains fully functional after failed fallback additions.
+	px :: f32(20)
+	g_actual := font_get_glyph(&font, 'A', px)
+	g_ref := font_get_glyph(&ref_primary, 'A', px)
+	testing.expect(t, g_actual.width > 0 && g_actual.height > 0 && len(g_actual.alpha) > 0)
+	testing.expect(t, glyph_equal(g_actual, g_ref), "primary font must remain intact after failed fallback addition")
+	testing.expect_value(t, font_measure_width(&font, "Alpha", px), font_measure_width(&ref_primary, "Alpha", px))
 }
