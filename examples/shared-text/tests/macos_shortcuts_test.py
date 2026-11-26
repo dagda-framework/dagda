@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """macOS primary-shortcut process check (dummy video driver).
 
-Drives the shared-text window through the normal host event
-path with Command chords (control-stdin injects SDL key events
-carrying the GUI modifier; no physical IME is involved):
+Drives hosted windows through the normal host event path with
+Command chords (control-stdin injects SDL key events carrying
+the GUI modifier; no physical IME is involved): in shared-text,
 select and cut decomposed text, verify the exact UTF-8 on
-paste, undo to the original bytes with the app-owned revision
-and history, then exercise app-level undo in the worker app
-after focus moves away. Isolated SDL dummy clipboard only.
+paste, and undo to the original bytes with the app-owned
+revision and history; in rect-app, commit a rectangle edit
+through the client, verify Command+Shift+Z, a repeat-only
+Command+Z, and Control+Z leave it intact, then verify one
+Command+Z reaches the app-level undo hook exactly once.
+Isolated SDL dummy clipboard only.
 """
 import json
 import os
@@ -53,8 +56,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="dagda-macos-shortcuts."))
     proc = None
     try:
-        shared_bin, worker_bin, client_bin = tmp / "shared-text", tmp / "worker-rebuild", tmp / "dagda-client"
-        for src, out in [("examples/shared-text", shared_bin), ("examples/worker-rebuild", worker_bin), ("examples/dagda-client", client_bin)]:
+        shared_bin, rect_bin, client_bin = tmp / "shared-text", tmp / "rect-app", tmp / "dagda-client"
+        for src, out in [("examples/shared-text", shared_bin), ("examples/rect-app", rect_bin), ("examples/dagda-client", client_bin)]:
             subprocess.check_call([str(ODIN), "build", src, "-collection:dagda=.", f"-out:{out}"], cwd=ROOT)
 
         proc, reader, sock = start(shared_bin, client_bin, tmp, "shared")
@@ -87,29 +90,49 @@ def main():
         proc = None
         print("[mac] Command select/cut/paste/undo with decomposed text passed")
 
-        # App-level undo after focus moves away (worker fixture).
-        proc, reader, sock = start(worker_bin, client_bin, tmp, "worker")
-        field = inspect(client_bin, sock, "worker.field")
-        fb = field["bounds"]
-        base.send_control(proc, reader, f"click {fb['x'] + fb['width'] - 5:.2f} {fb['y'] + fb['height'] / 2:.2f}")
-        base.send_control(proc, reader, "text X")
-        assert inspect(client_bin, sock, "worker.field")["text"] == "FieldX"
-        label = inspect(client_bin, sock, "worker.label")
-        lb = label["bounds"]
-        base.send_control(proc, reader, f"click {lb['x'] + 20:.2f} {lb['y'] + lb['height'] / 2:.2f}")
+        # App-level undo (rect-app fixture): a rectangle edit
+        # committed through the client is undone by the app's
+        # on_undo hook, which no focused field owns.
+        proc, reader, sock = start(rect_bin, client_bin, tmp, "rect", size="1200x540")
+        _, edits = base.run_client(client_bin, sock, "edits", "7")
+        assert edits == {"ok": True, "id": 7, "revision": 0,
+                         "edits": [{"name": "set_rect", "argument": "rect"}]}, edits
+        original = inspect(client_bin, sock, "slide.rect")["canvas_bounds"]
+        assert original == {"x": 72, "y": 240, "width": 360, "height": 180}, original
+        frac = ("120.5", "180.25", "300.75", "150.5")
+        _, done = base.run_client(client_bin, sock, "commit", "7", "set_rect", "0", "rect", *frac)
+        assert done == {"ok": True, "id": 7, "edit": "set_rect", "revision": 1}, done
+        committed = inspect(client_bin, sock, "slide.rect")["canvas_bounds"]
+        assert committed == {"x": 120.5, "y": 180.25, "width": 300.75, "height": 150.5}, committed
+
+        # Shifted, repeat-only, and non-primary Control chords
+        # must not reach the app-level undo hook.
+        for chord in ["cmd+shift+z", "cmd+z+repeat", "ctrl+z"]:
+            base.send_control(proc, reader, f"key {chord}")
+            assert inspect(client_bin, sock, "slide.rect")["canvas_bounds"] == committed, chord
+            _, kept = base.run_client(client_bin, sock, "edits", "7")
+            assert kept["revision"] == 1, (chord, kept)
+
+        # One initial Command+Z undoes exactly once.
         base.send_control(proc, reader, "key cmd+z")
         deadline = time.monotonic() + 5
-        text = None
+        bounds = None
         while time.monotonic() < deadline:
-            text = inspect(client_bin, sock, "worker.field")["text"]
-            if text == "Field":
+            bounds = inspect(client_bin, sock, "slide.rect")["canvas_bounds"]
+            if bounds == original:
                 break
             time.sleep(0.02)
-        assert text == "Field", text
+        assert bounds == original, bounds
+        _, after = base.run_client(client_bin, sock, "edits", "7")
+        assert after["revision"] == 2, after
+        base.send_control(proc, reader, "key cmd+z")
+        _, again = base.run_client(client_bin, sock, "edits", "7")
+        assert again["revision"] == 2, again
+        assert inspect(client_bin, sock, "slide.rect")["canvas_bounds"] == original
         base.send_control(proc, reader, "quit")
         proc.wait(timeout=10)
         proc = None
-        print("[mac] app-level Command+Z after focus moved away passed")
+        print("[mac] app-level Command+Z restored the committed rectangle exactly once")
         print("macos shortcuts process check passed (SDL dummy driver, injected SDL events, no physical IME)")
         return 0
     finally:
