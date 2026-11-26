@@ -2,6 +2,8 @@ name: Native IME hosted attempt (temporary)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/macos-native-composition]
 
 jobs:
   hosted-attempt:
