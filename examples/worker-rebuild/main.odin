@@ -7,6 +7,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import "dagda:dagda"
+import driver "dagda:dagda/driver"
 import "dagda:dagda/sdlhost"
 import sdl "vendor:sdl3"
 
@@ -45,6 +46,17 @@ State :: struct {
 	stale_path:    string,
 	mode:          string,
 	worker:        ^thread.Thread,
+	targets_storage: [2]dagda.Object_Id,
+	targets:         []dagda.Object_Id,
+	edit_storage:    [2]dagda.Advertised_Edit,
+	edit_decls:      []dagda.Advertised_Edit,
+	other_rev:       dagda.Revision,
+	last_commit_id:  dagda.Object_Id,
+	enable_b:        bool,
+	enable_applied:  bool,
+	generation:      int,
+	commits_a:       int,
+	commits_b:       int,
 	present_count: int,
 	posted_count:  int,
 	gate_armed:    bool,
@@ -81,6 +93,15 @@ wait_for_file :: proc(s: ^State, path: string) {
 app_view :: proc(user_data: rawptr) -> dagda.View {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
+	// Host-thread refresh of the borrowed slots: once the
+	// worker-published flag is seen, write both arrays here,
+	// on the host thread, and mark this generation built.
+	if s.enable_b && !s.enable_applied {
+		s.targets_storage[1] = 3
+		s.edit_storage[1] = {object_id = 3, edit = "rename", argument = .Text}
+		s.enable_applied = true
+		s.generation += 1
+	}
 	label := fmt.bprintf(s.built_label[:], "%s", s.label)
 	s.built_len = len(label)
 	s.builder_tid = u64(sdl.GetCurrentThreadID())
@@ -107,7 +128,7 @@ app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
 	s.present_count += 1
-	text := fmt.tprintf("present count=%d label=%q other=%q builder=%d host=%d\n", s.present_count, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
+	text := fmt.tprintf("present count=%d gen=%d commitsA=%d commitsB=%d label=%q other=%q builder=%d host=%d\n", s.present_count, s.generation, s.commits_a, s.commits_b, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -192,6 +213,18 @@ worker_main :: proc(data: rawptr) {
 			trigger := string(data_bytes)
 			if trigger != last {
 				last = trigger
+				if trigger == "enable-b" {
+					if delay_text, has_delay := os.lookup_env("WORKER_DELAY_MS", context.temp_allocator); has_delay {
+						delay_ms := 0
+						for ch in delay_text { delay_ms = delay_ms * 10 + int(ch - '0') }
+						time.sleep(time.Duration(delay_ms) * time.Millisecond)
+					}
+					sync.mutex_lock(&s.mu)
+					s.enable_b = true
+					sync.mutex_unlock(&s.mu)
+					_ = sdlhost.request_rebuild(s.handle)
+					continue
+				}
 				if trigger == "snap" {
 					sync.mutex_lock(&s.mu)
 					s.snap_armed = true
@@ -275,16 +308,50 @@ app_ready :: proc(user_data: rawptr, handle: sdlhost.Rebuild_Handle) {
 
 field_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
 	s := (^State)(user_data)
-	if id != 2 || new_text == s.field {
-		return false
-	}
 	sync.mutex_lock(&s.mu)
-	delete(s.field_hist)
-	s.field_hist = s.field
-	s.has_hist = true
-	s.field = strings.clone(new_text)
-	sync.mutex_unlock(&s.mu)
-	return true
+	defer sync.mutex_unlock(&s.mu)
+	if id == 2 && new_text != s.field {
+		delete(s.field_hist)
+		s.field_hist = s.field
+		s.has_hist = true
+		s.field = strings.clone(new_text)
+		s.last_commit_id = id
+		s.commits_a += 1
+		return true
+	}
+	if id == 3 && new_text != s.other {
+		delete(s.other)
+		s.other = strings.clone(new_text)
+		s.other_rev += 1
+		s.last_commit_id = id
+		s.commits_b += 1
+		return true
+	}
+	return false
+}
+
+state_edit_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+	s := (^State)(user_data)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
+	if target.id != 3 {
+		return .Unknown_Object
+	}
+	if target.base_revision != s.other_rev {
+		return .Stale_Revision
+	}
+	delete(s.other)
+	s.other = strings.clone(arg.text)
+	s.other_rev += 1
+	return .Applied
+}
+
+state_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+	s := (^State)(user_data)
+	if id == 3 {
+		return s.other_rev, true
+	}
+	return 0, false
 }
 
 field_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
@@ -319,6 +386,13 @@ main :: proc() {
 		delete(state.field_hist)
 	}
 
+	state.targets_storage = {2, 999}
+	state.targets = state.targets_storage[:]
+	state.edit_storage = {
+		{object_id = 2, edit = "rename", argument = .Text},
+		{object_id = 999, edit = "rename", argument = .Text},
+	}
+	state.edit_decls = state.edit_storage[:]
 	opts, ok := sdlhost.parse_cli_args(os.args[1:])
 	if !ok {
 		fmt.eprintln("usage: worker-rebuild [--socket <socket-path>] [--control-stdin]")
@@ -335,6 +409,8 @@ main :: proc() {
 		on_ready       = app_ready,
 		on_present     = app_present,
 		text_edit      = {enabled = true, target_id = 2, on_commit = field_commit, on_undo = field_undo},
+		editable_text_targets = state.targets,
+		edits          = driver.Edit_Source{edits = state.edit_decls, handler = state_edit_handle, user_data = &state, revision_of = state_revision},
 	}
 	code := sdlhost.run(app, opts)
 	// A request issued after the window has closed must be safe.

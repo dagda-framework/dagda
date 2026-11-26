@@ -120,6 +120,26 @@ class App:
         self.proc.wait(timeout=10)
 
 
+def commit_counts(text):
+    import re as _re
+    a = _re.search(r"commitsA=(\d+)", text)
+    b = _re.search(r"commitsB=(\d+)", text)
+    return (int(a.group(1)) if a else -1, int(b.group(1)) if b else -1)
+
+
+def field_preedit_hits(app, shot):
+    # Count preedit pixels within A's current inspected bounds,
+    # reacquiring the bounds for the matching capture if a
+    # resize moved them between inspect and screenshot.
+    for _ in range(3):
+        bounds = app.inspect("worker.field")["bounds"]
+        app.control(f"screenshot {shot}")
+        after = app.inspect("worker.field")["bounds"]
+        if bounds == after:
+            return count_preedit_pixels(shot, bounds), bounds
+    raise AssertionError("field bounds kept changing across captures")
+
+
 def count_preedit_pixels(path, bounds):
     data = Path(path).read_bytes()
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -212,8 +232,7 @@ def main():
         # worker presentation, before sending any final text.
         # If a rebuild cancelled the composition, this fails.
         shot = app.dir / "after-worker.png"
-        app.control(f"screenshot {shot}")
-        hits = count_preedit_pixels(shot, fb)
+        hits, _field_bounds = field_preedit_hits(app, shot)
         assert hits >= 20, f"composition was lost across the worker rebuild (preedit pixels={hits})"
         print(f"[2] composing field/preedit still active after worker presentation (preedit pixels={hits})")
         # Finish the composition normally at the intended place.
@@ -259,6 +278,76 @@ def main():
         print(f"[1c] snapshot ordering presented 101 (present count {present_count(burst)})")
         burst.quit()
         apps.remove(burst)
+
+        # 2b. Borrowed slices refreshed in place: B starts with
+        # no rename edit and is not editable. While A composes,
+        # a worker publishes the enable-B flag and requests a
+        # rebuild; B's edit becomes discoverable, A's session
+        # finishes at its original selection, then B edits.
+        mut = App(app_bin, client_bin, tmp, "mutate", {"WORKER_MODE": "request"})
+        apps.append(mut)
+        r = subprocess.run([str(client_bin), str(mut.sock), "edits", "3"], capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0 and json.loads(r.stdout)["edits"] == [], r.stdout  # no rename edit for B yet
+        field_b = mut.inspect("worker.other")
+        bb = field_b["bounds"]
+        mut.control(f"click {bb['x'] + bb['width'] - 5:.2f} {bb['y'] + bb['height'] / 2:.2f}")
+        mut.control("text Z")
+        assert mut.inspect("worker.other")["text"] == "other 0"
+        fa = mut.inspect("worker.field")["bounds"]
+        mut.control(f"click {fa['x'] + fa['width'] - 5:.2f} {fa['y'] + fa['height'] / 2:.2f}")
+        mut.control("key shift+left")
+        mut.control("preedit X")
+        mut.fire("enable-b")
+        # Wait, under one monotonic deadline, for the built
+        # generation to be presented before asking the client
+        # for B's edits or sending further input. A successful
+        # response with an empty edits list is the old state.
+        deadline = time.monotonic() + 10
+        generation = 0
+        while time.monotonic() < deadline:
+            if mut.present.exists():
+                present_now = mut.present.read_text()
+                if "gen=" in present_now:
+                    generation = int(present_now.split("gen=", 1)[1].split()[0])
+                    if generation >= 1:
+                        break
+            time.sleep(0.02)
+        assert generation >= 1, "enable-B generation was never presented"
+        discovered = None
+        while time.monotonic() < deadline:
+            rr = subprocess.run([str(client_bin), str(mut.sock), "edits", "3"], capture_output=True, text=True, timeout=10)
+            if rr.returncode == 0 and json.loads(rr.stdout)["edits"]:
+                discovered = json.loads(rr.stdout)
+                break
+            time.sleep(0.02)
+        assert discovered is not None and discovered["edits"] == [{"name": "rename", "argument": "text"}], discovered
+        # A is still visibly composing after B became discoverable.
+        shot_mut = mut.dir / "composing-after-enable.png"
+        hits_mut, current_a = field_preedit_hits(mut, shot_mut)
+        assert hits_mut >= 20, f"A stopped composing after the enable-B rebuild (preedit pixels={hits_mut}, bounds={current_a})"
+        mut.control("key enter")
+        mut.control("text Y")
+        assert mut.wait_text("worker.field", "FielY")["text"] == "FielY"
+        mut.control(f"click {bb['x'] + bb['width'] - 5:.2f} {bb['y'] + bb['height'] / 2:.2f}")
+        mut.control("text !")
+        assert mut.wait_text("worker.other", "other 0!")["text"] == "other 0!"
+        assert mut.inspect("worker.field")["text"] == "FielY"
+        # Bound the wait for the final presented B text, then
+        # check both commit counts as complete integers on that
+        # same presentation record.
+        count_deadline = time.monotonic() + 5
+        final_present = ""
+        while time.monotonic() < count_deadline:
+            final_present = mut.present.read_text() if mut.present.exists() else ""
+            if 'other="other 0!"' in final_present:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"final presented B text never appeared; last presentation record: {final_present}")
+        assert commit_counts(final_present) == (1, 1), final_present
+        print("[2b] in-place slice refresh: B edit discovered during A composition; both fields typed correctly")
+        mut.quit()
+        apps.remove(mut)
 
         # 3. Negative control: publish without requesting stays stale.
         neg = App(app_bin, client_bin, tmp, "negative", {"WORKER_MODE": "publish"})
