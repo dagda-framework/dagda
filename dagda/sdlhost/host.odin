@@ -906,12 +906,15 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		}
 
 		if running && srv.active {
+			prev_host := dispatch_host
+			dispatch_host = &h
 			applied, rebuild_failed: bool
 			if h.app.edits.handler != nil {
 				applied, rebuild_failed = driver.server_poll_edits(&srv, &h.frame, h.app.handle, h.app.user_data, h.app.edits, &h, host_rebuild_cb)
 			} else {
 				applied, rebuild_failed = driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb)
 			}
+			dispatch_host = prev_host
 			if rebuild_failed {
 				exit_code = 1
 				running = false

@@ -31,6 +31,34 @@ Text_Edit_State :: struct {
 	session:   dagda.Text_Session,
 }
 
+// Active_Composition identifies which visual field in the current host window
+// has an active IME preedit, using an explicit active flag because
+// Object_Id(0) is a valid element ID.
+Active_Composition :: struct {
+	active:   bool,
+	field_id: dagda.Object_Id,
+}
+
+@(private="package", thread_local)
+dispatch_host: ^Host
+
+@(private="package")
+host_active_composition :: proc(h: ^Host) -> Active_Composition {
+	if h != nil && h.text_edit.focused && dagda.is_composing(&h.text_edit.session) {
+		return {active = true, field_id = h.text_edit.active_id}
+	}
+	return {}
+}
+
+// current_composition reports which visual field in the dispatching host window
+// currently has an active IME composition. Outside dispatch, it returns an
+// inactive Active_Composition{active = false, field_id = 0}. Intended for an
+// app's external Edit_Handler to decide whether an incoming edit conflicts with
+// live user composition.
+current_composition :: proc() -> Active_Composition {
+	return host_active_composition(dispatch_host)
+}
+
 text_edit_is_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_Id, id: dagda.Object_Id) -> bool {
 	if !cfg.enabled {
 		return false

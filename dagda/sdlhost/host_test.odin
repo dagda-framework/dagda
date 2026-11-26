@@ -1624,6 +1624,55 @@ test_tab_traverses_editable_fields_and_buttons_skips_passive_and_preserves_id_an
 }
 
 @(test)
+test_active_composition_query_distinguishes_none_and_id_zero :: proc(t: ^testing.T) {
+	els := [2]dagda.Canvas_Element{
+		{info = {id = 0, role = "a.outline"}, kind = .Label, text = "Alpha", bounds = {x = 40, y = 40, width = 300, height = 50}},
+		{info = {id = 1, role = "a.canvas"}, kind = .Label, text = "Alpha", bounds = {x = 400, y = 40, width = 300, height = 50}},
+	}
+	editable := [2]dagda.Object_Id{0, 1}
+	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = els[:]}, {width = 800, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	h: Host
+	h.frame = frame
+	h.app = App{
+		text_edit             = {enabled = true},
+		editable_text_targets = editable[:],
+	}
+	defer text_edit_destroy(&h.text_edit)
+
+	// No composition -> active=false.
+	testing.expect_value(t, host_active_composition(&h), Active_Composition{active = false, field_id = 0})
+
+	// Focus ID 0 without preedit -> still active=false.
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, nil, h.frame, h.app.text_edit, 0, editable[:]))
+	testing.expect_value(t, host_active_composition(&h), Active_Composition{active = false, field_id = 0})
+
+	// Start preedit in ID 0 -> active=true, field_id=0 (explicitly distinct from no composition).
+	pre: sdl.Event
+	pre.type = .TEXT_EDITING
+	pre.edit.text = "e"
+	pre.edit.start = 0
+	pre.edit.length = 1
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, nil, &pre, editable[:])
+	testing.expect_value(t, host_active_composition(&h), Active_Composition{active = true, field_id = 0})
+
+	// During dispatch scope, current_composition() returns the window's active composition.
+	prev := dispatch_host
+	dispatch_host = &h
+	defer { dispatch_host = prev }
+	testing.expect_value(t, current_composition(), Active_Composition{active = true, field_id = 0})
+
+	// Cancel composition -> active=false again.
+	esc: sdl.Event
+	esc.type = .KEY_DOWN
+	esc.key.key = sdl.K_ESCAPE
+	_ = text_edit_handle_event(&h.text_edit, nil, nil, h.frame, h.app.text_edit, nil, &esc, editable[:])
+	testing.expect_value(t, current_composition(), Active_Composition{active = false, field_id = 0})
+}
+
+@(test)
 test_canvas_editable_text_click_places_caret_at_two_viewports :: proc(t: ^testing.T) {
 	font: Font
 	if !font_init(&font) {
