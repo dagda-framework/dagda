@@ -64,7 +64,7 @@ doc_ptr :: proc(app: ^Conflict_App, which: Doc_Target) -> ^Title_Doc {
 }
 
 doc_commit_text :: proc(d: ^Title_Doc, new_text: string) -> bool {
-	if new_text == d.text {
+	if !dagda.valid_single_line(new_text) || new_text == d.text {
 		return false
 	}
 	cloned, err := strings.clone(new_text)

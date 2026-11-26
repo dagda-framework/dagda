@@ -341,13 +341,28 @@ def main() -> int:
         wait_for_role_text(client_bin, sock, "a.canvas", "Agent Alpha")
         wait_for_role_text(client_bin, sock, "conflict.status", "a_rev=3, a_undo=2, b_rev=2, b_undo=1")
 
+        # Step 6: Newline rename "A\nB" is rejected with text, revision, and undo depth intact;
+        # subsequent keyboard "Q" commits once.
+        c6, r6 = run_client(client_bin, sock, "commit", str(a_out_id), "rename", "3", "text", "A\nB")
+        assert c6 != 0 and r6 == {"ok": False, "error": "Not_Handled"}, (c6, r6)
+        wait_for_role_text(client_bin, sock, "a.outline", "Agent Alpha")
+        wait_for_role_text(client_bin, sock, "a.canvas", "Agent Alpha")
+        wait_for_role_text(client_bin, sock, "conflict.status", "a_rev=3, a_undo=2, b_rev=2, b_undo=1")
+
+        send_control(proc, reader, "key end")
+        send_control(proc, reader, "text Q")
+        wait_for_role_text(client_bin, sock, "a.outline", "Agent AlphaQ")
+        wait_for_role_text(client_bin, sock, "a.canvas", "Agent AlphaQ")
+        wait_for_role_text(client_bin, sock, "conflict.status", "a_rev=4, a_undo=3, b_rev=2, b_undo=1")
+
         print(
             f"[conflict] requested=960x540 captured={png_w}x{png_h} preedit=(bg={pre_bg0},uline_w={uline0}):\n"
-            f"  step1 preview: {json.dumps(r1)}\n"
-            f"  step2 stale:   {json.dumps(r2)}\n"
-            f"  step3 busy:    {json.dumps(r3)}\n"
-            f"  step4 b_edit:  {json.dumps(r4)} -> a_finish='Alpha é' (a_rev=2,a_undo=1)\n"
-            f"  step5 retry:   {json.dumps(r5)} -> 'Agent Alpha' (a_rev=3,a_undo=2)"
+            f"  step1 preview:  {json.dumps(r1)}\n"
+            f"  step2 stale:    {json.dumps(r2)}\n"
+            f"  step3 busy:     {json.dumps(r3)}\n"
+            f"  step4 b_edit:   {json.dumps(r4)} -> a_finish='Alpha é' (a_rev=2,a_undo=1)\n"
+            f"  step5 retry:    {json.dumps(r5)} -> 'Agent Alpha' (a_rev=3,a_undo=2)\n"
+            f"  step6 newline:  {json.dumps(r6)} -> key 'Q' -> 'Agent AlphaQ' (a_rev=4,a_undo=3)"
         )
 
         send_control(proc, reader, "quit")

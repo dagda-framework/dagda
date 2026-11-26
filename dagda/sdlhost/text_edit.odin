@@ -39,9 +39,10 @@ Active_Composition :: struct {
 	field_id: dagda.Object_Id,
 }
 
-@(thread_local)
+@(private="package", thread_local)
 dispatch_host: ^Host
 
+@(private="package")
 host_active_composition :: proc(h: ^Host) -> Active_Composition {
 	if h != nil && h.text_edit.focused && dagda.is_composing(&h.text_edit.session) {
 		return {active = true, field_id = h.text_edit.active_id}
@@ -50,9 +51,10 @@ host_active_composition :: proc(h: ^Host) -> Active_Composition {
 }
 
 // current_composition reports which visual field in the dispatching host window
-// currently has an active IME composition. Intended for an app's external
-// Edit_Handler to decide whether an incoming edit conflicts with live user
-// composition.
+// currently has an active IME composition. Outside dispatch, it returns an
+// inactive Active_Composition{active = false, field_id = 0}. Intended for an
+// app's external Edit_Handler to decide whether an incoming edit conflicts with
+// live user composition.
 current_composition :: proc() -> Active_Composition {
 	return host_active_composition(dispatch_host)
 }

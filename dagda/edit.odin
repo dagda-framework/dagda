@@ -93,9 +93,9 @@ Edit_Result :: enum {
 	Unknown_Edit,
 	Wrong_Argument,
 	Stale_Revision,
-	Busy_Composing,
 	Alloc_Failed,
 	Not_Handled,
+	Busy_Composing,
 }
 
 // An owned preview of a proposed edit: both the edit name and
