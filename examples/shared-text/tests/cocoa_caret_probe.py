@@ -28,6 +28,7 @@ Input path:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -76,9 +77,33 @@ class DeadlineLineReader:
             self.buf.extend(chunk)
 
 
-def stop_process(proc: subprocess.Popen | None) -> None:
+def drain_stderr_nonblocking(stream) -> str:
+    """Read any bytes immediately available on stream without blocking for EOF."""
+    if stream is None:
+        return ""
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError):
+        return ""
+    buf = bytearray()
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0.0)
+        if not ready:
+            break
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return buf.decode("utf-8", errors="replace")
+
+
+def stop_process(proc: subprocess.Popen | None) -> str:
+    """Terminate and reap proc, draining any buffered stderr without blocking."""
     if proc is None:
-        return
+        return ""
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -86,12 +111,84 @@ def stop_process(proc: subprocess.Popen | None) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+    stderr_out = drain_stderr_nonblocking(proc.stderr)
     for stream in (proc.stdin, proc.stdout, proc.stderr):
         if stream is not None:
             try:
                 stream.close()
             except OSError:
                 pass
+    return stderr_out
+
+
+def wait_for_startup(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    sock: Path,
+    timeout: float = 10.0,
+    err_stream=None,
+) -> str:
+    """Wait for the host's startup readiness line; on failure, terminate and reap
+    the child immediately and drain stderr non-blockingly before re-raising.
+    """
+    try:
+        ready = reader.read_line("shared-text startup", timeout=timeout)
+    except Exception:
+        stderr_out = stop_process(proc)
+        if stderr_out:
+            target = sys.stderr if err_stream is None else err_stream
+            print(f"STARTUP_STDERR:\n{stderr_out}", file=target)
+        raise
+    assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+    return ready
+
+
+def verify_startup_timeout_bounded() -> None:
+    """Regression: a child that writes a partial stdout line and stderr then
+    stays alive past the readiness deadline must fail promptly, preserve the
+    stage and partial-line diagnostic, and be terminated and reaped.
+    """
+    child_code = (
+        "import sys, time\n"
+        "sys.stdout.write('Listen'); sys.stdout.flush()\n"
+        "sys.stderr.write('startup stalled\\n'); sys.stderr.flush()\n"
+        "time.sleep(15)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    pid = proc.pid
+    assert proc.stdout is not None
+    reader = DeadlineLineReader(proc.stdout)
+    diag = io.StringIO()
+    start = time.monotonic()
+    err: TimeoutError | None = None
+    try:
+        try:
+            wait_for_startup(proc, reader, Path("/tmp/unused.sock"), timeout=0.3, err_stream=diag)
+        except TimeoutError as exc:
+            err = exc
+    finally:
+        stop_process(proc)
+    elapsed = time.monotonic() - start
+    assert err is not None, "expected TimeoutError for stalled startup child"
+    msg = str(err)
+    assert "shared-text startup" in msg, f"missing stage in error: {msg!r}"
+    assert "b'Listen'" in msg, f"missing partial-line diagnostic in error: {msg!r}"
+    assert "startup stalled" in diag.getvalue(), f"missing stderr diagnostic: {diag.getvalue()!r}"
+    assert elapsed < 2.0, f"startup timeout was not bounded (elapsed={elapsed:.2f}s)"
+    assert proc.poll() is not None, f"child pid {pid} was not reaped"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError(f"child pid {pid} is still alive after startup timeout")
+    print(f"[startup-timeout] bounded failure in {elapsed:.2f}s, child pid {pid} reaped, diagnostics preserved")
 
 
 def paeth(a: int, b: int, c: int) -> int:
@@ -385,6 +482,8 @@ def main() -> int:
     subprocess.check_call([str(ODIN), "build", "examples/shared-text", "-collection:dagda=.", f"-out:{app_bin}"], cwd=ROOT)
     subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
 
+    verify_startup_timeout_bounded()
+
     sock_dir = Path(tempfile.mkdtemp(prefix="dagda-cocoa-caret."))
     os.chmod(sock_dir, 0o700)
     sock = sock_dir / "shared.sock"
@@ -400,13 +499,7 @@ def main() -> int:
         )
         assert proc.stdout is not None
         reader = DeadlineLineReader(proc.stdout)
-        try:
-            ready = reader.read_line("shared-text startup", timeout=10.0)
-        except Exception:
-            stderr_out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
-            print(f"STARTUP_STDERR:\n{stderr_out}", file=sys.stderr)
-            raise
-        assert ready == f"Listening {sock}", f"unexpected startup: {ready!r}"
+        wait_for_startup(proc, reader, sock, timeout=10.0)
 
         # Settle initial window dimensions.
         init_png = capture_dir / "00-init.png"
