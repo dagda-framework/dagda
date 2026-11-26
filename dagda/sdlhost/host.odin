@@ -281,8 +281,23 @@ canvas_clip_rect :: proc(fitted: sdl.FRect) -> sdl.Rect {
 	}
 }
 
+// host_render_scale derives the logical-point-to-output-pixel scale for r from
+// the current renderer output size and logical viewport dimensions.
+host_render_scale :: proc(h: ^Host) -> (scale_x: f32, scale_y: f32) {
+	if h == nil || h.renderer == nil || h.viewport.width <= 0 || h.viewport.height <= 0 {
+		return 1, 1
+	}
+	out_w, out_h: c.int
+	if !sdl.GetCurrentRenderOutputSize(h.renderer, &out_w, &out_h) || out_w <= 0 || out_h <= 0 {
+		return 1, 1
+	}
+	return f32(out_w) / h.viewport.width, f32(out_h) / h.viewport.height
+}
+
 host_draw :: proc(h: ^Host) {
 	r := h.renderer
+	scale_x, scale_y := host_render_scale(h)
+	_ = sdl.SetRenderScale(r, scale_x, scale_y)
 	if h.frame.has_canvas {
 		// Distinct dark letterbox background outside the fitted canvas.
 		sdl.SetRenderDrawColor(r, 14, 16, 22, 255)

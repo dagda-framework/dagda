@@ -4014,3 +4014,162 @@ test_parse_move_window_args_bounds :: proc(t: ^testing.T) {
 	_, _, ok = parse_move_window_args("100")
 	testing.expect(t, !ok)
 }
+
+@(test)
+test_host_draw_scales_to_2x_output_surface :: proc(t: ^testing.T) {
+	sync.mutex_guard(&sdl_test_mu)
+	if !sdl.Init({.VIDEO}) {
+		testing.fail_now(t, "SDL_Init failed")
+	}
+	defer sdl.Quit()
+
+	HiDPI_State :: struct {
+		title:    string,
+		elements: [2]dagda.Canvas_Element,
+	}
+	hidpi_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^HiDPI_State)(user_data)
+		s.elements = {
+			{
+				info   = {id = 2, role = "canvas.title"},
+				kind   = .Label,
+				text   = s.title,
+				bounds = {x = 80, y = 200, width = 640, height = 80},
+			},
+			{
+				info   = {id = 3, role = "canvas.narrow"},
+				kind   = .Label,
+				text   = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+				bounds = {x = 80, y = 320, width = 160, height = 64},
+			},
+		}
+		return {
+			size     = {width = 960, height = 540},
+			elements = s.elements[:],
+		}
+	}
+
+	read_rgb :: proc(surf: ^sdl.Surface, x, y: i32) -> [3]u8 {
+		r, g, b, a: u8
+		ok := sdl.ReadSurfacePixel(surf, c.int(x), c.int(y), &r, &g, &b, &a)
+		assert(ok)
+		return {r, g, b}
+	}
+
+	find_amber_caret_col :: proc(surf: ^sdl.Surface, bounds: dagda.Rect, scale: f32) -> (col: i32, found: bool) {
+		x0 := max(i32(0), i32(math.floor(bounds.x * scale)) + 2)
+		x1 := min(i32(surf.w), i32(math.ceil((bounds.x + bounds.width) * scale)) - 2)
+		y0 := max(i32(0), i32(math.floor(bounds.y * scale)) + 4)
+		y1 := min(i32(surf.h), i32(math.floor((bounds.y + bounds.height * 0.65) * scale)))
+		for x := x0; x < x1; x += 1 {
+			hits := 0
+			for y := y0; y < y1; y += 1 {
+				rgb := read_rgb(surf, x, y)
+				if abs(int(rgb[0]) - 255) <= 10 && abs(int(rgb[1]) - 206) <= 10 && abs(int(rgb[2]) - 84) <= 10 {
+					hits += 1
+				}
+			}
+			if hits >= 12 {
+				return x, true
+			}
+		}
+		return -1, false
+	}
+
+	state := HiDPI_State{
+		title = "Cafe\u0301 Slide Title",
+	}
+	editable_ids := [2]dagda.Object_Id{2, 3}
+
+	surf1 := sdl.CreateSurface(1600, 1080, .ABGR8888)
+	testing.expect(t, surf1 != nil)
+	defer sdl.DestroySurface(surf1)
+	ren1 := sdl.CreateSoftwareRenderer(surf1)
+	testing.expect(t, ren1 != nil)
+	defer sdl.DestroyRenderer(ren1)
+
+	h: Host
+	h.app = {
+		user_data             = &state,
+		canvas                = hidpi_canvas,
+		text_edit             = {enabled = true, target_id = 2},
+		editable_text_targets = editable_ids[:],
+	}
+	h.renderer = ren1
+	h.viewport = {width = 800, height = 540}
+	testing.expect(t, font_init(&h.font))
+	defer font_destroy(&h.font)
+	defer font_destroy_textures(&h.font)
+	defer text_edit_destroy(&h.text_edit)
+	defer dagda.frame_destroy(&h.frame)
+
+	testing.expect(t, host_rebuild_frame(&h))
+	el1, ok_el1 := dagda.find(h.frame, 2)
+	testing.expect(t, ok_el1)
+	text_x1, _, px1 := text_edit_layout(h.frame, el1.bounds)
+	w_caf1 := font_measure_width(&h.font, "Caf", px1)
+	expected_caret1 := text_x1 + w_caf1
+	_ = text_edit_click_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 2, expected_caret1 + 1.0, editable_ids[:])
+
+	// Draw without setting any scale in the test; host_draw must derive 2x itself.
+	host_draw(&h)
+
+	cap1 := sdl.RenderReadPixels(h.renderer, nil)
+	testing.expect(t, cap1 != nil)
+	defer sdl.DestroySurface(cap1)
+	testing.expect_value(t, cap1.w, c.int(1600))
+	testing.expect_value(t, cap1.h, c.int(1080))
+
+	// Sheet pixel (1200, 540) must be canvas sheet (26, 31, 42), while letterbox (1200, 40) & (1200, 1040) must be (14, 16, 22).
+	testing.expect_value(t, read_rgb(cap1, 1200, 540), [3]u8{26, 31, 42})
+	testing.expect_value(t, read_rgb(cap1, 1200, 40), [3]u8{14, 16, 22})
+	testing.expect_value(t, read_rgb(cap1, 1200, 1040), [3]u8{14, 16, 22})
+
+	// Caret must appear at ~2x logical caret X (around column 222), not at 1x (~111).
+	caret_col1, found_caret1 := find_amber_caret_col(cap1, el1.bounds, 2.0)
+	testing.expect(t, found_caret1)
+	if found_caret1 {
+		testing.expect(t, math.abs(f32(caret_col1) / 2.0 - expected_caret1) <= 2.0)
+	}
+
+	// Field clip at 2x: the narrow overflowing field (id=3) must not paint white glyph pixels to its right.
+	narrow1, ok_n1 := dagda.find(h.frame, 3)
+	testing.expect(t, ok_n1)
+	right_outside_x := i32(math.ceil((narrow1.bounds.x + narrow1.bounds.width) * 2.0)) + 8
+	narrow_mid_y := i32(math.floor((narrow1.bounds.y + narrow1.bounds.height * 0.5) * 2.0))
+	testing.expect_value(t, read_rgb(cap1, right_outside_x, narrow_mid_y), [3]u8{26, 31, 42})
+
+	// Resize to 640x480 logical points on a 1280x960 (2x) backing surface and verify scale updates cleanly.
+	font_destroy_textures(&h.font)
+	surf2 := sdl.CreateSurface(1280, 960, .ABGR8888)
+	testing.expect(t, surf2 != nil)
+	defer sdl.DestroySurface(surf2)
+	ren2 := sdl.CreateSoftwareRenderer(surf2)
+	testing.expect(t, ren2 != nil)
+	defer sdl.DestroyRenderer(ren2)
+
+	h.renderer = ren2
+	h.viewport = {width = 640, height = 480}
+	testing.expect(t, host_rebuild_frame(&h))
+	el2, ok_el2 := dagda.find(h.frame, 2)
+	testing.expect(t, ok_el2)
+	text_x2, _, px2 := text_edit_layout(h.frame, el2.bounds)
+	w_caf2 := font_measure_width(&h.font, "Caf", px2)
+	expected_caret2 := text_x2 + w_caf2
+
+	host_draw(&h)
+
+	cap2 := sdl.RenderReadPixels(h.renderer, nil)
+	testing.expect(t, cap2 != nil)
+	defer sdl.DestroySurface(cap2)
+	testing.expect_value(t, cap2.w, c.int(1280))
+	testing.expect_value(t, cap2.h, c.int(960))
+	testing.expect_value(t, read_rgb(cap2, 960, 480), [3]u8{26, 31, 42})
+	testing.expect_value(t, read_rgb(cap2, 960, 40), [3]u8{14, 16, 22})
+
+	caret_col2, found_caret2 := find_amber_caret_col(cap2, el2.bounds, 2.0)
+	testing.expect(t, found_caret2)
+	if found_caret2 {
+		testing.expect(t, math.abs(f32(caret_col2) / 2.0 - expected_caret2) <= 2.0)
+	}
+}
