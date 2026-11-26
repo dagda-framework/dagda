@@ -91,7 +91,7 @@ write_f32_exact :: proc(b: ^strings.Builder, v: f32) {
 	strings.write_string(b, s)
 }
 
-write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, has_canvas := false) {
+write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, has_canvas := false, canvas: dagda.Size = {}) {
 	strings.write_string(b, "{\"id\":")
 	strings.write_u64(b, u64(el.info.id))
 	strings.write_string(b, ",\"role\":")
@@ -103,6 +103,27 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 	fmt.sbprintf(b, ",\"bounds\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}}",
 		el.bounds.x, el.bounds.y, el.bounds.width, el.bounds.height)
 	if has_canvas {
+		// visible_canvas_bounds is the read-only intersection of
+		// the element's canvas rectangle with the canvas sheet,
+		// or null when that intersection has no area.
+		vis_x := max(el.canvas_bounds.x, f32(0))
+		vis_y := max(el.canvas_bounds.y, f32(0))
+		vis_right := min(el.canvas_bounds.x + el.canvas_bounds.width, canvas.width)
+		vis_bottom := min(el.canvas_bounds.y + el.canvas_bounds.height, canvas.height)
+		strings.write_string(b, ",\"visible_canvas_bounds\":")
+		if vis_right <= vis_x || vis_bottom <= vis_y {
+			strings.write_string(b, "null")
+		} else {
+			strings.write_string(b, "{\"x\":")
+			write_f32_exact(b, vis_x)
+			strings.write_string(b, ",\"y\":")
+			write_f32_exact(b, vis_y)
+			strings.write_string(b, ",\"width\":")
+			write_f32_exact(b, vis_right - vis_x)
+			strings.write_string(b, ",\"height\":")
+			write_f32_exact(b, vis_bottom - vis_y)
+			strings.write_byte(b, '}')
+		}
 		strings.write_string(b, ",\"canvas_bounds\":{\"x\":")
 		write_f32_exact(b, el.canvas_bounds.x)
 		strings.write_string(b, ",\"y\":")
@@ -279,7 +300,7 @@ dispatch :: proc(
 				if i > 0 {
 					strings.write_byte(&b, ',')
 				}
-				write_resolved_element(&b, el, frame.has_canvas)
+				write_resolved_element(&b, el, frame.has_canvas, frame.transform.canvas)
 			}
 			strings.write_string(&b, "]}")
 			return strings.to_string(b), false
@@ -304,7 +325,7 @@ dispatch :: proc(
 			if emitted > 0 {
 				strings.write_byte(&b, ',')
 			}
-			write_resolved_element(&b, el, frame.has_canvas)
+			write_resolved_element(&b, el, frame.has_canvas, frame.transform.canvas)
 			emitted += 1
 		}
 		if emitted == 0 {
