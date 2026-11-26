@@ -960,34 +960,39 @@ text_edit_draw :: proc(
 	bounds: dagda.Rect,
 	committed: string,
 	focused: bool,
+	scale_x: f32 = 1.0,
+	scale_y: f32 = 1.0,
 ) {
 	r := h.renderer
 	box := sdl.FRect{x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height}
+	box_px := scale_frect(box, scale_x, scale_y)
 	tx, ty, px := text_edit_layout(h.frame, bounds)
 
 	if !focused {
 		sdl.SetRenderDrawColor(r, 31, 36, 47, 255)
-		sdl.RenderFillRect(r, &box)
+		sdl.RenderFillRect(r, &box_px)
 		sdl.SetRenderDrawColor(r, 56, 65, 84, 255)
-		sdl.RenderRect(r, &box)
+		sdl.RenderRect(r, &box_px)
 	} else {
 		sdl.SetRenderDrawColor(r, 34, 41, 56, 255)
-		sdl.RenderFillRect(r, &box)
+		sdl.RenderFillRect(r, &box_px)
 		sdl.SetRenderDrawColor(r, 108, 178, 255, 255)
-		sdl.RenderRect(r, &box)
-		inner := sdl.FRect{x = box.x + 1, y = box.y + 1, w = max(box.w - 2, 0), h = max(box.h - 2, 0)}
-		sdl.RenderRect(r, &inner)
+		sdl.RenderRect(r, &box_px)
+		inner_px := scale_frect(sdl.FRect{x = box.x + 1, y = box.y + 1, w = max(box.w - 2, 0), h = max(box.h - 2, 0)}, scale_x, scale_y)
+		sdl.RenderRect(r, &inner_px)
 	}
 
+	// Renderer scale is (1, 1) so clip rects operate directly in exact physical
+	// output pixels and restoring prev_clip preserves odd canvas edges verbatim.
 	prev_clip_enabled := sdl.RenderClipEnabled(r)
 	prev_clip: sdl.Rect
 	if prev_clip_enabled {
 		_ = sdl.GetRenderClipRect(r, &prev_clip)
 	}
-	cx0 := c.int(math.floor(bounds.x + 2))
-	cy0 := c.int(math.floor(bounds.y + 2))
-	cx1 := c.int(math.ceil(bounds.x + bounds.width - 2))
-	cy1 := c.int(math.ceil(bounds.y + bounds.height - 2))
+	cx0 := c.int(math.floor((bounds.x + 2) * scale_x))
+	cy0 := c.int(math.floor((bounds.y + 2) * scale_y))
+	cx1 := c.int(math.ceil((bounds.x + bounds.width - 2) * scale_x))
+	cy1 := c.int(math.ceil((bounds.y + bounds.height - 2) * scale_y))
 	inner_clip := sdl.Rect{x = cx0, y = cy0, w = max(cx1 - cx0, 0), h = max(cy1 - cy0, 0)}
 	if prev_clip_enabled {
 		inner_clip = intersect_sdl_rect(prev_clip, inner_clip)
@@ -999,7 +1004,7 @@ text_edit_draw :: proc(
 		scroll := text_edit_clamped_scroll(&h.text_edit, &h.font, h.frame, id, bounds, committed, false)
 		draw_x := tx - scroll
 		if len(committed) > 0 {
-			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255})
+			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
 		}
 		return
 	}
@@ -1025,37 +1030,37 @@ text_edit_draw :: proc(
 		pre_x := draw_x + prefix_w
 
 		// Preedit highlight background + underline.
-		pre_bg := sdl.FRect{x = pre_x - 2, y = ty - 3, w = max(preedit_w + 4, 6), h = caret_h}
+		pre_bg := scale_frect(sdl.FRect{x = pre_x - 2, y = ty - 3, w = max(preedit_w + 4, 6), h = caret_h}, scale_x, scale_y)
 		sdl.SetRenderDrawColor(r, 62, 78, 118, 255)
 		sdl.RenderFillRect(r, &pre_bg)
 
-		underline := sdl.FRect{x = pre_x, y = ty + px + 2, w = max(preedit_w, 6), h = 2}
+		underline := scale_frect(sdl.FRect{x = pre_x, y = ty + px + 2, w = max(preedit_w, 6), h = 2}, scale_x, scale_y)
 		sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
 		sdl.RenderFillRect(r, &underline)
 
 		if len(prefix) > 0 {
-			font_draw_text(&h.font, r, prefix, draw_x, ty, px, sdl.Color{240, 244, 250, 255})
+			font_draw_text(&h.font, r, prefix, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
 		}
 		if len(preedit) > 0 {
-			font_draw_text(&h.font, r, preedit, pre_x, ty, px, sdl.Color{255, 244, 196, 255})
+			font_draw_text(&h.font, r, preedit, pre_x, ty, px, sdl.Color{255, 244, 196, 255}, scale_x, scale_y)
 		}
 		if len(suffix) > 0 {
-			font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255})
+			font_draw_text(&h.font, r, suffix, pre_x + preedit_w, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
 		}
 	} else {
 		if len(selected) > 0 {
 			sel_w := font_measure_width(&h.font, selected, px)
-			sel_rect := sdl.FRect{x = draw_x + prefix_w, y = ty - 3, w = sel_w, h = caret_h}
+			sel_rect := scale_frect(sdl.FRect{x = draw_x + prefix_w, y = ty - 3, w = sel_w, h = caret_h}, scale_x, scale_y)
 			sdl.SetRenderDrawColor(r, 58, 108, 190, 255)
 			sdl.RenderFillRect(r, &sel_rect)
 		}
 		if len(committed) > 0 {
-			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255})
+			font_draw_text(&h.font, r, committed, draw_x, ty, px, sdl.Color{240, 244, 250, 255}, scale_x, scale_y)
 		}
 	}
 
 	caret_x := text_edit_caret_x(&h.text_edit, &h.font, h.frame, bounds, committed)
-	caret_rect := sdl.FRect{x = caret_x, y = ty - 3, w = TEXT_EDIT_CARET_WIDTH, h = caret_h}
+	caret_rect := scale_frect(sdl.FRect{x = caret_x, y = ty - 3, w = TEXT_EDIT_CARET_WIDTH, h = caret_h}, scale_x, scale_y)
 	sdl.SetRenderDrawColor(r, 255, 206, 84, 255)
 	sdl.RenderFillRect(r, &caret_rect)
 }

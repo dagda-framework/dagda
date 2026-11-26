@@ -328,6 +328,8 @@ font_draw_text :: proc(
 	x, y: f32,
 	px_height: f32,
 	color: sdl.Color,
+	scale_x: f32 = 1.0,
+	scale_y: f32 = 1.0,
 ) -> f32 {
 	if !font.loaded || len(text) == 0 {
 		return 0
@@ -359,10 +361,10 @@ font_draw_text :: proc(
 				sdl.SetTextureColorMod(g.texture, color.r, color.g, color.b)
 				sdl.SetTextureAlphaMod(g.texture, color.a)
 				dst := sdl.FRect{
-					x = math.floor(pen_x) + f32(g.bearing_x),
-					y = math.floor(baseline) - f32(g.bearing_y),
-					w = f32(g.width),
-					h = f32(g.height),
+					x = (math.floor(pen_x) + f32(g.bearing_x)) * scale_x,
+					y = (math.floor(baseline) - f32(g.bearing_y)) * scale_y,
+					w = f32(g.width) * scale_x,
+					h = f32(g.height) * scale_y,
 				}
 				sdl.RenderTexture(renderer, g.texture, nil, &dst)
 			}
