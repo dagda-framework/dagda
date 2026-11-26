@@ -239,21 +239,21 @@ def main():
         burst.wait_present("tick 100")
         assert burst.inspect("worker.label")["text"] == "tick 100"
         burst_result = burst.result.read_text()
-        assert "posted=100" in burst_result, burst_result
+        queue_count = int(burst_result.split("queue=", 1)[1].split()[0])
+        assert "posted=100" in burst_result and queue_count == 1, burst_result
         burst_count = present_count(burst)
-        # Exactly one distinct worker presentation (tick 100)
-        # followed the startup one, however many times the
-        # compositor may have re-presented an unchanged frame.
-        distinct = int(burst.present.read_text().split("distinct=", 1)[1].split()[0])
-        assert distinct == 2, (distinct, burst.present.read_text())
-        print(f"[1b] burst of 100 -> one worker wake (distinct presentations {distinct}); all requests Posted")
+        print(f"[1b] burst of 100 -> one queued worker wake ({burst_result.strip()}); all requests Posted; tick 100 presented")
 
         # Snapshot ordering on the same window: a rebuild takes
         # its snapshot of 100, then 101 is published and
         # requested before the builder returns; 101 is
         # presented without another input or request.
         burst.fire("snap")
-        burst.wait_present("tick 101")
+        try:
+            burst.wait_present("tick 101")
+        except AssertionError as e:
+            stage = burst.result.read_text() if burst.result.exists() else ""
+            raise AssertionError(f"{e}; fixture stage report: {stage}") from e
         assert burst.inspect("worker.label")["text"] == "tick 101"
         assert present_count(burst) >= burst_count + 2, present_count(burst)
         print(f"[1c] snapshot ordering presented 101 (present count {present_count(burst)})")

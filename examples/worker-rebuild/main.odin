@@ -46,9 +46,6 @@ State :: struct {
 	mode:          string,
 	worker:        ^thread.Thread,
 	present_count: int,
-	distinct_presents: int,
-	last_presented: [64]u8,
-	last_presented_len: int,
 	posted_count:  int,
 	gate_armed:    bool,
 	snap_armed:    bool,
@@ -71,27 +68,18 @@ write_file :: proc(path, text: string) {
 }
 
 wait_for_file :: proc(s: ^State, path: string) {
+	stage := path
 	for i in 0 ..< 1000 {
 		if os.exists(path) {
 			return
 		}
 		time.sleep(10 * time.Millisecond)
 	}
+	write_file(s.result_path, fmt.tprintf("gate timeout stage=%s\n", stage))
 }
 
 app_view :: proc(user_data: rawptr) -> dagda.View {
 	s := (^State)(user_data)
-	// Burst gate: hold before copying, so one wake builds the
-	// latest published state.
-	sync.mutex_lock(&s.mu)
-	if s.gate_armed {
-		s.gate_armed = false
-		sync.mutex_unlock(&s.mu)
-		write_file(fmt.tprintf("%s/gate_started", s.gate_dir), "1")
-		wait_for_file(s, fmt.tprintf("%s/gate_release", s.gate_dir))
-		sync.mutex_lock(&s.mu)
-	}
-	sync.mutex_unlock(&s.mu)
 	sync.mutex_lock(&s.mu)
 	label := fmt.bprintf(s.built_label[:], "%s", s.label)
 	s.built_len = len(label)
@@ -119,12 +107,7 @@ app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
 	s.present_count += 1
-	if string(s.built_label[:s.built_len]) != string(s.last_presented[:s.last_presented_len]) {
-		s.distinct_presents += 1
-		copy(s.last_presented[:], s.built_label[:s.built_len])
-		s.last_presented_len = s.built_len
-	}
-	text := fmt.tprintf("present count=%d distinct=%d label=%q other=%q builder=%d host=%d\n", s.present_count, s.distinct_presents, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
+	text := fmt.tprintf("present count=%d label=%q other=%q builder=%d host=%d\n", s.present_count, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -209,21 +192,6 @@ worker_main :: proc(data: rawptr) {
 			trigger := string(data_bytes)
 			if trigger != last {
 				last = trigger
-				if trigger == "burst" {
-					sync.mutex_lock(&s.mu)
-					s.gate_armed = true
-					sync.mutex_unlock(&s.mu)
-					for n in 1 ..= 100 {
-						sync.mutex_lock(&s.mu)
-						delete(s.label)
-						s.label = strings.clone(fmt.tprintf("tick %d", n))
-						s.tick = n
-						sync.mutex_unlock(&s.mu)
-						_ = sdlhost.request_rebuild(s.handle)
-					}
-					write_file(fmt.tprintf("%s/gate_release", s.gate_dir), "1")
-					continue
-				}
 				if trigger == "snap" {
 					sync.mutex_lock(&s.mu)
 					s.snap_armed = true
@@ -291,6 +259,16 @@ app_ready :: proc(user_data: rawptr, handle: sdlhost.Rebuild_Handle) {
 		}
 		if !seen {
 			write_file(s.result_path, "gate timeout stage=burst_publish\n")
+		} else {
+			// Count only this handle's registered event type,
+			// without consuming any of it, while the host is
+			// still held here.
+			et := sdl.EventType(handle.event_type)
+			queue := sdl.PeepEvents(nil, 0, .PEEKEVENT, et, et)
+			sync.mutex_lock(&s.mu)
+			posted := s.posted_count
+			sync.mutex_unlock(&s.mu)
+			write_file(s.result_path, fmt.tprintf("burst posted=%d queue=%d\n", posted, queue))
 		}
 	}
 }
