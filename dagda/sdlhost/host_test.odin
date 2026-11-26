@@ -1930,4 +1930,128 @@ test_clipboard_sdl_dummy_roundtrip :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	defer delete(got)
 	testing.expect_value(t, got, sample)
+
+	// Refused copy containing U+0000 must preserve the seeded SDL clipboard,
+	// selection, revision, and undo history.
+	testing.expect(t, clipboard_set({}, "prior-sdl"))
+
+	Nul_App :: struct {
+		title:      string,
+		rev:        u64,
+		undo_depth: int,
+		elements:   [1]dagda.Canvas_Element,
+	}
+	s := Nul_App{
+		title      = "ab\x00cd",
+		rev        = 7,
+		undo_depth = 2,
+	}
+	s.elements = {
+		{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 40, y = 40, width = 500, height = 60}},
+	}
+	frame, frame_ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+	testing.expect(t, frame_ok)
+	defer dagda.frame_destroy(&frame)
+
+	h: Host
+	h.frame = frame
+	h.app = App{
+		user_data = &s,
+		text_edit = {enabled = true, target_id = 1},
+	}
+	defer text_edit_destroy(&h.text_edit)
+
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, nil, h.frame, h.app.text_edit, 1))
+	h.text_edit.session.anchor = 1
+	h.text_edit.session.caret = 4
+
+	ev: sdl.Event
+	ev.type = .KEY_DOWN
+	ev.key.key = sdl.K_C
+	ev.key.mod = sdl.KMOD_LCTRL
+	rebuild, has_pending, _ := host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, rebuild, false)
+	testing.expect_value(t, has_pending, false)
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, s.rev, u64(7))
+	testing.expect_value(t, s.undo_depth, 2)
+
+	after, after_ok := clipboard_get({})
+	testing.expect(t, after_ok)
+	defer delete(after)
+	testing.expect_value(t, after, "prior-sdl")
+}
+
+@(test)
+test_clipboard_copy_declines_nul_preserving_memory_backend_and_state :: proc(t: ^testing.T) {
+	Spy_Clipboard :: struct {
+		mc:        Memory_Clipboard,
+		set_calls: int,
+	}
+	spy_set :: proc(ctx: rawptr, text: string) -> bool {
+		sp := (^Spy_Clipboard)(ctx)
+		sp.set_calls += 1
+		return memory_clipboard_set(&sp.mc, text)
+	}
+	spy_get :: proc(ctx: rawptr, allocator := context.allocator) -> (string, bool) {
+		sp := (^Spy_Clipboard)(ctx)
+		return memory_clipboard_get(&sp.mc, allocator)
+	}
+
+	Nul_App :: struct {
+		title:      string,
+		rev:        u64,
+		undo_depth: int,
+		elements:   [1]dagda.Canvas_Element,
+	}
+	s := Nul_App{
+		title      = "ab\x00cd",
+		rev        = 3,
+		undo_depth = 1,
+	}
+	s.elements = {
+		{info = {id = 1, role = "outline.title"}, kind = .Label, text = s.title, bounds = {x = 40, y = 40, width = 500, height = 60}},
+	}
+	frame, ok := dagda.resolve_canvas({size = {width = 960, height = 540}, elements = s.elements[:]}, {width = 800, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	spy: Spy_Clipboard
+	defer memory_clipboard_destroy(&spy.mc)
+	cb := Clipboard{ctx = &spy, get = spy_get, set = spy_set}
+
+	// Seed the memory backend with a known value.
+	testing.expect(t, clipboard_set(cb, "prior-mem"))
+	testing.expect_value(t, spy.set_calls, 1)
+	testing.expect_value(t, spy.mc.text, "prior-mem")
+
+	h: Host
+	h.frame = frame
+	h.app = App{
+		user_data = &s,
+		text_edit = {enabled = true, target_id = 1},
+	}
+	h.clipboard = cb
+	defer text_edit_destroy(&h.text_edit)
+
+	testing.expect(t, text_edit_focus_id(&h.text_edit, nil, nil, h.frame, h.app.text_edit, 1))
+	h.text_edit.session.anchor = 1
+	h.text_edit.session.caret = 4
+
+	ev: sdl.Event
+	ev.type = .KEY_DOWN
+	ev.key.key = sdl.K_C
+	ev.key.mod = sdl.KMOD_LCTRL
+	rebuild, has_pending, _ := host_dispatch_key_event(&h, &ev)
+	testing.expect_value(t, rebuild, false)
+	testing.expect_value(t, has_pending, false)
+
+	// Declined before calling backend set; previous clipboard, selection, rev, and undo survive.
+	testing.expect_value(t, spy.set_calls, 1)
+	testing.expect_value(t, spy.mc.text, "prior-mem")
+	testing.expect_value(t, h.text_edit.session.anchor, 1)
+	testing.expect_value(t, h.text_edit.session.caret, 4)
+	testing.expect_value(t, s.rev, u64(3))
+	testing.expect_value(t, s.undo_depth, 1)
 }

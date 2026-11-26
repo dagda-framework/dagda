@@ -414,6 +414,11 @@ memory_clipboard_interface :: proc(mc: ^Memory_Clipboard) -> Clipboard {
 
 @(private="package")
 clipboard_set :: proc(cb: Clipboard, text: string) -> bool {
+	// C-string clipboard APIs (SDL_SetClipboardText) cannot represent embedded NUL
+	// bytes without silent truncation; decline before writing to either backend.
+	if strings.index_byte(text, 0) >= 0 {
+		return false
+	}
 	if cb.set != nil {
 		return cb.set(cb.ctx, text)
 	}
