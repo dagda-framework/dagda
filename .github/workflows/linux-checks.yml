@@ -118,3 +118,9 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
         run: python3 examples/title-window/tests/e2e_title_conflict.py
+
+      - name: Run the action origin test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/action-origin/tests/e2e_action_origin.py
