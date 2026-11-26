@@ -28,6 +28,7 @@ Input path:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import io
 import json
 import math
@@ -322,12 +323,15 @@ def send_control(proc: subprocess.Popen, reader: DeadlineLineReader, cmd: str) -
 
 def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dict[str, object]:
     resp = send_control(proc, reader, "window-info")
-    # CONTROL_OK window-info driver=cocoa win=800x540 output=800x540 density=1.0000 display_scale=1.0000
+    # CONTROL_OK window-info driver=cocoa pos=100,80 win=800x540 output=800x540 density=1.0000 display_scale=1.0000
     parts = dict(tok.split("=", 1) for tok in resp.split()[2:])
+    pos_x, pos_y = (int(v) for v in parts["pos"].split(","))
     win_w, win_h = (int(v) for v in parts["win"].split("x"))
     out_w, out_h = (int(v) for v in parts["output"].split("x"))
     return {
         "driver": parts["driver"],
+        "pos_x": pos_x,
+        "pos_y": pos_y,
         "win_w": win_w,
         "win_h": win_h,
         "out_w": out_w,
@@ -337,6 +341,83 @@ def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dic
         "density": float(parts["density"]),
         "display_scale": float(parts["display_scale"]),
     }
+
+
+class CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+K_CG_EVENT_LEFT_MOUSE_DOWN = 1
+K_CG_EVENT_LEFT_MOUSE_UP = 2
+K_CG_EVENT_MOUSE_MOVED = 5
+K_CG_MOUSE_BUTTON_LEFT = 0
+K_CG_HID_EVENT_TAP = 0
+
+
+class MacOSNativePointer:
+    """Posts native macOS pointer events via CoreGraphics CGEventPost.
+    Never falls back to SDL event injection.
+    """
+
+    def __init__(self) -> None:
+        if sys.platform != "darwin":
+            raise RuntimeError(f"--input-mode native requires macOS (current platform: {sys.platform})")
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+        cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventPost.restype = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+
+        self.preflight_access: bool | None = None
+        if hasattr(cg, "CGPreflightPostEventAccess"):
+            cg.CGPreflightPostEventAccess.argtypes = []
+            cg.CGPreflightPostEventAccess.restype = ctypes.c_bool
+            self.preflight_access = bool(cg.CGPreflightPostEventAccess())
+
+        self.cg = cg
+        self.cf = cf
+
+    def _post(self, event_type: int, x: float, y: float) -> None:
+        ev = self.cg.CGEventCreateMouseEvent(None, event_type, CGPoint(x, y), K_CG_MOUSE_BUTTON_LEFT)
+        if not ev:
+            raise RuntimeError(f"CGEventCreateMouseEvent(type={event_type}, x={x:.2f}, y={y:.2f}) returned NULL")
+        try:
+            self.cg.CGEventPost(K_CG_HID_EVENT_TAP, ev)
+        finally:
+            self.cf.CFRelease(ev)
+
+    def click_screen(self, screen_x: float, screen_y: float) -> None:
+        self._post(K_CG_EVENT_MOUSE_MOVED, screen_x, screen_y)
+        time.sleep(0.03)
+        self._post(K_CG_EVENT_LEFT_MOUSE_DOWN, screen_x, screen_y)
+        time.sleep(0.03)
+        self._post(K_CG_EVENT_LEFT_MOUSE_UP, screen_x, screen_y)
+        time.sleep(0.08)
+
+
+def deliver_click(
+    proc: subprocess.Popen,
+    reader: DeadlineLineReader,
+    info: dict[str, object],
+    win_x: float,
+    win_y: float,
+    native_ptr: MacOSNativePointer | None,
+) -> tuple[str, tuple[float, float]]:
+    """Deliver a click at logical window coordinates (win_x, win_y).
+    Returns (provenance_label, delivered_coords).
+    """
+    if native_ptr is not None:
+        screen_x = float(info["pos_x"]) + win_x
+        screen_y = float(info["pos_y"]) + win_y
+        native_ptr.click_screen(screen_x, screen_y)
+        return "macos-cgevent", (screen_x, screen_y)
+    send_control(proc, reader, f"click {win_x:.2f} {win_y:.2f}")
+    time.sleep(0.05)
+    return "sdl-injected", (win_x, win_y)
 
 
 def query_measure(proc: subprocess.Popen, reader: DeadlineLineReader, px: float, text: str) -> float:
@@ -390,8 +471,17 @@ def verify_grapheme_clicks(
     suffix_after_e: str,
     left_marker: str,
     right_marker: str,
+    native_ptr: MacOSNativePointer | None,
+    require_min_scale: float,
 ) -> dict[str, object]:
     info = query_window_info(proc, reader)
+    if require_min_scale > 0.0:
+        assert info["scale_x"] >= require_min_scale and info["scale_y"] >= require_min_scale, (
+            f"[{stage}] required min scale {require_min_scale:.2f}x on both axes, "
+            f"got scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
+            f"(win={info['win_w']}x{info['win_h']}pt output={info['out_w']}x{info['out_h']}px "
+            f"density={info['density']:.4f} display_scale={info['display_scale']:.4f})"
+        )
     el = inspect_role(client_bin, sock, "canvas.title")
     b = el["bounds"]
     assert b["x"] > 0 and b["y"] > 0, f"expected translated field origin, got {b}"
@@ -406,8 +496,7 @@ def verify_grapheme_clicks(
 
     left_edge = text_x + w_before
     click_left_x = left_edge + grapheme_w * 0.25
-    send_control(proc, reader, f"click {click_left_x:.2f} {mid_y:.2f}")
-    time.sleep(0.05)
+    click_mode, left_delivered = deliver_click(proc, reader, info, click_left_x, mid_y, native_ptr)
 
     shot_left = capture_dir / f"{stage}-left-caret.png"
     send_control(proc, reader, f"screenshot {shot_left}")
@@ -436,12 +525,15 @@ def verify_grapheme_clicks(
 
     right_edge = text_x + w_after_r
     click_right_x = text_x + w_before_r + grapheme_w_r * 0.75
-    send_control(proc, reader, f"click {click_right_x:.2f} {mid_y:.2f}")
-    time.sleep(0.05)
+    _, right_delivered = deliver_click(proc, reader, info, click_right_x, mid_y, native_ptr)
 
     shot_right = capture_dir / f"{stage}-right-caret.png"
     send_control(proc, reader, f"screenshot {shot_right}")
     png_w2, png_h2, rgb2 = decode_png_rgb(shot_right)
+    assert (png_w2, png_h2) == (info["out_w"], info["out_h"]), (
+        (png_w2, png_h2),
+        (info["out_w"], info["out_h"]),
+    )
     caret_right_px, _ = find_caret_x_pixels(png_w2, png_h2, rgb2, b, info["scale_x"], info["scale_y"])
     caret_right_pt = caret_right_px / info["scale_x"]
     assert abs(caret_right_pt - right_edge) <= 2.0, (
@@ -454,12 +546,16 @@ def verify_grapheme_clicks(
     el_final = wait_for_role_text(client_bin, sock, "canvas.title", expected_after_right)
 
     print(
-        f"[{stage}] driver={info['driver']} win={info['win_w']}x{info['win_h']}pt "
-        f"output={info['out_w']}x{info['out_h']}px scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
+        f"[{stage}] driver={info['driver']} click_input={click_mode} text_input=sdl-injected "
+        f"win_origin=({info['pos_x']},{info['pos_y']})pt win={info['win_w']}x{info['win_h']}pt "
+        f"output={info['out_w']}x{info['out_h']}px png={png_w}x{png_h}px "
+        f"scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
         f"density={info['density']:.4f} display_scale={info['display_scale']:.4f} "
         f"field=({b['x']:.2f},{b['y']:.2f},{b['width']:.2f}x{b['height']:.2f}) px={px:.2f} "
-        f"left_caret={caret_left_pt:.2f}pt(want {left_edge:.2f}pt) "
-        f"right_caret={caret_right_pt:.2f}pt(want {right_edge:.2f}pt) "
+        f"left_click=({left_delivered[0]:.2f},{left_delivered[1]:.2f}) "
+        f"right_click=({right_delivered[0]:.2f},{right_delivered[1]:.2f}) "
+        f"left_caret={caret_left_pt:.2f}pt(px={caret_left_px:.1f},want={left_edge:.2f}pt) "
+        f"right_caret={caret_right_pt:.2f}pt(px={caret_right_px:.1f},want={right_edge:.2f}pt) "
         f"utf8={el_final['text'].encode('utf-8').hex(' ')}"
     )
     return {"info": info, "bounds": b, "text": el_final["text"]}
@@ -468,8 +564,33 @@ def verify_grapheme_clicks(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cocoa / native-window caret and grapheme hit-test probe")
     parser.add_argument("--require-driver", default="", help="Fail if SDL_GetCurrentVideoDriver() does not match")
+    parser.add_argument(
+        "--input-mode",
+        choices=("sdl", "native"),
+        default="sdl",
+        help="Click delivery mode: 'sdl' (SDL_PushEvent in logical points) or 'native' (macOS CGEventPost; no fallback)",
+    )
+    parser.add_argument(
+        "--require-min-scale",
+        type=float,
+        default=0.0,
+        help="Fail if output/window pixel ratio on either axis is below this value (e.g. 2.0 for Retina; no fallback)",
+    )
+    parser.add_argument(
+        "--high-density",
+        action="store_true",
+        help="Opt-in experiment: set DAGDA_SDL_HIGH_PIXEL_DENSITY=1 when launching the host window",
+    )
     parser.add_argument("--capture-dir", default="", help="Directory for PNG captures")
     args = parser.parse_args()
+
+    native_ptr: MacOSNativePointer | None = None
+    if args.input_mode == "native":
+        native_ptr = MacOSNativePointer()
+        print(
+            f"[native-pointer] CoreGraphics loaded; CGPreflightPostEventAccess={native_ptr.preflight_access} "
+            f"(high_density_opt_in={args.high_density})"
+        )
 
     capture_dir = Path(args.capture_dir) if args.capture_dir else ROOT / "build" / "cocoa-caret-capture"
     capture_dir.mkdir(parents=True, exist_ok=True)
@@ -489,6 +610,12 @@ def main() -> int:
     sock = sock_dir / "shared.sock"
     proc = None
     try:
+        env = dict(os.environ)
+        if args.high_density:
+            env["DAGDA_SDL_HIGH_PIXEL_DENSITY"] = "1"
+        else:
+            env.pop("DAGDA_SDL_HIGH_PIXEL_DENSITY", None)
+
         proc = subprocess.Popen(
             [str(app_bin), "--size", "800x540", "--socket", str(sock), "--control-stdin"],
             stdin=subprocess.PIPE,
@@ -496,12 +623,17 @@ def main() -> int:
             stderr=subprocess.PIPE,
             bufsize=0,
             cwd=ROOT,
+            env=env,
         )
         assert proc.stdout is not None
         reader = DeadlineLineReader(proc.stdout)
         wait_for_startup(proc, reader, sock, timeout=10.0)
 
-        # Settle initial window dimensions.
+        if native_ptr is not None:
+            send_control(proc, reader, "raise")
+            time.sleep(0.15)
+
+        # Settle initial window dimensions and content origin.
         init_png = capture_dir / "00-init.png"
         prev_info = None
         for _ in range(10):
@@ -513,15 +645,28 @@ def main() -> int:
             time.sleep(0.05)
 
         info0 = query_window_info(proc, reader)
+        print(
+            f"[startup] driver={info0['driver']} high_density_opt_in={args.high_density} "
+            f"win_origin=({info0['pos_x']},{info0['pos_y']})pt win={info0['win_w']}x{info0['win_h']}pt "
+            f"output={info0['out_w']}x{info0['out_h']}px scale={info0['scale_x']:.3f}x{info0['scale_y']:.3f} "
+            f"density={info0['density']:.4f} display_scale={info0['display_scale']:.4f}"
+        )
         if args.require_driver:
             assert info0["driver"] == args.require_driver, (
                 f"expected SDL video driver {args.require_driver!r}, got {info0['driver']!r}"
             )
+        if args.require_min_scale > 0.0:
+            assert info0["scale_x"] >= args.require_min_scale and info0["scale_y"] >= args.require_min_scale, (
+                f"required min scale {args.require_min_scale:.2f}x on both axes, "
+                f"got scale={info0['scale_x']:.3f}x{info0['scale_y']:.3f} "
+                f"(win={info0['win_w']}x{info0['win_h']}pt output={info0['out_w']}x{info0['out_h']}px "
+                f"density={info0['density']:.4f} display_scale={info0['display_scale']:.4f})"
+            )
 
-        # Insert decomposed "Cafe\u0301 " at start of canvas.title using plain pointer click + TEXT_INPUT.
+        # Insert decomposed "Cafe\u0301 " at start of canvas.title using pointer click + TEXT_INPUT.
         el0 = inspect_role(client_bin, sock, "canvas.title")
         b0 = el0["bounds"]
-        send_control(proc, reader, f"click {b0['x'] + 2.0:.2f} {b0['y'] + b0['height'] * 0.5:.2f}")
+        deliver_click(proc, reader, info0, b0["x"] + 2.0, b0["y"] + b0["height"] * 0.5, native_ptr)
         send_control(proc, reader, f"text Caf{E_ACUTE_DECOMPOSED} ")
         wait_for_role_text(client_bin, sock, "canvas.title", f"Caf{E_ACUTE_DECOMPOSED} Slide Title")
 
@@ -537,9 +682,17 @@ def main() -> int:
             suffix_after_e=" Slide Title",
             left_marker="[",
             right_marker="]",
+            native_ptr=native_ptr,
+            require_min_scale=args.require_min_scale,
         )
 
-        # Stage 2: Resize to 640x480 and wait for Cocoa/WM to settle, then verify updated field bounds + repeat clicks.
+        # Stage 2: Move (under native mode) and resize to 640x480, wait for Cocoa/WM to settle,
+        # then reacquire window origin & field bounds and repeat clicks.
+        if native_ptr is not None:
+            new_pos_x = int(res1["info"]["pos_x"]) + 40
+            new_pos_y = int(res1["info"]["pos_y"]) + 40
+            send_control(proc, reader, f"move-window {new_pos_x} {new_pos_y}")
+            send_control(proc, reader, "raise")
         send_control(proc, reader, "resize 640x480")
         deadline = time.monotonic() + 2.0
         el_after_resize = inspect_role(client_bin, sock, "canvas.title")
@@ -562,6 +715,8 @@ def main() -> int:
             suffix_after_e="] Slide Title",
             left_marker="<",
             right_marker=">",
+            native_ptr=native_ptr,
+            require_min_scale=args.require_min_scale,
         )
         assert res2["bounds"] != res1["bounds"]
 

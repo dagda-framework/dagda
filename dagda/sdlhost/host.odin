@@ -781,15 +781,19 @@ poll_control_stdin :: proc(
 		} else if line == "window-info" {
 			drv := sdl.GetCurrentVideoDriver()
 			drv_str := drv != nil ? string(drv) : "unknown"
+			pos_x, pos_y: c.int
 			win_w, win_h: c.int
 			out_w, out_h: c.int
+			_ = sdl.GetWindowPosition(h.window, &pos_x, &pos_y)
 			_ = sdl.GetWindowSize(h.window, &win_w, &win_h)
 			_ = sdl.GetCurrentRenderOutputSize(h.renderer, &out_w, &out_h)
 			density := sdl.GetWindowPixelDensity(h.window)
 			display_scale := sdl.GetWindowDisplayScale(h.window)
 			fmt.printf(
-				"CONTROL_OK window-info driver=%s win=%dx%d output=%dx%d density=%.4f display_scale=%.4f\n",
+				"CONTROL_OK window-info driver=%s pos=%d,%d win=%dx%d output=%dx%d density=%.4f display_scale=%.4f\n",
 				drv_str,
+				pos_x,
+				pos_y,
 				win_w,
 				win_h,
 				out_w,
@@ -797,6 +801,28 @@ poll_control_stdin :: proc(
 				density,
 				display_scale,
 			)
+			_ = os.flush(os.stdout)
+		} else if line == "raise" {
+			_ = sdl.RaiseWindow(h.window)
+			_ = sdl.SyncWindow(h.window)
+			fmt.println("CONTROL_OK raise")
+			_ = os.flush(os.stdout)
+		} else if strings.has_prefix(line, "move-window ") {
+			rest := line[len("move-window "):]
+			sp := strings.index_byte(rest, ' ')
+			if sp > 0 {
+				mx, ok_x := strconv.parse_int(rest[:sp])
+				my, ok_y := strconv.parse_int(rest[sp + 1:])
+				if ok_x && ok_y {
+					_ = sdl.SetWindowPosition(h.window, c.int(mx), c.int(my))
+					_ = sdl.SyncWindow(h.window)
+					fmt.printf("CONTROL_OK move-window %d %d\n", mx, my)
+				} else {
+					fmt.println("CONTROL_ERR invalid move-window")
+				}
+			} else {
+				fmt.println("CONTROL_ERR invalid move-window")
+			}
 			_ = os.flush(os.stdout)
 		} else if strings.has_prefix(line, "measure ") {
 			rest := line[len("measure "):]
@@ -1176,7 +1202,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer delete(title_cstr)
 	w := opts.width > 0 ? c.int(opts.width) : (app.width > 0 ? c.int(app.width) : 360)
 	ht := opts.height > 0 ? c.int(opts.height) : (app.height > 0 ? c.int(app.height) : 180)
-	if !sdl.CreateWindowAndRenderer(title_cstr, w, ht, {.RESIZABLE}, &h.window, &h.renderer) {
+	window_flags := sdl.WindowFlags{.RESIZABLE}
+	if high_dpi, ok := os.lookup_env("DAGDA_SDL_HIGH_PIXEL_DENSITY", context.allocator); ok {
+		if high_dpi == "1" {
+			window_flags += {.HIGH_PIXEL_DENSITY}
+		}
+		delete(high_dpi)
+	}
+	if !sdl.CreateWindowAndRenderer(title_cstr, w, ht, window_flags, &h.window, &h.renderer) {
 		fmt.eprintf("SDL_CreateWindowAndRenderer failed: %s\n", sdl.GetError())
 		return 1
 	}
