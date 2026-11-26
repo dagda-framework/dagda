@@ -196,6 +196,13 @@ def main():
         app.control(f"click {fb['x'] + fb['width'] - 5:.2f} {fb['y'] + fb['height'] / 2:.2f}")
         app.control("key shift+left")
         app.control("preedit X")
+        shot = app.dir / "before-worker.png"
+        deadline = time.monotonic() + 5
+        while True:
+            app.control(f"screenshot {shot}")
+            if count_preedit_pixels(shot, fb) >= 20:
+                break
+            assert time.monotonic() < deadline, "preedit never became visible before worker publication"
         # Publish a different element through the same worker
         # path while this composition is active (second trigger).
         app.fire("other")

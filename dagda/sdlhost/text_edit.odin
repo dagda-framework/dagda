@@ -242,6 +242,7 @@ text_edit_click_id :: proc(
 	target_id: dagda.Object_Id,
 	click_x: f32,
 	targets: []dagda.Object_Id = nil,
+	extend_selection := false,
 ) -> bool {
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
@@ -253,6 +254,7 @@ text_edit_click_id :: proc(
 	if !found {
 		return false
 	}
+	was_same_field := te.focused && te.active_id == target_id
 	changed := text_edit_focus_id(te, window, font, frame, cfg, target_id, targets)
 	if dagda.cancel_composition(&te.session) {
 		changed = true
@@ -262,7 +264,7 @@ text_edit_click_id :: proc(
 		offset := font_hit_test_caret(font, el.text, px, click_x - text_x)
 		prev_caret := te.session.caret
 		prev_anchor := te.session.anchor
-		dagda.set_caret(&te.session, el.text, offset, false)
+		dagda.set_caret(&te.session, el.text, offset, extend_selection && was_same_field)
 		if te.session.caret != prev_caret || te.session.anchor != prev_anchor {
 			changed = true
 		}
@@ -283,10 +285,13 @@ text_edit_click :: proc(
 	return text_edit_click_id(te, window, font, frame, cfg, text_edit_default_target(cfg, targets), click_x, targets)
 }
 
-// text_edit_press_id focuses target_id, places the selection anchor at press_x
-// using the existing click-to-caret metrics, and begins mouse drag selection
-// along target_id. While another editable field has an active preedit, pressing
-// target_id leaves focus, caret, selection, and preedit untouched.
+// text_edit_press_id focuses target_id, places the caret at press_x using the
+// existing click-to-caret metrics, and begins mouse drag selection along
+// target_id. When extend_selection is true on an already-focused field, the
+// existing selection anchor is kept and only the caret moves; entering a
+// different field always starts a fresh selection. While another editable
+// field has an active preedit, pressing target_id leaves focus, caret,
+// selection, and preedit untouched.
 text_edit_press_id :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
@@ -296,6 +301,7 @@ text_edit_press_id :: proc(
 	target_id: dagda.Object_Id,
 	press_x: f32,
 	targets: []dagda.Object_Id = nil,
+	extend_selection := false,
 ) -> (started: bool, changed: bool) {
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false, false
@@ -306,7 +312,7 @@ text_edit_press_id :: proc(
 	if _, found := dagda.find(frame, target_id); !found {
 		return false, false
 	}
-	changed = text_edit_click_id(te, window, font, frame, cfg, target_id, press_x, targets)
+	changed = text_edit_click_id(te, window, font, frame, cfg, target_id, press_x, targets, extend_selection)
 	if te.focused && te.active_id == target_id && !dagda.is_composing(&te.session) {
 		te.dragging = true
 		te.drag_target_id = target_id
