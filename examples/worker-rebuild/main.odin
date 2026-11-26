@@ -45,6 +45,10 @@ State :: struct {
 	stale_path:    string,
 	mode:          string,
 	worker:        ^thread.Thread,
+	present_count: int,
+	gate_armed:    bool,
+	snap_armed:    bool,
+	gate_dir:      string,
 	runs:          int,
 	first_handle:  sdlhost.Rebuild_Handle,
 }
@@ -62,12 +66,39 @@ write_file :: proc(path, text: string) {
 	}
 }
 
+wait_for_file :: proc(s: ^State, path: string) {
+	for i in 0 ..< 1000 {
+		if os.exists(path) {
+			return
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
 app_view :: proc(user_data: rawptr) -> dagda.View {
 	s := (^State)(user_data)
+	// Burst gate: hold before copying, so one wake builds the
+	// latest published state.
+	sync.mutex_lock(&s.mu)
+	if s.gate_armed {
+		s.gate_armed = false
+		sync.mutex_unlock(&s.mu)
+		write_file(fmt.tprintf("%s/gate_started", s.gate_dir), "1")
+		wait_for_file(s, fmt.tprintf("%s/gate_release", s.gate_dir))
+		sync.mutex_lock(&s.mu)
+	}
+	sync.mutex_unlock(&s.mu)
 	sync.mutex_lock(&s.mu)
 	label := fmt.bprintf(s.built_label[:], "%s", s.label)
 	s.built_len = len(label)
 	s.builder_tid = u64(sdl.GetCurrentThreadID())
+	if s.snap_armed {
+		s.snap_armed = false
+		sync.mutex_unlock(&s.mu)
+		write_file(fmt.tprintf("%s/snap_started", s.gate_dir), "1")
+		wait_for_file(s, fmt.tprintf("%s/snap_release", s.gate_dir))
+		sync.mutex_lock(&s.mu)
+	}
 	other_text := fmt.bprintf(s.other_buf[:], "%s", s.other)
 	s.other_len = len(other_text)
 	field := s.field
@@ -83,7 +114,8 @@ app_view :: proc(user_data: rawptr) -> dagda.View {
 app_present :: proc(user_data: rawptr) {
 	s := (^State)(user_data)
 	sync.mutex_lock(&s.mu)
-	text := fmt.tprintf("present label=%q other=%q builder=%d host=%d\n", string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
+	s.present_count += 1
+	text := fmt.tprintf("present count=%d label=%q other=%q builder=%d host=%d\n", s.present_count, string(s.built_label[:s.built_len]), string(s.other_buf[:s.other_len]), s.builder_tid, s.host_tid)
 	path := s.present_path
 	sync.mutex_unlock(&s.mu)
 	write_file(path, text)
@@ -145,6 +177,32 @@ worker_main :: proc(data: rawptr) {
 			trigger := string(data_bytes)
 			if trigger != last {
 				last = trigger
+				if trigger == "burst" {
+					sync.mutex_lock(&s.mu)
+					s.gate_armed = true
+					sync.mutex_unlock(&s.mu)
+					for n in 1 ..= 100 {
+						sync.mutex_lock(&s.mu)
+						delete(s.label)
+						s.label = strings.clone(fmt.tprintf("tick %d", n))
+						s.tick = n
+						sync.mutex_unlock(&s.mu)
+						_ = sdlhost.request_rebuild(s.handle)
+					}
+					write_file(fmt.tprintf("%s/gate_release", s.gate_dir), "1")
+					continue
+				}
+				if trigger == "snap" {
+					sync.mutex_lock(&s.mu)
+					s.snap_armed = true
+					sync.mutex_unlock(&s.mu)
+					_ = sdlhost.request_rebuild(s.handle)
+					wait_for_file(s, fmt.tprintf("%s/snap_started", s.gate_dir))
+					publish(s, "go")
+					_ = sdlhost.request_rebuild(s.handle)
+					write_file(fmt.tprintf("%s/snap_release", s.gate_dir), "1")
+					continue
+				}
 				publish(s, trigger)
 				if s.mode == "request" {
 					result := sdlhost.request_rebuild(s.handle)
@@ -226,6 +284,7 @@ main :: proc() {
 	state.result_path = env_or("RESULT_FILE", "")
 	state.trigger_path = env_or("TRIGGER_FILE", "")
 	state.stale_path = env_or("STALE_FILE", "")
+	state.gate_dir = env_or("GATE_DIR", "")
 	defer {
 		delete(state.label)
 		delete(state.other)

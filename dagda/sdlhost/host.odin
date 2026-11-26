@@ -1057,6 +1057,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		if sdl.WaitEventTimeout(&ev, wait_ms) {
 			for {
 				if u32(ev.type) == h.rebuild.event_type && ev.user.data1 == rawptr(uintptr(h.rebuild.id)) {
+					rebuild_consume_pending(h.rebuild)
 					if !host_rebuild_frame(&h) {
 						exit_code = 1
 						running = false
