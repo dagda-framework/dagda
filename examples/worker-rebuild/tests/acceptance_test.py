@@ -342,6 +342,8 @@ def main():
             if 'other="other 0!"' in final_present:
                 break
             time.sleep(0.02)
+        else:
+            raise AssertionError(f"final presented B text never appeared; last presentation record: {final_present}")
         assert commit_counts(final_present) == (1, 1), final_present
         print("[2b] in-place slice refresh: B edit discovered during A composition; both fields typed correctly")
         mut.quit()
