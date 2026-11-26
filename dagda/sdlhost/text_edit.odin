@@ -26,10 +26,9 @@ Editable_Text_Config :: struct {
 }
 
 Text_Edit_State :: struct {
-	focused:                 bool,
-	active_id:               dagda.Object_Id,
-	discard_next_text_input: bool,
-	session:                 dagda.Text_Session,
+	focused:   bool,
+	active_id: dagda.Object_Id,
+	session:   dagda.Text_Session,
 }
 
 text_edit_is_target :: proc(cfg: Editable_Text_Config, targets: []dagda.Object_Id, id: dagda.Object_Id) -> bool {
@@ -115,7 +114,6 @@ text_edit_destroy :: proc(te: ^Text_Edit_State) {
 	dagda.text_session_destroy(&te.session)
 	te.focused = false
 	te.active_id = 0
-	te.discard_next_text_input = false
 }
 
 text_edit_update_ime_area :: proc(
@@ -155,41 +153,31 @@ text_edit_focus_id :: proc(
 	if !text_edit_is_target(cfg, targets, target_id) {
 		return false
 	}
+	// Keep focus, caret, selection, and preedit in the originating field
+	// until composition commits or is cancelled.
+	if te.focused && te.active_id != target_id && dagda.is_composing(&te.session) {
+		return false
+	}
 	el, found := dagda.find(frame, target_id)
 	if !found {
 		return false
 	}
 	was_focused := te.focused
-	was_composing := te.focused && dagda.is_composing(&te.session)
 	switched := !te.focused || te.active_id != target_id
 	if switched {
-		// If transferring focus away from an actively composing field, cancel
-		// native composition and discard one trailing TEXT_INPUT from the
-		// originating field so it cannot edit the newly focused field.
-		if was_composing && te.active_id != target_id {
-			if window != nil {
-				_ = sdl.StopTextInput(window)
-			}
-			te.discard_next_text_input = true
-		} else {
-			te.discard_next_text_input = false
-		}
 		dagda.text_session_destroy(&te.session)
 		dagda.text_session_init(&te.session, el.text)
 		te.focused = true
 		te.active_id = target_id
 		if window != nil {
-			if !was_focused || was_composing {
+			if !was_focused {
 				_ = sdl.StartTextInput(window)
 			}
 			text_edit_update_ime_area(te, window, font, frame, cfg)
 		}
-	} else {
-		te.discard_next_text_input = false
-		if !dagda.is_composing(&te.session) {
-			dagda.text_session_sync(&te.session, el.text)
-			text_edit_update_ime_area(te, window, font, frame, cfg)
-		}
+	} else if !dagda.is_composing(&te.session) {
+		dagda.text_session_sync(&te.session, el.text)
+		text_edit_update_ime_area(te, window, font, frame, cfg)
 	}
 	return switched
 }
@@ -207,7 +195,8 @@ text_edit_focus :: proc(
 
 // text_edit_click_id focuses target_id and places the caret at the clicked
 // grapheme boundary using font_hit_test_caret with the exact painted text
-// origin and font height.
+// origin and font height. While another editable field has an active preedit,
+// clicking target_id leaves focus, caret, selection, and preedit untouched.
 text_edit_click_id :: proc(
 	te: ^Text_Edit_State,
 	window: ^sdl.Window,
@@ -219,6 +208,9 @@ text_edit_click_id :: proc(
 	targets: []dagda.Object_Id = nil,
 ) -> bool {
 	if !text_edit_is_target(cfg, targets, target_id) {
+		return false
+	}
+	if te.focused && te.active_id != target_id && dagda.is_composing(&te.session) {
 		return false
 	}
 	el, found := dagda.find(frame, target_id)
@@ -261,7 +253,6 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 	_ = dagda.cancel_composition(&te.session)
 	te.focused = false
 	te.active_id = 0
-	te.discard_next_text_input = false
 	if window != nil {
 		_ = sdl.StopTextInput(window)
 	}
@@ -385,7 +376,6 @@ text_edit_handle_event :: proc(
 
 	#partial switch ev.type {
 	case .TEXT_EDITING:
-		te.discard_next_text_input = false
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
 		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
 		text_edit_update_ime_area(te, window, font, frame, cfg)
@@ -394,13 +384,6 @@ text_edit_handle_event :: proc(
 		return res
 
 	case .TEXT_INPUT:
-		if te.discard_next_text_input {
-			// Drop one stale final TEXT_INPUT from the previous field's
-			// cancelled composition so it cannot edit the newly focused field.
-			te.discard_next_text_input = false
-			res.consumed = true
-			return res
-		}
 		text := ev.text.text != nil ? string(ev.text.text) : ""
 		// Propose replacing the selection with the IME's final text without
 		// clearing composition first; clear composition only if accepted so a
@@ -414,7 +397,6 @@ text_edit_handle_event :: proc(
 		return res
 
 	case .KEY_DOWN:
-		te.discard_next_text_input = false
 		key := ev.key.key
 		mod := ev.key.mod
 		shift := (mod & sdl.KMOD_SHIFT) != {}
