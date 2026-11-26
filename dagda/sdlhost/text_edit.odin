@@ -630,6 +630,7 @@ text_edit_handle_event :: proc(
 		alt_or_gui := (mod & (sdl.KMOD_ALT | sdl.KMOD_GUI)) != {}
 
 		if key == sdl.K_ESCAPE {
+			text_edit_drag_end(te)
 			if dagda.is_composing(&te.session) {
 				_ = dagda.cancel_composition(&te.session)
 				text_edit_update_ime_area(te, window, font, frame, cfg)

@@ -603,6 +603,7 @@ host_clear_pressed_on_cancel :: proc(h: ^Host) {
 		h.has_pressed = false
 		h.pressed_id = 0
 	}
+	text_edit_drag_end(&h.text_edit)
 	h.needs_redraw = true
 }
 
@@ -765,7 +766,6 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 			if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.motion.x, h.app.editable_text_targets) {
 				h.needs_redraw = true
 			}
-			return true
 		}
 		pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
 		if pres.changed {
@@ -773,7 +773,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 				return false
 			}
 		}
-		if !pres.consumed {
+		if !pres.consumed && !h.text_edit.dragging {
 			id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
 			if hit != h.has_hovered || (hit && id != h.hovered_id) {
 				h.has_hovered = hit
@@ -792,32 +792,9 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 					if changed {
 						h.needs_redraw = true
 					}
-					h.has_pressed = true
-					h.pressed_id = id
-					if started && h.frame.has_canvas && h.app.on_pointer != nil {
-						if h.pointer.active {
-							cancelled, c := pointer_cancel(&h.pointer, h.app.on_pointer, h.app.user_data)
-							if cancelled {
-								host_clear_pressed_on_cancel(h)
-							}
-							if c && !host_rebuild_frame(h) {
-								return false
-							}
-						}
-						if canvas_p, in_canvas := dagda.window_point_to_canvas(h.frame.transform, {x = ev.button.x, y = ev.button.y}); in_canvas {
-							if h.app.on_pointer(h.app.user_data, {
-								phase      = .Press,
-								has_target = true,
-								target_id  = id,
-								point      = canvas_p,
-							}) {
-								if !host_rebuild_frame(h) {
-									return false
-								}
-							}
-						}
+					if !started {
+						return true
 					}
-					return true
 				} else if text_edit_blur(&h.text_edit, h.ime_window) {
 					h.needs_redraw = true
 				}
@@ -857,12 +834,6 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 					h.needs_redraw = true
 				}
 				text_edit_drag_end(&h.text_edit)
-				if h.has_pressed {
-					h.has_pressed = false
-					h.pressed_id = 0
-					h.needs_redraw = true
-				}
-				return true
 			}
 			pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
 			if h.has_pressed {
