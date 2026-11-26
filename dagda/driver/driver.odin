@@ -101,8 +101,15 @@ write_resolved_element :: proc(b: ^strings.Builder, el: dagda.Resolved_Element, 
 	write_json_string(b, kind_name(el.kind))
 	strings.write_string(b, ",\"text\":")
 	write_json_string(b, el.text)
-	fmt.sbprintf(b, ",\"bounds\":{{\"x\":%.2f,\"y\":%.2f,\"width\":%.2f,\"height\":%.2f}}",
-		el.bounds.x, el.bounds.y, el.bounds.width, el.bounds.height)
+	strings.write_string(b, ",\"bounds\":{\"x\":")
+	write_f32_exact(b, el.bounds.x)
+	strings.write_string(b, ",\"y\":")
+	write_f32_exact(b, el.bounds.y)
+	strings.write_string(b, ",\"width\":")
+	write_f32_exact(b, el.bounds.width)
+	strings.write_string(b, ",\"height\":")
+	write_f32_exact(b, el.bounds.height)
+	strings.write_byte(b, '}')
 	if has_canvas {
 		// visible_canvas_bounds is the read-only intersection of
 		// the element's canvas rectangle with the canvas sheet,

@@ -144,6 +144,25 @@ def main():
                 assert code == 2 or bad.get("ok") is False, (code, bad)
             finally:
                 cleanup(proc)
+        # Unit-scale tiny button: centre derived only from the
+        # JSON reply must hit it; its exact right edge must miss.
+        sock = tmp / "sock-tiny" / "app.sock"
+        proc = start(host, sock, 960, 540)
+        try:
+            tiny = inspect(client_bin, sock, "tiny")
+            assert tiny["id"] == 5, tiny
+            all_els = client(client_bin, sock, "inspect")[1]["elements"]
+            unfiltered = [e for e in all_els if e["id"] == 5][0]
+            assert unfiltered["bounds"] == tiny["bounds"], (unfiltered, tiny)
+            b = tiny["bounds"]
+            cx, cy = b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
+            _, hit = client(client_bin, sock, "hit-test", str(cx), str(cy))
+            assert hit == {"ok": True, "id": 5}, (b, hit)
+            _, edge = client(client_bin, sock, "hit-test", str(b["x"] + b["width"]), str(cy))
+            assert edge == {"ok": True, "id": None}, edge
+            print(f"tiny bounds {b} centre ({cx}, {cy}) -> id 5; right edge -> null")
+        finally:
+            cleanup(proc)
         print("hit-test client checks passed at two viewport sizes")
         return 0
     finally:

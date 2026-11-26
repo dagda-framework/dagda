@@ -49,7 +49,7 @@ test_inspect_shared_role_in_declaration_order :: proc(t: ^testing.T) {
 	rep, applied := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"shared.action"}`)
 	defer delete(rep)
 	testing.expect_value(t, applied, false)
-	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":10,"role":"shared.action","kind":"button","text":"First","bounds":{"x":16.00,"y":16.00,"width":288.00,"height":40.00},"actions":["activate"]},{"id":20,"role":"shared.action","kind":"button","text":"Second","bounds":{"x":16.00,"y":112.00,"width":288.00,"height":40.00},"actions":["activate"]}]}`)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":10,"role":"shared.action","kind":"button","text":"First","bounds":{"x":16,"y":16,"width":288,"height":40},"actions":["activate"]},{"id":20,"role":"shared.action","kind":"button","text":"Second","bounds":{"x":16,"y":112,"width":288,"height":40},"actions":["activate"]}]}`)
 
 	missing, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"missing"}`)
 	defer delete(missing)
@@ -70,12 +70,12 @@ test_dispatch_inspect_and_invoke :: proc(t: ^testing.T) {
 	val_rep, val_app := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"counter.value"}`)
 	defer delete(val_rep)
 	testing.expect_value(t, val_app, false)
-	testing.expect_value(t, val_rep, `{"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"0","bounds":{"x":16.00,"y":16.00,"width":328.00,"height":40.00},"actions":[]}]}`)
+	testing.expect_value(t, val_rep, `{"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"0","bounds":{"x":16,"y":16,"width":328,"height":40},"actions":[]}]}`)
 
 	btn_rep, btn_app := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"counter.increment"}`)
 	defer delete(btn_rep)
 	testing.expect_value(t, btn_app, false)
-	testing.expect_value(t, btn_rep, `{"ok":true,"elements":[{"id":2,"role":"counter.increment","kind":"button","text":"Increment","bounds":{"x":16.00,"y":64.00,"width":328.00,"height":40.00},"actions":["activate"]}]}`)
+	testing.expect_value(t, btn_rep, `{"ok":true,"elements":[{"id":2,"role":"counter.increment","kind":"button","text":"Increment","bounds":{"x":16,"y":64,"width":328,"height":40},"actions":["activate"]}]}`)
 
 	inv_rep, inv_app := dispatch(frame, test_counter_handle, &c, `{"op":"invoke","id":2,"action":"activate"}`)
 	defer delete(inv_rep)
@@ -153,7 +153,7 @@ test_server_socket_roundtrip_and_rebuild :: proc(t: ^testing.T) {
 	r2, ok2 := read_line(&r)
 	defer delete(r2)
 	testing.expect(t, ok2)
-	testing.expect_value(t, r2, `{"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"1","bounds":{"x":16.00,"y":16.00,"width":328.00,"height":40.00},"actions":[]}]}`)
+	testing.expect_value(t, r2, `{"ok":true,"elements":[{"id":1,"role":"counter.value","kind":"label","text":"1","bounds":{"x":16,"y":16,"width":328,"height":40},"actions":[]}]}`)
 }
 
 @(test)
@@ -183,7 +183,7 @@ test_u64_max_id_roundtrip_and_out_of_range_rejected :: proc(t: ^testing.T) {
 
 	insp, _ := dispatch(frame, handler, &st, `{"op":"inspect","role":"btn.max"}`)
 	defer delete(insp)
-	testing.expect_value(t, insp, `{"ok":true,"elements":[{"id":18446744073709551615,"role":"btn.max","kind":"button","text":"Max","bounds":{"x":16.00,"y":16.00,"width":168.00,"height":40.00},"actions":["activate"]}]}`)
+	testing.expect_value(t, insp, `{"ok":true,"elements":[{"id":18446744073709551615,"role":"btn.max","kind":"button","text":"Max","bounds":{"x":16,"y":16,"width":168,"height":40},"actions":["activate"]}]}`)
 
 	// Exact max(u64) round-trips through invoke.
 	inv_ok, applied := dispatch(frame, handler, &st, `{"op":"invoke","id":18446744073709551615,"action":"activate"}`)
@@ -307,7 +307,7 @@ test_canvas_inspect_exposes_window_and_canvas_bounds :: proc(t: ^testing.T) {
 	rep, applied := dispatch(frame, nil, nil, `{"op":"inspect","role":"slide.card"}`)
 	defer delete(rep)
 	testing.expect_value(t, applied, false)
-	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.08,"y":193.33,"width":133.38,"height":146.67},"visible_canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
+	testing.expect_value(t, rep, `{"ok":true,"elements":[{"id":2,"role":"slide.card","kind":"button","text":"Card","bounds":{"x":62.083336,"y":193.33334,"width":133.375,"height":146.66667},"visible_canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"canvas_bounds":{"x":93.125,"y":200,"width":200.0625,"height":220},"actions":["activate"]}]}`)
 }
 
 Wire_Doc :: struct {
@@ -434,7 +434,7 @@ test_inspect_visible_canvas_bounds :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":10,"width":0.1,"height":50}`))
 	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":900,"y":100,"width":1e-05,"height":50}`))
 	// Edge-touching and entirely outside objects report null (twice).
-	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":6.1035156e-05,"height":50}`) || strings.contains(rep, `"width":0.00006103515625`))
+	testing.expect(t, strings.contains(rep, `"visible_canvas_bounds":{"x":959.99994,"y":10,"width":6.1035156e-05,"height":50}`) || strings.contains(rep, `"width":0006103515625`))
 	testing.expect_value(t, strings.count(rep, `"visible_canvas_bounds":null`), 4)
 	// Existing fields are still present.
 	testing.expect(t, strings.contains(rep, `"canvas_bounds":{"x":900,"y":480,"width":200,"height":120}`))
@@ -532,4 +532,31 @@ test_hit_test_f32_max_coordinates :: proc(t: ^testing.T) {
 	big, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1e40,"y":150}`)
 	defer delete(big)
 	testing.expect_value(t, big, `{"ok":false,"error":"Malformed_Request"}`)
+}
+
+@(test)
+test_inspect_bounds_exact_round_trip :: proc(t: ^testing.T) {
+	c: Test_Counter
+	canvas := dagda.Canvas{
+		size = {width = 960, height = 540},
+		elements = {{info = {id = 5, role = "tiny"}, kind = .Button, text = "Tiny", bounds = {x = 32.001953125, y = 10, width = 0.001953125, height = 50}}},
+	}
+	frame, ok := dagda.resolve_canvas(canvas, {width = 960, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+	expected_bounds := `"bounds":{"x":32.001953,"y":10,"width":0.001953125,"height":50}`
+	// Role-filtered and unfiltered inspection agree exactly.
+	filtered, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect","role":"tiny"}`)
+	defer delete(filtered)
+	testing.expect(t, strings.contains(filtered, expected_bounds))
+	all, _ := dispatch(frame, test_counter_handle, &c, `{"op":"inspect"}`)
+	defer delete(all)
+	testing.expect(t, strings.contains(all, expected_bounds))
+	// The reported centre hits; the exact right edge misses.
+	centre, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":32.0029296875,"y":35}`)
+	defer delete(centre)
+	testing.expect_value(t, centre, `{"ok":true,"id":5}`)
+	edge, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":32.00390625,"y":35}`)
+	defer delete(edge)
+	testing.expect_value(t, edge, `{"ok":true,"id":null}`)
 }
