@@ -170,6 +170,31 @@ def _synthetic_entries(second_field=A_CANVAS_ID, extra_pairs=0, supplied="かな
     return entries
 
 
+def _write_obs(path, entries):
+    path.write_text("".join(" ".join(f"{k}={v}" for k, v in e.items()) + "\n" for e in entries), encoding="utf-8")
+
+
+def _finalize_probe(tmp, entries):
+    probe = object.__new__(Probe)
+    probe.args = argparse.Namespace(stage_timeout=1.0)
+    probe.out = tmp
+    probe.transcript = tmp / "transcript.txt"
+    probe.obs_log = tmp / "composition-obs.log"
+    _write_obs(probe.obs_log, entries)
+
+    class _ExitedProc:
+        def wait(self, timeout):
+            return 0
+
+    probe.proc = _ExitedProc()
+    probe.operator_answers = lambda: {
+        "two_distinct_marked_updates": "yes",
+        "marked_text_and_focus_survived_preview": "yes",
+        "second_preedit_in_a_canvas_before_cancel": "yes",
+    }
+    return probe
+
+
 def self_test_trace():
     valid = _synthetic_entries()
     supplied = validate_complete_trace(valid)
@@ -185,6 +210,30 @@ def self_test_trace():
             continue
         raise AssertionError(f"{label} counterexample trace unexpectedly passed validation")
     print("self-test verdicts differ: PASS")
+
+    # Finalization path: a clean close passes, but a field-2
+    # pair appended during the close wait must overturn the
+    # pre-close verdict when the log is reread after exit.
+    supplied_hex = "かな".encode("utf-8").hex()
+    late = _synthetic_entries() + [
+        {"seq": "6", "kind": "composition_start", "field": "2", "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex},
+        {"seq": "7", "kind": "composition_end", "field": "2", "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex},
+    ]
+    with tempfile.TemporaryDirectory(prefix="dagda-ime-finalize-clean.") as td:
+        probe = _finalize_probe(Path(td), _synthetic_entries())
+        assert probe.finalize("かな") == 0
+        transcript = probe.transcript.read_text(encoding="utf-8")
+        assert "machine final: post-exit trace validated (6 records" in transcript, transcript
+        print("self-test finalize clean close: PASS")
+    with tempfile.TemporaryDirectory(prefix="dagda-ime-finalize-late.") as td:
+        probe = _finalize_probe(Path(td), late)
+        try:
+            probe.finalize("かな")
+        except AssertionError as exc:
+            print(f"self-test finalize late field-2 pair: FAIL as required ({str(exc)[:160]})")
+        else:
+            raise AssertionError("late-pair finalization unexpectedly passed")
+    print("self-test finalization verdicts differ: PASS")
     return 0
 
 
@@ -245,6 +294,38 @@ class Probe:
     def check_threads(self, entries):
         for e in entries:
             assert e.get("tid") == e.get("main_tid"), f"callback off host thread: {e}"
+
+    def finalize(self, supplied):
+        """Close out the run after the undo stage.
+
+        The fixture can still append callbacks until the host
+        actually exits, so the pre-close trace is never the
+        verdict. After a successful exit this rereads the
+        run-specific log, validates that post-exit snapshot
+        against the expected trace and the supplied committed
+        bytes, and uses only that snapshot for the final
+        transcript and verdict, before the operator questions.
+        """
+        self.record("CUE 5: Close the Dagda window now. After it closes, focus this terminal for the operator questions.")
+        try:
+            rc = self.proc.wait(timeout=self.args.stage_timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise Pending(f"window close not observed within {self.args.stage_timeout:.0f}s") from exc
+        assert rc == 0, f"host exited with status {rc} after window close"
+        self.proc = None
+        post_exit_entries = self.obs()
+        post_exit_supplied = validate_complete_trace(post_exit_entries)
+        assert post_exit_supplied == supplied, (
+            f"post-exit committed bytes mismatch: trace supplied {post_exit_supplied!r}, expected {supplied!r}")
+        self.record(f"machine final: post-exit trace validated ({len(post_exit_entries)} records, supplied={post_exit_supplied!r}); any callback appended during the close wait is included in this snapshot")
+        for entry in post_exit_entries:
+            self.record(f"final trace record: {entry}")
+        answers = self.operator_answers()
+        unconfirmed = [key for key, value in answers.items() if value != "yes"]
+        if unconfirmed:
+            raise Pending(f"machine stages passed but visual observations were not confirmed (need yes): {unconfirmed} answers={answers}")
+        self.record("all native IME cases observed (machine trace, driver checks, and operator visual confirmations)")
+        return 0
 
     def operator_answers(self):
         """Collect visual confirmations after the window sequence.
@@ -394,25 +475,9 @@ class Probe:
                 return (el, st2) if el["text"] == ORIGINAL and st2["a_rev"] == 3 and st2["a_undo"] == 0 else None
             el, st = self.wait_until("Command+Z undo to original", undone, self.args.stage_timeout)
             assert self.inspect("a.outline")["text"] == ORIGINAL
-            final_entries = self.obs()
-            assert validate_complete_trace(final_entries) == supplied, final_entries
-            self.record(f"machine step 3b: Command+Z restored {ORIGINAL!r} bytes={ORIGINAL.encode('utf-8')!r} at rev={st['a_rev']} undo={st['a_undo']}; final trace still exactly the six expected records")
-            for entry in final_entries:
-                self.record(f"trace record: {entry}")
-
-            self.record("CUE 5: Close the Dagda window now. After it closes, focus this terminal for the operator questions.")
-            try:
-                rc = self.proc.wait(timeout=self.args.stage_timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise Pending(f"window close not observed within {self.args.stage_timeout:.0f}s") from exc
-            assert rc == 0, f"host exited with status {rc} after window close"
-            self.proc = None
-            answers = self.operator_answers()
-            unconfirmed = [key for key, value in answers.items() if value != "yes"]
-            if unconfirmed:
-                raise Pending(f"machine stages passed but visual observations were not confirmed (need yes): {unconfirmed} answers={answers}")
-            self.record("all native IME cases observed (machine trace, driver checks, and operator visual confirmations)")
-            return 0
+            assert validate_complete_trace(self.obs()) == supplied
+            self.record(f"machine step 3b: Command+Z restored {ORIGINAL!r} bytes={ORIGINAL.encode('utf-8')!r} at rev={st['a_rev']} undo={st['a_undo']} (pre-close trace check only; the verdict snapshot is taken after host exit)")
+            return self.finalize(supplied)
         finally:
             base.stop_process(self.proc)
             self.proc = None
