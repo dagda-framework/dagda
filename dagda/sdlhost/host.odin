@@ -14,6 +14,46 @@ import sdl "vendor:sdl3"
 View_Proc :: #type proc(user_data: rawptr) -> dagda.View
 Canvas_Proc :: #type proc(user_data: rawptr) -> dagda.Canvas
 
+// Action_Origin identifies whether the currently executing Action_Handler was
+// triggered by local window input (pointer click or keyboard Enter/Space) or
+// by an external driver invoke request. Outside a host-delivered Action_Handler
+// call — including inside subsequent frame builders, pointer/text callbacks,
+// or other threads — current_action_origin() returns .None.
+Action_Origin :: enum {
+	None,
+	Local,
+	Driver,
+}
+
+@(private="package", thread_local)
+dispatch_action_origin: Action_Origin
+
+// current_action_origin reports the origin of the host-delivered Action_Handler
+// currently executing on this thread, or .None outside that callback (including
+// during subsequent frame rebuilds).
+current_action_origin :: proc() -> Action_Origin {
+	return dispatch_action_origin
+}
+
+@(private="package")
+Action_Dispatch :: struct {
+	handler:   dagda.Action_Handler,
+	user_data: rawptr,
+	origin:    Action_Origin,
+}
+
+@(private="package")
+action_dispatch_trampoline :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+	d := (^Action_Dispatch)(user_data)
+	if d == nil || d.handler == nil {
+		return false
+	}
+	prev := dispatch_action_origin
+	dispatch_action_origin = d.origin
+	defer dispatch_action_origin = prev
+	return d.handler(d.user_data, id, action)
+}
+
 // App describes a native Dagda application hosted in an SDL3 window.
 // Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
 App :: struct {
@@ -894,7 +934,9 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 		return
 	}
 
-	applied, redraw := focus_handle_event(&h.focus, h.frame, ev, h.app.handle, h.app.user_data)
+	local_action := Action_Dispatch{handler = h.app.handle, user_data = h.app.user_data, origin = .Local}
+	local_handler: dagda.Action_Handler = h.app.handle != nil ? action_dispatch_trampoline : nil
+	applied, redraw := focus_handle_event(&h.focus, h.frame, ev, local_handler, &local_action)
 	if h.focus.has_focus && h.text_edit.focused {
 		_ = text_edit_blur(&h.text_edit, h.ime_window)
 		h.needs_redraw = true
@@ -962,7 +1004,9 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 				}
 			}
 			if !pres.suppress_click {
-				if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
+				local_action := Action_Dispatch{handler = h.app.handle, user_data = h.app.user_data, origin = .Local}
+				local_handler: dagda.Action_Handler = h.app.handle != nil ? action_dispatch_trampoline : nil
+				if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, local_handler, &local_action) == .Applied {
 					if !host_rebuild_frame(h) {
 						return false
 					}
@@ -1001,12 +1045,14 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 				}
 			}
 			if pres.consumed && !pres.suppress_click && pres.has_click_id {
+				local_action := Action_Dispatch{handler = h.app.handle, user_data = h.app.user_data, origin = .Local}
+				local_handler: dagda.Action_Handler = h.app.handle != nil ? action_dispatch_trampoline : nil
 				if pointer_try_activate(
 					h.frame,
 					{x = ev.button.x, y = ev.button.y},
 					pres.click_target_id,
-					h.app.handle,
-					h.app.user_data,
+					local_handler,
+					&local_action,
 				) {
 					if !host_rebuild_frame(h) {
 						return false
@@ -1167,11 +1213,13 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 		if running && srv.active {
 			prev_host := dispatch_host
 			dispatch_host = &h
+			driver_action := Action_Dispatch{handler = h.app.handle, user_data = h.app.user_data, origin = .Driver}
+			driver_handler: dagda.Action_Handler = h.app.handle != nil ? action_dispatch_trampoline : nil
 			applied, rebuild_failed: bool
 			if h.app.edits.handler != nil {
-				applied, rebuild_failed = driver.server_poll_edits(&srv, &h.frame, h.app.handle, h.app.user_data, h.app.edits, &h, host_rebuild_cb)
+				applied, rebuild_failed = driver.server_poll_edits(&srv, &h.frame, driver_handler, &driver_action, h.app.edits, &h, host_rebuild_cb)
 			} else {
-				applied, rebuild_failed = driver.server_poll(&srv, &h.frame, h.app.handle, h.app.user_data, &h, host_rebuild_cb)
+				applied, rebuild_failed = driver.server_poll(&srv, &h.frame, driver_handler, &driver_action, &h, host_rebuild_cb)
 			}
 			dispatch_host = prev_host
 			if rebuild_failed {

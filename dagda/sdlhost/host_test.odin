@@ -3807,6 +3807,128 @@ test_clipboard_ctrl_x_cut_combining_failures_reject_repeat_and_preedit :: proc(t
 	testing.expect_value(t, h.text_edit.session.caret, 3)
 }
 
+@(test)
+test_action_origin_local_pointer_keyboard_and_thread_scope :: proc(t: ^testing.T) {
+	Origin_App :: struct {
+		origins:       [dynamic]Action_Origin,
+		frame_origins: [dynamic]Action_Origin,
+		other_thread:  Action_Origin,
+		check_thread:  bool,
+		elements:      [1]dagda.Canvas_Element,
+	}
+	make_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+		s := (^Origin_App)(user_data)
+		append(&s.frame_origins, current_action_origin())
+		s.elements = {
+			{info = {id = 2, role = "item.add"}, kind = .Button, text = "Add", bounds = {x = 80, y = 80, width = 160, height = 60}},
+		}
+		return {size = {width = 960, height = 540}, elements = s.elements[:]}
+	}
+	on_action :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+		s := (^Origin_App)(user_data)
+		if id != 2 || action != .Activate {
+			return false
+		}
+		append(&s.origins, current_action_origin())
+		if s.check_thread {
+			// Verify thread-local scoping: another thread observes .None while host thread is inside handler.
+			worker := thread.create_and_start_with_poly_data(s, proc(st: ^Origin_App) {
+				st.other_thread = current_action_origin()
+			})
+			thread.join(worker)
+			thread.destroy(worker)
+		}
+		return true
+	}
+	noop_pointer :: proc(_: rawptr, _: Pointer_Event) -> bool {
+		return false
+	}
+
+	// Outside any host-delivered handler call, origin is .None.
+	testing.expect_value(t, current_action_origin(), Action_Origin.None)
+
+	s := Origin_App{other_thread = .Local}
+	defer {
+		delete(s.origins)
+		delete(s.frame_origins)
+	}
+
+	h: Host
+	h.viewport = {width = 800, height = 540}
+	h.app = App{
+		user_data = &s,
+		canvas    = make_canvas,
+		handle    = on_action,
+	}
+	testing.expect(t, host_rebuild_frame(&h))
+	defer dagda.frame_destroy(&h.frame)
+
+	btn, found := dagda.find(h.frame, 2)
+	testing.expect(t, found)
+	cx := btn.bounds.x + btn.bounds.width * 0.5
+	cy := btn.bounds.y + btn.bounds.height * 0.5
+
+	down: sdl.Event
+	down.type = .MOUSE_BUTTON_DOWN
+	down.button.button = sdl.BUTTON_LEFT
+	down.button.down = true
+	down.button.x = cx
+	down.button.y = cy
+	up := down
+	up.type = .MOUSE_BUTTON_UP
+	up.button.down = false
+
+	// 1. Local pointer click (without on_pointer) -> .Local, and .None on another thread & in rebuild.
+	s.check_thread = true
+	testing.expect(t, host_dispatch_mouse_event(&h, &down))
+	testing.expect(t, host_dispatch_mouse_event(&h, &up))
+	s.check_thread = false
+	testing.expect_value(t, s.other_thread, Action_Origin.None)
+	testing.expect_value(t, current_action_origin(), Action_Origin.None)
+
+	// 2. Local pointer click (with on_pointer -> release activation path) -> .Local.
+	h.app.on_pointer = noop_pointer
+	testing.expect(t, host_dispatch_mouse_event(&h, &down))
+	testing.expect(t, host_dispatch_mouse_event(&h, &up))
+	testing.expect_value(t, current_action_origin(), Action_Origin.None)
+
+	// 3. Local keyboard activation (Tab -> Enter, then Space down + Space up) -> .Local, .Local.
+	key_ev :: proc(kind: sdl.EventType, key: sdl.Keycode) -> sdl.Event {
+		ev: sdl.Event
+		ev.type = kind
+		ev.key.key = key
+		ev.key.down = kind == .KEY_DOWN
+		return ev
+	}
+	tab := key_ev(.KEY_DOWN, sdl.K_TAB)
+	enter := key_ev(.KEY_DOWN, sdl.K_RETURN)
+	space_d := key_ev(.KEY_DOWN, sdl.K_SPACE)
+	space_u := key_ev(.KEY_UP, sdl.K_SPACE)
+	_, _, _ = host_dispatch_key_event(&h, &tab)
+	rebuild_e, _, _ := host_dispatch_key_event(&h, &enter)
+	testing.expect_value(t, rebuild_e, true)
+	testing.expect(t, host_rebuild_frame(&h))
+	_, _, _ = host_dispatch_key_event(&h, &space_d)
+	rebuild_s, _, _ := host_dispatch_key_event(&h, &space_u)
+	testing.expect_value(t, rebuild_s, true)
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, current_action_origin(), Action_Origin.None)
+
+	// Verify exact recorded origins: 4 Local (click, pointer-click, Enter, Space).
+	expected := [4]Action_Origin{.Local, .Local, .Local, .Local}
+	testing.expect_value(t, len(s.origins), len(expected))
+	for want, i in expected {
+		if i < len(s.origins) {
+			testing.expect_value(t, s.origins[i], want)
+		}
+	}
+	// Every single frame builder invocation observed .None.
+	testing.expect(t, len(s.frame_origins) >= 4)
+	for fo in s.frame_origins {
+		testing.expect_value(t, fo, Action_Origin.None)
+	}
+}
+
 Failed_Start_State :: struct {
 	ready_calls:   int,
 	second_result: Rebuild_Result,
