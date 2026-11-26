@@ -31,6 +31,17 @@ the Dagda window before running the probe.
 
 Exit status: 0 = every case observed, 3 = at least one case
 left pending (the transcript names the exact failing stage).
+
+Machine assertions (callback trace, driver replies, inspected
+text/revision/undo) are kept distinct from visual observations
+(marked-text updates, focus survival): a delay and a printed
+cue cannot establish those. The operator answers three
+yes/no/unknown questions only after the window sequence, so
+focus stays in the Dagda window throughout; any answer that
+is not "yes" withholds the all-pass exit. A green hosted job
+that reaches CUE 1 and receives no input is a pending native
+run: its input source was a supplied label, unattended, and
+no composition start was received.
 """
 import argparse
 import json
@@ -42,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -76,11 +88,116 @@ def hex_text(value):
     return bytes.fromhex(value).decode("utf-8")
 
 
+ORIGINAL_HEX = ORIGINAL.encode("utf-8").hex()
+
+
+def _check_entry(entry, kind, field, rev, undo, text_hex):
+    want = {"kind": kind, "field": str(field), "a_rev": str(rev), "a_undo": str(undo), "a_text_hex": text_hex}
+    for key, value in want.items():
+        if entry.get(key) != value:
+            raise AssertionError(f"trace entry mismatch: want {key}={value!r} in {want}, got {entry}")
+
+
+def _check_common(entries, count):
+    if len(entries) != count:
+        raise AssertionError(f"trace length mismatch: want {count} records, got {len(entries)}: {entries}")
+    for i, entry in enumerate(entries):
+        if entry.get("seq") != str(i):
+            raise AssertionError(f"trace sequence mismatch at record {i}: {entries}")
+        if entry.get("tid") != entry.get("main_tid"):
+            raise AssertionError(f"callback off the host thread at record {i}: {entry}")
+        if i > 0 and entry.get("video") != "cocoa":
+            raise AssertionError(f"native Cocoa path not verified at record {i} (video={entry.get('video')!r}): {entry}")
+    ready = entries[0]
+    if ready.get("kind") != "ready" or ready.get("a_rev") != "1" or ready.get("a_undo") != "0" or ready.get("a_text_hex") != ORIGINAL_HEX:
+        raise AssertionError(f"trace ready record mismatch: {ready}")
+
+
+def validate_trace_at_start(entries):
+    """Exactly [ready, start(1)] with title A at rev=1, undo=0."""
+    _check_common(entries, 2)
+    _check_entry(entries[1], "composition_start", A_CANVAS_ID, 1, 0, ORIGINAL_HEX)
+
+
+def validate_trace_at_commit(entries):
+    """[ready, start(1), commit(1), end(1)]; returns supplied text."""
+    _check_common(entries, 4)
+    _check_entry(entries[1], "composition_start", A_CANVAS_ID, 1, 0, ORIGINAL_HEX)
+    commit = entries[2]
+    if commit.get("kind") != "commit" or commit.get("field") != str(A_CANVAS_ID) or commit.get("accepted") != "true":
+        raise AssertionError(f"trace commit record mismatch: {commit}")
+    if commit.get("rev") != "2" or commit.get("undo") != "1" or not commit.get("text_hex"):
+        raise AssertionError(f"trace commit revision/undo/bytes mismatch: {commit}")
+    supplied_hex = commit["text_hex"]
+    _check_entry(entries[3], "composition_end", A_CANVAS_ID, 2, 1, supplied_hex)
+    return hex_text(supplied_hex)
+
+
+def validate_complete_trace(entries):
+    """Full expected trace, including the final cancel pair.
+
+    Exactly: start(1), one accepted commit(1), end(1),
+    start(1), end(1) after the ready record, all on the host
+    thread under Cocoa, with title A at rev 1/undo 0, then
+    rev 2/undo 1 with the supplied bytes from the commit on.
+    Returns the supplied text.
+    """
+    if len(entries) >= 4:
+        validate_trace_at_commit(entries[:4])
+    _check_common(entries, 6)
+    supplied_hex = entries[2]["text_hex"]
+    _check_entry(entries[4], "composition_start", A_CANVAS_ID, 2, 1, supplied_hex)
+    _check_entry(entries[5], "composition_end", A_CANVAS_ID, 2, 1, supplied_hex)
+    return hex_text(supplied_hex)
+
+
+def _synthetic_entries(second_field=A_CANVAS_ID, extra_pairs=0, supplied="かな"):
+    supplied_hex = supplied.encode("utf-8").hex()
+    entries = [
+        {"seq": "0", "kind": "ready", "tid": "7", "main_tid": "7", "a_rev": "1", "a_undo": "0", "a_text_hex": ORIGINAL_HEX},
+        {"seq": "1", "kind": "composition_start", "field": "1", "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "1", "a_undo": "0", "a_text_hex": ORIGINAL_HEX},
+        {"seq": "2", "kind": "commit", "field": "1", "tid": "7", "main_tid": "7", "video": "cocoa", "accepted": "true", "text_hex": supplied_hex, "rev": "2", "undo": "1"},
+        {"seq": "3", "kind": "composition_end", "field": "1", "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex},
+        {"seq": "4", "kind": "composition_start", "field": str(second_field), "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex},
+        {"seq": "5", "kind": "composition_end", "field": str(second_field), "tid": "7", "main_tid": "7", "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex},
+    ]
+    seq = 6
+    for _ in range(extra_pairs):
+        for kind in ("composition_start", "composition_end"):
+            entries.append({"seq": str(seq), "kind": kind, "field": str(second_field), "tid": "7", "main_tid": "7",
+                            "video": "cocoa", "a_rev": "2", "a_undo": "1", "a_text_hex": supplied_hex})
+            seq += 1
+    return entries
+
+
+def self_test_trace():
+    valid = _synthetic_entries()
+    supplied = validate_complete_trace(valid)
+    print(f"self-test valid trace: PASS (supplied={supplied!r})")
+    for label, entries in [
+        ("wrong-field", _synthetic_entries(second_field=2)),
+        ("wrong-field/extra-pair", _synthetic_entries(second_field=2, extra_pairs=1)),
+    ]:
+        try:
+            validate_complete_trace(entries)
+        except AssertionError as exc:
+            print(f"self-test {label} counterexample: FAIL as required ({str(exc)[:160]})")
+            continue
+        raise AssertionError(f"{label} counterexample trace unexpectedly passed validation")
+    print("self-test verdicts differ: PASS")
+    return 0
+
+
 class Probe:
     def __init__(self, args):
         self.args = args
-        self.out = Path(args.output_dir) if args.output_dir else Path(tempfile.mkdtemp(prefix="dagda-native-ime."))
-        self.out.mkdir(parents=True, exist_ok=True)
+        # Each run gets a tagged, isolated directory, so a
+        # reused --output-dir can never contribute observations
+        # from an earlier run to this run's verdict.
+        self.run_id = uuid.uuid4().hex[:12]
+        base_out = Path(args.output_dir) if args.output_dir else Path(tempfile.mkdtemp(prefix="dagda-native-ime."))
+        self.out = base_out / f"run-{self.run_id}"
+        self.out.mkdir(parents=True, exist_ok=False)
         self.transcript = self.out / "transcript.txt"
         self.obs_log = self.out / "composition-obs.log"
         self.proc = None
@@ -129,6 +246,32 @@ class Probe:
         for e in entries:
             assert e.get("tid") == e.get("main_tid"), f"callback off host thread: {e}"
 
+    def operator_answers(self):
+        """Collect visual confirmations after the window sequence.
+
+        Asked only once the Dagda window is closed, so the
+        operator kept keyboard focus in it throughout. Each
+        answer is recorded verbatim-normalized; anything other
+        than yes (including EOF in an unattended run) is a
+        missing visual observation, never a pass.
+        """
+        questions = [
+            ("two_distinct_marked_updates", "During the FIRST composition, did the marked text visibly change in at least two distinct updates?"),
+            ("marked_text_and_focus_survived_preview", "While still composing after the automatic driver preview, did the marked text and caret remain visible in the A canvas field with that field still focused?"),
+            ("second_preedit_in_a_canvas_before_cancel", "During the SECOND composition, did marked text appear in the A canvas field before you cancelled it?"),
+        ]
+        self.record("operator confirmation questions (visual observations only; machine results above stand separately)")
+        answers = {}
+        for key, question in questions:
+            try:
+                raw = input(f"{question} [yes/no/unknown] ").strip().lower()
+            except EOFError:
+                raw = ""
+            normalized = {"yes": "yes", "y": "yes", "no": "no", "n": "no"}.get(raw, "unknown" if raw else "missing")
+            answers[key] = normalized
+            self.record(f"operator confirmation {key}: {normalized} (raw={raw!r})")
+        return answers
+
     def environment(self):
         self.record(f"platform: system={platform.system()} machine={platform.machine()} release={platform.release()}")
         if platform.system() == "Darwin":
@@ -138,9 +281,11 @@ class Probe:
                     self.record(f"{' '.join(cmd)} -> exit={out.returncode} {(out.stdout or out.stderr).strip()[:400]!r}")
                 except Exception as exc:
                     self.record(f"{' '.join(cmd)} failed: {exc!r}")
-        self.record(f"input source (operator-supplied): {self.args.input_source}")
+        self.record(f"run id: {self.run_id} (observations isolated under {self.out})")
+        self.record(f"input source label (supplied by the operator, not verified by the probe): {self.args.input_source}")
         self.record(f"keys (operator-supplied): {self.args.keys}")
         self.record(f"input method: native macOS IME via SDL text input (no --control-stdin), separate dagda-client over a private socket")
+        self.record("note: reaching CUE 1 with no composition start is a pending native run, not a pass")
         if platform.system() != "Darwin" or platform.machine() != "arm64":
             raise Pending(
                 f"native composition needs an Apple Silicon Mac desktop; this host is "
@@ -156,7 +301,14 @@ class Probe:
         sock_dir.mkdir()
         os.chmod(sock_dir, 0o700)
         self.sock = sock_dir / "app.sock"
+        assert not self.obs_log.exists(), f"observation log already exists for run {self.run_id}: {self.obs_log}"
         env = {**os.environ, "COMPOSITION_OBS_LOG": str(self.obs_log)}
+        # Native Cocoa path required: strip any inherited dummy
+        # or offscreen SDL drivers so SDL uses its macOS default
+        # (cocoa); the trace also verifies video=cocoa per record.
+        inherited_video = env.pop("SDL_VIDEODRIVER", None)
+        env.pop("SDL_AUDIODRIVER", None)
+        self.record(f"child SDL_VIDEODRIVER: inherited {inherited_video!r} removed; SDL default (cocoa on macOS) required and verified from the trace")
         # Normal --socket launch only: no --control-stdin and no
         # dummy video driver, so SDL subscribes to the native IME.
         self.proc = subprocess.Popen([str(app_bin), "--socket", str(self.sock)],
@@ -187,45 +339,33 @@ class Probe:
                         "press Command+A, switch to your composing input source if needed, and start a preedit. "
                         "Do not accept the candidate yet.")
             entries = self.wait_until("composition start #1",
-                                      lambda: [e for e in self.obs() if e.get("kind") == "composition_start"],
+                                      lambda: self.obs() if len(self.obs()) >= 2 else None,
                                       self.args.stage_timeout)
-            first = entries[0]
-            assert first.get("field") == str(A_CANVAS_ID), first
-            assert first.get("a_rev") == "1", first
-            self.check_threads(self.obs())
-            self.record(f"observed composition start #1: {first}")
-            self.record(f"CUE 1b: Keep the preedit alive and update the marked text at least twice "
-                        f"in the next {self.args.update_seconds:.0f} seconds. Do not accept yet; "
-                        f"the preview below runs automatically while you compose.")
+            validate_trace_at_start(entries)
+            self.record(f"machine step 1a: exact trace [ready, start(1) rev=1 undo=0] on the host thread under Cocoa: {entries[1]}")
+            self.record(f"CUE 1b: Keep composing for the next {self.args.update_seconds:.0f} seconds. "
+                        f"Visual observations (two distinct marked-text updates, and marked text/focus "
+                        f"surviving the preview) are NOT established by this delay or cue; you will be "
+                        f"asked about them after the window closes. Do not accept yet.")
             time.sleep(self.args.update_seconds)
-            before = self.obs()
-            assert len([e for e in before if e.get("kind") == "composition_end"]) == 0, before
+            validate_trace_at_start(self.obs())
             code, preview = self.client("preview", str(A_OUTLINE_ID), "rename", "1", "text", "Agent draft")
             assert code == 0 and preview.get("ok") is True, preview
-            self.record("operator: visually confirm focus, marked text and caret are still in the A canvas field (probe cannot see the preedit without the operator)")
             for role in ("a.canvas", "a.outline"):
                 el = self.inspect(role)
                 assert el["text"] == ORIGINAL, (role, el)
             st = self.status()
             assert st["a_rev"] == 1 and st["a_undo"] == 0, st
-            after_preview = self.obs()
-            assert len([e for e in after_preview if e.get("kind") == "composition_end"]) == 0, after_preview
-            self.record("step 1 passed: preview succeeded during preedit; committed bytes, revision and undo depth survived")
+            validate_trace_at_start(self.obs())
+            self.record("machine step 1b: preview succeeded during the composition; trace still exactly [ready, start(1)], committed bytes, revision and undo depth survived (visual survival remains an operator question)")
 
             # 2. Accept the candidate; stale driver commit must fail.
             self.record(f"CUE 2: Accept the candidate through the input source now (for example {self.args.accept_key}). Type nothing else.")
-            def committed():
-                es = self.obs()
-                commits = [e for e in es if e.get("kind") == "commit" and e.get("accepted") == "true"]
-                ends = [e for e in es if e.get("kind") == "composition_end"]
-                return (commits, ends) if commits and ends else None
-            commits, ends = self.wait_until("composition commit + end #1", committed, self.args.stage_timeout)
-            assert len(commits) == 1 and len(ends) == 1, (commits, ends)
-            supplied = hex_text(commits[0]["text_hex"])
-            seqs = [int(e["seq"]) for e in self.obs()]
-            assert int(commits[0]["seq"]) < int(ends[0]["seq"]), "composition end must follow the commit callback"
-            self.check_threads(self.obs())
-            self.record(f"observed accepted commit: text={supplied!r} bytes={supplied.encode('utf-8')!r} entry={commits[0]}; end entry={ends[0]}")
+            self.wait_until("composition commit + end #1",
+                            lambda: self.obs() if len(self.obs()) >= 4 else None,
+                            self.args.stage_timeout)
+            supplied = validate_trace_at_commit(self.obs())
+            self.record(f"machine step 2a: exact trace [ready, start(1), commit(1) accepted rev=2 undo=1, end(1) rev=2 undo=1]; supplied text={supplied!r} bytes={supplied.encode('utf-8')!r}")
             for role in ("a.canvas", "a.outline"):
                 el = self.inspect(role)
                 assert el["text"] == supplied, (role, el, supplied)
@@ -237,18 +377,16 @@ class Probe:
 
             # 3. Cancel a second composition; one Command+Z undoes.
             self.record("CUE 3: In the still-focused A canvas field, press Command+A, start a second preedit, then cancel it (Escape).")
-            def cancelled():
-                es = self.obs()
-                starts = [e for e in es if e.get("kind") == "composition_start"]
-                ends2 = [e for e in es if e.get("kind") == "composition_end"]
-                return (starts, ends2) if len(starts) >= 2 and len(ends2) >= 2 else None
-            starts, ends2 = self.wait_until("composition start/end #2 (cancel)", cancelled, self.args.stage_timeout)
-            assert len([e for e in self.obs() if e.get("kind") == "commit"]) == 1, self.obs()
+            self.wait_until("composition start/end #2 (cancel)",
+                            lambda: self.obs() if len(self.obs()) >= 6 else None,
+                            self.args.stage_timeout)
+            supplied_again = validate_complete_trace(self.obs())
+            assert supplied_again == supplied, (supplied_again, supplied)
             for role in ("a.canvas", "a.outline"):
                 assert self.inspect(role)["text"] == supplied, role
             st = self.status()
             assert st["a_rev"] == 2 and st["a_undo"] == 1, st
-            self.record(f"observed cancel pair: start={starts[1]} end={ends2[1]}; committed state unchanged")
+            self.record("machine step 3a: complete trace is exactly start(1), one accepted commit(1), end(1), start(1), end(1) with rev/undo/bytes as documented; no extra pair and no commit from the cancel; committed state unchanged")
             self.record("CUE 4: Press Command+Z once in the A canvas field.")
             def undone():
                 el = self.inspect("a.canvas")
@@ -256,13 +394,24 @@ class Probe:
                 return (el, st2) if el["text"] == ORIGINAL and st2["a_rev"] == 3 and st2["a_undo"] == 0 else None
             el, st = self.wait_until("Command+Z undo to original", undone, self.args.stage_timeout)
             assert self.inspect("a.outline")["text"] == ORIGINAL
-            self.record(f"step 3 passed: cancel kept state; Command+Z restored {ORIGINAL!r} bytes={ORIGINAL.encode('utf-8')!r} at rev={st['a_rev']} undo={st['a_undo']}")
+            final_entries = self.obs()
+            assert validate_complete_trace(final_entries) == supplied, final_entries
+            self.record(f"machine step 3b: Command+Z restored {ORIGINAL!r} bytes={ORIGINAL.encode('utf-8')!r} at rev={st['a_rev']} undo={st['a_undo']}; final trace still exactly the six expected records")
+            for entry in final_entries:
+                self.record(f"trace record: {entry}")
 
-            self.record("CUE 5: Close the Dagda window now.")
-            rc = self.proc.wait(timeout=self.args.stage_timeout)
+            self.record("CUE 5: Close the Dagda window now. After it closes, focus this terminal for the operator questions.")
+            try:
+                rc = self.proc.wait(timeout=self.args.stage_timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise Pending(f"window close not observed within {self.args.stage_timeout:.0f}s") from exc
             assert rc == 0, f"host exited with status {rc} after window close"
             self.proc = None
-            self.record("all native IME cases observed")
+            answers = self.operator_answers()
+            unconfirmed = [key for key, value in answers.items() if value != "yes"]
+            if unconfirmed:
+                raise Pending(f"machine stages passed but visual observations were not confirmed (need yes): {unconfirmed} answers={answers}")
+            self.record("all native IME cases observed (machine trace, driver checks, and operator visual confirmations)")
             return 0
         finally:
             base.stop_process(self.proc)
@@ -272,13 +421,18 @@ class Probe:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-source", required=True, help='e.g. "Japanese - Romaji" or "Pinyin - Simplified"')
+    parser.add_argument("--input-source", default="", help='e.g. "Japanese - Romaji" or "Pinyin - Simplified"')
+    parser.add_argument("--self-test-trace", action="store_true", help="exercise the trace verdict on a valid trace and the wrong-field/extra-pair counterexample, then exit")
     parser.add_argument("--keys", default="Command+A; romaji/pinyin syllables updating the preedit at least twice; Return accepts; Escape cancels; Command+Z undoes")
     parser.add_argument("--accept-key", default="Return")
     parser.add_argument("--stage-timeout", type=float, default=120.0)
     parser.add_argument("--update-seconds", type=float, default=12.0)
     parser.add_argument("--output-dir", default="")
     args = parser.parse_args()
+    if args.self_test_trace:
+        return self_test_trace()
+    if not args.input_source:
+        parser.error("--input-source is required unless --self-test-trace is given")
     probe = Probe(args)
     try:
         return probe.run()

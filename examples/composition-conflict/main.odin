@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 import "dagda:dagda"
+import sdl "vendor:sdl3"
 import "dagda:dagda/driver"
 import "dagda:dagda/sdlhost"
 
@@ -175,8 +176,8 @@ conflict_observe_composition :: proc(user_data: rawptr, field_id: dagda.Object_I
 	}
 	app.obs_seq += 1
 	obs_record(app, fmt.tprintf(
-		"seq=%d kind=composition_%s field=%d tid=%d main_tid=%d a_text_hex=%s a_rev=%d a_undo=%d",
-		app.obs_seq, composing ? "start" : "end", u64(field_id), sync.current_thread_id(), app.main_thread,
+		"seq=%d kind=composition_%s field=%d tid=%d main_tid=%d video=%s a_text_hex=%s a_rev=%d a_undo=%d",
+		app.obs_seq, composing ? "start" : "end", u64(field_id), sync.current_thread_id(), app.main_thread, sdl.GetCurrentVideoDriver(),
 		obs_hex(app.doc_a.text), u64(app.doc_a.rev), len(app.doc_a.undo),
 	))
 }
@@ -194,8 +195,8 @@ conflict_observe_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text
 		rev, undo = int(d.rev), len(d.undo)
 	}
 	obs_record(app, fmt.tprintf(
-		"seq=%d kind=commit field=%d tid=%d main_tid=%d accepted=%v text_hex=%s rev=%d undo=%d",
-		app.obs_seq, u64(id), sync.current_thread_id(), app.main_thread, accepted,
+		"seq=%d kind=commit field=%d tid=%d main_tid=%d video=%s accepted=%v text_hex=%s rev=%d undo=%d",
+		app.obs_seq, u64(id), sync.current_thread_id(), app.main_thread, sdl.GetCurrentVideoDriver(), accepted,
 		obs_hex(new_text), rev, undo,
 	))
 	return accepted
