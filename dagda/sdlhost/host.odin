@@ -112,9 +112,11 @@ Host :: struct {
 }
 
 host_rebuild_frame :: proc(h: ^Host) -> bool {
-	w, height: c.int
-	sdl.GetWindowSize(h.window, &w, &height)
-	h.viewport = {width = f32(w), height = f32(height)}
+	if h.window != nil {
+		w, height: c.int
+		sdl.GetWindowSize(h.window, &w, &height)
+		h.viewport = {width = f32(w), height = f32(height)}
+	}
 	// Release the previous frame before rebuilding the app view/canvas so no
 	// frame outlives borrowed label/role storage.
 	dagda.frame_destroy(&h.frame)
@@ -754,19 +756,22 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 
 // host_dispatch_mouse_event routes MOUSE_MOTION, MOUSE_BUTTON_DOWN, and
 // MOUSE_BUTTON_UP across editable text drag selection, canvas pointer gestures,
-// hover tracking, and ordinary element activation.
-host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool) {
+// hover tracking, and ordinary element activation. Returns false if a frame
+// rebuild failed so the host exits through its normal failure path.
+host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	#partial switch ev.type {
 	case .MOUSE_MOTION:
 		if h.text_edit.dragging {
 			if text_edit_drag_move(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, ev.motion.x, h.app.editable_text_targets) {
 				h.needs_redraw = true
 			}
-			return false
+			return true
 		}
 		pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
 		if pres.changed {
-			needs_rebuild = true
+			if !host_rebuild_frame(h) {
+				return false
+			}
 		}
 		if !pres.consumed {
 			id, hit := dagda.hit_test(h.frame, {x = ev.motion.x, y = ev.motion.y})
@@ -783,13 +788,36 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 			if h.app.text_edit.enabled {
 				if hit && text_edit_is_target(h.app.text_edit, h.app.editable_text_targets, id) {
 					_ = focus_clear(&h.focus)
-					_, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets)
+					started, changed := text_edit_press_id(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, id, ev.button.x, h.app.editable_text_targets)
 					if changed {
 						h.needs_redraw = true
 					}
 					h.has_pressed = true
 					h.pressed_id = id
-					return false
+					if started && h.frame.has_canvas && h.app.on_pointer != nil {
+						if h.pointer.active {
+							cancelled, c := pointer_cancel(&h.pointer, h.app.on_pointer, h.app.user_data)
+							if cancelled {
+								host_clear_pressed_on_cancel(h)
+							}
+							if c && !host_rebuild_frame(h) {
+								return false
+							}
+						}
+						if canvas_p, in_canvas := dagda.window_point_to_canvas(h.frame.transform, {x = ev.button.x, y = ev.button.y}); in_canvas {
+							if h.app.on_pointer(h.app.user_data, {
+								phase      = .Press,
+								has_target = true,
+								target_id  = id,
+								point      = canvas_p,
+							}) {
+								if !host_rebuild_frame(h) {
+									return false
+								}
+							}
+						}
+					}
+					return true
 				} else if text_edit_blur(&h.text_edit, h.ime_window) {
 					h.needs_redraw = true
 				}
@@ -798,11 +826,15 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 			h.pressed_id = hit ? id : 0
 			pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
 			if pres.changed {
-				needs_rebuild = true
+				if !host_rebuild_frame(h) {
+					return false
+				}
 			}
 			if !pres.suppress_click {
 				if dagda.click(h.frame, {x = ev.button.x, y = ev.button.y}, h.app.handle, h.app.user_data) == .Applied {
-					needs_rebuild = true
+					if !host_rebuild_frame(h) {
+						return false
+					}
 				} else {
 					h.needs_redraw = true
 				}
@@ -812,7 +844,9 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 		} else if ev.button.button == sdl.BUTTON_RIGHT && h.pointer.active {
 			pres := host_handle_pointer_cancel_event(h, ev)
 			if pres.changed {
-				needs_rebuild = true
+				if !host_rebuild_frame(h) {
+					return false
+				}
 			}
 		}
 
@@ -828,7 +862,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 					h.pressed_id = 0
 					h.needs_redraw = true
 				}
-				return false
+				return true
 			}
 			pres := pointer_handle_event(&h.pointer, h.frame, ev, h.app.on_pointer, h.app.user_data)
 			if h.has_pressed {
@@ -837,7 +871,9 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 				h.needs_redraw = true
 			}
 			if pres.changed {
-				needs_rebuild = true
+				if !host_rebuild_frame(h) {
+					return false
+				}
 			}
 			if pres.consumed && !pres.suppress_click && pres.has_click_id {
 				if pointer_try_activate(
@@ -847,12 +883,14 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: b
 					h.app.handle,
 					h.app.user_data,
 				) {
-					needs_rebuild = true
+					if !host_rebuild_frame(h) {
+						return false
+					}
 				}
 			}
 		}
 	}
-	return needs_rebuild
+	return true
 }
 
 run :: proc(app: App, opts: Run_Options = {}) -> int {
@@ -931,11 +969,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .MOUSE_MOTION, .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
-					if host_dispatch_mouse_event(&h, &ev) {
-						if !host_rebuild_frame(&h) {
-							exit_code = 1
-							running = false
-						}
+					if !host_dispatch_mouse_event(&h, &ev) {
+						exit_code = 1
+						running = false
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
 					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets)
