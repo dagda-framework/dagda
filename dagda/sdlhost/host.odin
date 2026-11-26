@@ -512,6 +512,25 @@ poll_control_stdin :: proc(
 				fmt.printf("CONTROL_ERR invalid key %s\n", name)
 				_ = os.flush(os.stdout)
 			}
+		} else if strings.has_prefix(line, "resize ") {
+			w, ht, ok_size := parse_size_arg(line[len("resize "):])
+			if ok_size {
+				sdl.SetWindowSize(h.window, w, ht)
+				_ = sdl.SyncWindow(h.window)
+				if !host_rebuild_frame(h) {
+					fmt.println("CONTROL_ERR resize rebuild failed")
+					_ = os.flush(os.stdout)
+					exit_code^ = 1
+					running^ = false
+					break
+				}
+				_ = host_render(h)
+				fmt.printf("CONTROL_OK resize %dx%d\n", w, ht)
+				_ = os.flush(os.stdout)
+			} else {
+				fmt.println("CONTROL_ERR invalid resize")
+				_ = os.flush(os.stdout)
+			}
 		} else if strings.has_prefix(line, "screenshot ") {
 			path := line[len("screenshot "):]
 			if !host_render(h, path) {

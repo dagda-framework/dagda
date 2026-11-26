@@ -21,6 +21,9 @@ jobs:
       - name: Install the pinned Odin compiler
         run: bash scripts/setup-odin.sh
 
+      - name: Run the canvas slide unit tests
+        run: ./scripts/odin.sh test examples/canvas-slide -collection:dagda=.
+
       - name: Link a js_wasm32 consumer of Dagda core
         run: |
           ./scripts/odin.sh build tests/js-wasm32-consumer -collection:dagda=. -target:js_wasm32 -out:"$RUNNER_TEMP/dagda-consumer.wasm"
@@ -69,6 +72,12 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
         run: python3 examples/counter/tests/acceptance_test.py build/counter-capture
+
+      - name: Run the agent preview acceptance test
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python3 examples/canvas-slide/tests/agent_preview_acceptance.py
 
       - name: Run the native canvas acceptance test
         env:

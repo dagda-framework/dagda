@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "dagda:dagda"
+import "dagda:dagda/driver"
 import "dagda:dagda/sdlhost"
 
 HEADLINE_ID :: dagda.Object_Id(1)
@@ -155,19 +156,64 @@ slide_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Actio
 	return false
 }
 
-slide_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+slide_edits := []dagda.Advertised_Edit{
+	{object_id = HEADLINE_ID, edit = "replace_text", argument = .Text},
+}
+
+// slide_edit_handle is the app-owned replace_text handler: it
+// enforces the headline revision and records exactly one undo
+// entry per accepted replacement, like the keyboard path.
+slide_edit_handle :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
 	s := (^Slide_Canvas)(user_data)
-	if id != HEADLINE_ID || new_text == s.headline {
-		return false
+	if target.id != HEADLINE_ID {
+		return .Unknown_Object
+	}
+	if target.base_revision != dagda.Revision(s.headline_rev) {
+		return .Stale_Revision
+	}
+	return slide_commit_headline(s, arg.text)
+}
+
+slide_revision :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+	s := (^Slide_Canvas)(user_data)
+	if id != HEADLINE_ID {
+		return 0, false
+	}
+	return dagda.Revision(s.headline_rev), true
+}
+
+// slide_commit_headline is the one app-owned mutation path for
+// the headline: keyboard composition commits and driver edits
+// both land here, so the single-line rule, undo entry, and
+// revision advance can never diverge between them.
+slide_commit_headline :: proc(s: ^Slide_Canvas, new_text: string) -> dagda.Edit_Result {
+	if !dagda.valid_single_line(new_text) || new_text == s.headline {
+		return .Not_Handled
 	}
 	cloned, err := strings.clone(new_text)
-	if err != nil {
-		return false
+	if err != nil || len(cloned) != len(new_text) {
+		return .Alloc_Failed
 	}
+	// Keep the undo stack's own allocator. Publish the new
+	// headline and revision only after exactly one history
+	// entry has actually been added.
+	before := len(s.undo_stack)
 	append(&s.undo_stack, Undo_Entry{kind = .Headline_Text, text = s.headline})
+	if len(s.undo_stack) != before + 1 {
+		delete(cloned)
+		return .Alloc_Failed
+	}
 	s.headline = cloned
 	s.headline_rev += 1
-	return true
+	return .Applied
+}
+
+slide_text_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+	s := (^Slide_Canvas)(user_data)
+	if id != HEADLINE_ID {
+		return false
+	}
+	return slide_commit_headline(s, new_text) == .Applied
 }
 
 slide_text_undo :: proc(user_data: rawptr, id: dagda.Object_Id) -> bool {
@@ -260,6 +306,7 @@ main :: proc() {
 		canvas     = slide_canvas,
 		handle     = slide_handle,
 		on_pointer = slide_pointer,
+		edits      = driver.Edit_Source{edits = slide_edits, handler = slide_edit_handle, user_data = &slide, revision_of = slide_revision},
 		text_edit  = {
 			enabled   = true,
 			target_id = HEADLINE_ID,
