@@ -62,12 +62,13 @@ contains :: proc(r: Rect, p: Point) -> bool {
 // frame was resolved from a Canvas (see canvas.odin); for a flow
 // layout it equals bounds.
 Resolved_Element :: struct {
-	info:          Object_Info,
-	kind:          Element_Kind,
-	text:          string, // borrowed from the view definition
-	bounds:        Rect,
-	canvas_bounds: Rect,
-	actions:       Action_Set,
+	info:           Object_Info,
+	kind:           Element_Kind,
+	text:           string, // borrowed from the view definition
+	bounds:         Rect,
+	canvas_bounds:  Rect,
+	actions:        Action_Set,
+	window_overlay: bool, // host chrome (menu bar / popup) painted in window coordinates over any canvas clip
 }
 
 // A resolved frame. Element IDs are unique within a frame and
@@ -185,14 +186,21 @@ find :: proc(frame: Frame, id: Object_Id) -> (Resolved_Element, bool) {
 	return {}, false
 }
 
-// hit_test is the one hit-testing path for every frame. For a
-// canvas frame the window point is first clipped to the fitted
-// canvas rectangle in window coordinates (so a letterbox click,
-// or one beyond the canvas edge on an element that extends past
-// it, misses), then resolved window rectangles are tested in
-// reverse draw order so the last-drawn element wins. Edges are
-// inclusive on the left/top and exclusive on the right/bottom.
+// hit_test is the one hit-testing path for every frame. Visible window overlays
+// (such as host menu bars and open popups) are tested in reverse draw order
+// first, before canvas clipping is applied to underlying elements. For a canvas
+// frame the window point is then clipped to the fitted canvas rectangle in
+// window coordinates (so a letterbox click, or one beyond the canvas edge on an
+// element that extends past it, misses), and underlying resolved window
+// rectangles are tested in reverse draw order so the last-drawn element wins.
+// Edges are inclusive on the left/top and exclusive on the right/bottom.
 hit_test :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
+	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
+		el := frame.elements[i]
+		if el.window_overlay && contains(el.bounds, p) {
+			return el.info.id, true
+		}
+	}
 	if frame.has_canvas {
 		fitted := Rect{
 			x = frame.transform.offset.x,
@@ -205,8 +213,9 @@ hit_test :: proc(frame: Frame, p: Point) -> (Object_Id, bool) {
 		}
 	}
 	for i := len(frame.elements) - 1; i >= 0; i -= 1 {
-		if contains(frame.elements[i].bounds, p) {
-			return frame.elements[i].info.id, true
+		el := frame.elements[i]
+		if !el.window_overlay && contains(el.bounds, p) {
+			return el.info.id, true
 		}
 	}
 	return 0, false

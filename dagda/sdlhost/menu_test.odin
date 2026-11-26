@@ -1,9 +1,11 @@
 package sdlhost
 
+import "core:fmt"
 import "core:math"
 import "core:sync"
 import "core:testing"
 import "dagda:dagda"
+import "dagda:dagda/driver"
 import sdl "vendor:sdl3"
 
 @(private = "file")
@@ -317,4 +319,271 @@ test_menu_one_popup_ime_precedence_and_driver_discovery :: proc(t: ^testing.T) {
 	_, _, _ = host_dispatch_key_event(&h, &sf10)
 	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
 	testing.expect_value(t, h.menu.context_id, dagda.Object_Id(10))
+}
+
+@(private = "file")
+Menu_Comp_App :: struct {
+	base:         Menu_Test_App,
+	a_buf:        [64]u8,
+	commits:      int,
+	comp_starts:  int,
+	comp_ends:    int,
+	end_after_cm: bool,
+}
+
+@(private = "file")
+menu_comp_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
+	app := (^Menu_Comp_App)(user_data)
+	if id != 10 || len(new_text) > len(app.a_buf) {
+		return false
+	}
+	app.base.a_text = string(app.a_buf[:copy(app.a_buf[:], new_text)])
+	app.commits += 1
+	return true
+}
+
+@(private = "file")
+menu_comp_observe :: proc(user_data: rawptr, field_id: dagda.Object_Id, composing: bool) {
+	app := (^Menu_Comp_App)(user_data)
+	if field_id != 10 {
+		return
+	}
+	if composing {
+		app.comp_starts += 1
+	} else {
+		app.comp_ends += 1
+		if app.commits > 0 {
+			app.end_after_cm = true
+		}
+	}
+}
+
+@(private = "file")
+menu_comp_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+	app := (^Menu_Comp_App)(user_data)
+	return menu_test_canvas(&app.base)
+}
+
+@(private = "file")
+make_text_editing_ev :: proc(text: cstring) -> sdl.Event {
+	ev: sdl.Event
+	ev.type = .TEXT_EDITING
+	ev.edit.text = text
+	ev.edit.start = 0
+	ev.edit.length = 1
+	return ev
+}
+
+@(private = "file")
+make_text_input_ev :: proc(text: cstring) -> sdl.Event {
+	ev: sdl.Event
+	ev.type = .TEXT_INPUT
+	ev.text.text = text
+	return ev
+}
+
+@(test)
+test_menu_open_over_composition_both_orderings :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	viewport := dagda.Size{width = 480, height = 300}
+	surface := sdl.CreateSurface(480, 300, .RGBA8888)
+	if !testing.expect(t, surface != nil) { return }
+	defer sdl.DestroySurface(surface)
+	renderer := sdl.CreateSoftwareRenderer(surface)
+	if !testing.expect(t, renderer != nil) { return }
+	defer sdl.DestroyRenderer(renderer)
+
+	setup_comp_host :: proc(t: ^testing.T, state: ^Menu_Comp_App, viewport: dagda.Size, surface: ^sdl.Surface, renderer: ^sdl.Renderer) -> (h: Host, ok: bool) {
+		state^ = {}
+		h, ok = menu_test_setup_host(t, &state.base, viewport, surface, renderer)
+		if !ok {
+			return {}, false
+		}
+		state.base.a_text = string(state.a_buf[:copy(state.a_buf[:], "abcd")])
+		h.app.user_data = state
+		h.app.canvas = menu_comp_canvas
+		h.app.text_edit = {enabled = true, on_commit = menu_comp_commit}
+		h.app.on_composition = menu_comp_observe
+		if !testing.expect(t, host_rebuild_frame(&h)) {
+			return {}, false
+		}
+		// Focus A (id=10), select "cd" (bytes 2..4), start composition "하".
+		testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 10, h.app.editable_text_targets))
+		h.text_edit.session.anchor = 2
+		h.text_edit.session.caret = 4
+		pre_ev := make_text_editing_ev("하")
+		testing.expect(t, host_dispatch_text_event(&h, &pre_ev))
+		testing.expect_value(t, state.comp_starts, 1)
+		testing.expect_value(t, state.comp_ends, 0)
+		testing.expect_value(t, state.commits, 0)
+		// Open B's context menu over active composition on A.
+		menu_open_context(&h, 1, {x = 120, y = 180}, false)
+		testing.expect(t, menu_is_open(&h.menu))
+		return h, true
+	}
+
+	teardown_host :: proc(h: ^Host) {
+		font_destroy_textures(&h.font)
+		font_destroy(&h.font)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.driver_frame)
+		dagda.frame_destroy(&h.frame)
+	}
+
+	esc_ev: sdl.Event
+	esc_ev.type = .KEY_DOWN
+	esc_ev.key.key = sdl.K_ESCAPE
+	esc_ev.key.down = true
+
+	// Ordering 1: Escape closes popup first; active composition survives and finishes once with "한", then "|".
+	{
+		state: Menu_Comp_App
+		h, ok := setup_comp_host(t, &state, viewport, surface, renderer)
+		if !ok { return }
+		defer teardown_host(&h)
+
+		_, _, _ = host_dispatch_key_event(&h, &esc_ev)
+		testing.expect(t, !menu_is_open(&h.menu))
+		testing.expect_value(t, state.comp_starts, 1)
+		testing.expect_value(t, state.comp_ends, 0)
+		testing.expect_value(t, state.commits, 0)
+
+		fin_ev := make_text_input_ev("한")
+		testing.expect(t, host_dispatch_text_event(&h, &fin_ev))
+		testing.expect_value(t, state.base.a_text, "ab한")
+		testing.expect_value(t, state.commits, 1)
+		testing.expect_value(t, state.comp_ends, 1)
+		testing.expect(t, state.end_after_cm)
+
+		mark_ev := make_text_input_ev("|")
+		testing.expect(t, host_dispatch_text_event(&h, &mark_ev))
+		testing.expect_value(t, state.base.a_text, "ab한|")
+	}
+
+	// Ordering 2: IME final "한" arrives while popup is still open -> commits "ab한" once,
+	// ends composition once, suppresses subsequent ordinary typing while popup stays open,
+	// then Escape + "|" produces "ab한|".
+	{
+		state: Menu_Comp_App
+		h, ok := setup_comp_host(t, &state, viewport, surface, renderer)
+		if !ok { return }
+		defer teardown_host(&h)
+
+		fin_ev := make_text_input_ev("한")
+		testing.expect(t, host_dispatch_text_event(&h, &fin_ev))
+		testing.expect_value(t, state.base.a_text, "ab한")
+		testing.expect_value(t, state.commits, 1)
+		testing.expect_value(t, state.comp_ends, 1)
+		testing.expect(t, state.end_after_cm)
+		testing.expect(t, menu_is_open(&h.menu), "IME final must not unexpectedly destroy popup state before dismissal")
+
+		// Composition is now over; ordinary typing while popup is open must be suppressed.
+		noise_ev := make_text_input_ev("Z")
+		testing.expect(t, host_dispatch_text_event(&h, &noise_ev))
+		testing.expect_value(t, state.base.a_text, "ab한")
+		testing.expect_value(t, state.commits, 1)
+
+		_, _, _ = host_dispatch_key_event(&h, &esc_ev)
+		testing.expect(t, !menu_is_open(&h.menu))
+
+		mark_ev := make_text_input_ev("|")
+		testing.expect(t, host_dispatch_text_event(&h, &mark_ev))
+		testing.expect_value(t, state.base.a_text, "ab한|")
+	}
+
+	// Ordering 3: IME cancellation (empty TEXT_EDITING) arrives while popup is open ->
+	// ends composition once with zero writer commits, suppresses ordinary typing while open,
+	// then Escape + "|" replaces preserved selection "cd" -> "ab|".
+	{
+		state: Menu_Comp_App
+		h, ok := setup_comp_host(t, &state, viewport, surface, renderer)
+		if !ok { return }
+		defer teardown_host(&h)
+
+		cancel_ev := make_text_editing_ev("")
+		testing.expect(t, host_dispatch_text_event(&h, &cancel_ev))
+		testing.expect_value(t, state.base.a_text, "abcd")
+		testing.expect_value(t, state.commits, 0)
+		testing.expect_value(t, state.comp_ends, 1)
+
+		noise_ev := make_text_input_ev("Z")
+		testing.expect(t, host_dispatch_text_event(&h, &noise_ev))
+		testing.expect_value(t, state.commits, 0)
+
+		_, _, _ = host_dispatch_key_event(&h, &esc_ev)
+		testing.expect(t, !menu_is_open(&h.menu))
+
+		mark_ev := make_text_input_ev("|")
+		testing.expect(t, host_dispatch_text_event(&h, &mark_ev))
+		testing.expect_value(t, state.base.a_text, "ab|")
+	}
+}
+
+@(private = "file")
+menu_960_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+	app := (^Menu_Test_App)(user_data)
+	app.elements = {
+		{info = {id = 10, role = "slide.a"}, kind = .Label, text = app.a_text, bounds = {x = 80, y = 120, width = 800, height = 60}},
+		{info = {id = 11, role = "slide.b"}, kind = .Label, text = app.b_text, bounds = {x = 80, y = 220, width = 800, height = 60}},
+	}
+	return {size = {width = 960, height = 540}, elements = app.elements[:]}
+}
+
+@(test)
+test_menu_driver_hit_test_letterbox_1200x540 :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	// 960x540 canvas fitted in a 1200x540 window leaves a 120px left letterbox [0, 120).
+	viewport := dagda.Size{width = 1200, height = 540}
+	surface := sdl.CreateSurface(1200, 540, .RGBA8888)
+	if !testing.expect(t, surface != nil) { return }
+	defer sdl.DestroySurface(surface)
+	renderer := sdl.CreateSoftwareRenderer(surface)
+	if !testing.expect(t, renderer != nil) { return }
+	defer sdl.DestroyRenderer(renderer)
+
+	state: Menu_Test_App
+	h, ok := menu_test_setup_host(t, &state, viewport, surface, renderer)
+	if !ok { return }
+	defer {
+		font_destroy_textures(&h.font)
+		font_destroy(&h.font)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.driver_frame)
+		dagda.frame_destroy(&h.frame)
+	}
+	h.app.canvas = menu_960_canvas
+	if !testing.expect(t, host_rebuild_frame(&h)) { return }
+	testing.expect(t, h.frame.has_canvas && h.frame.transform.offset.x == 120)
+
+	// Open File menu: Stamp (id=100) sits at x=[10, 186), y=[36, 66), crossing into the left letterbox.
+	menu_open_bar(&h, 0, false)
+	df := host_driver_frame(&h)
+	stamp_el, stamp_found := dagda.find(df^, 100)
+	if !testing.expect(t, stamp_found) { return }
+	testing.expect(t, stamp_el.bounds.x < 120 && stamp_el.bounds.width > 0 && stamp_el.bounds.height > 0)
+
+	// Query a point strictly inside both Stamp and the left letterbox (x < 120).
+	px := stamp_el.bounds.x + 12
+	py := stamp_el.bounds.y + stamp_el.bounds.height * 0.5
+	testing.expect(t, px < h.frame.transform.offset.x, "test point must lie in the left letterbox")
+	req := fmt.tprintf(`{{"op":"hit-test","x":%g,"y":%g}}`, px, py)
+
+	open_reply, _ := driver.dispatch(df^, nil, nil, req)
+	defer delete(open_reply)
+	testing.expect_value(t, open_reply, `{"ok":true,"id":100}`)
+
+	// A letterbox point outside the popup still misses.
+	miss_reply, _ := driver.dispatch(df^, nil, nil, `{"op":"hit-test","x":40,"y":300}`)
+	defer delete(miss_reply)
+	testing.expect_value(t, miss_reply, `{"ok":true,"id":null}`)
+
+	// After dismissal, the exact same letterbox point returns null.
+	_ = menu_close(&h)
+	closed_reply, _ := driver.dispatch(host_driver_frame(&h)^, nil, nil, req)
+	defer delete(closed_reply)
+	testing.expect_value(t, closed_reply, `{"ok":true,"id":null}`)
 }

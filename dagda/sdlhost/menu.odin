@@ -628,10 +628,11 @@ host_sync_driver_frame :: proc(h: ^Host) {
 		}
 		tr := menu_bar_title_rect(h, i)
 		elems[n] = dagda.Resolved_Element{
-			info   = {id = dagda.Object_Id(next_title_id), role = "menu.title"},
-			kind   = .Label,
-			text   = m.text,
-			bounds = tr,
+			info           = {id = dagda.Object_Id(next_title_id), role = "menu.title"},
+			kind           = .Label,
+			text           = m.text,
+			bounds         = tr,
+			window_overlay = true,
 		}
 		n += 1
 		next_title_id -= 1
@@ -643,11 +644,12 @@ host_sync_driver_frame :: proc(h: ^Host) {
 		for item, ii in m.items {
 			b := is_open ? menu_popup_item_rect(h, popup, ii) : dagda.Rect{}
 			elems[n] = dagda.Resolved_Element{
-				info    = item.info,
-				kind    = item.enabled ? .Button : .Label,
-				text    = item.text,
-				bounds  = b,
-				actions = item.enabled ? {.Activate} : {},
+				info           = item.info,
+				kind           = item.enabled ? .Button : .Label,
+				text           = item.text,
+				bounds         = b,
+				actions        = item.enabled ? {.Activate} : {},
+				window_overlay = true,
 			}
 			n += 1
 		}
@@ -658,11 +660,12 @@ host_sync_driver_frame :: proc(h: ^Host) {
 		for item, ii in ctx.items {
 			b := is_open ? menu_popup_item_rect(h, popup, ii) : dagda.Rect{}
 			elems[n] = dagda.Resolved_Element{
-				info    = item.info,
-				kind    = item.enabled ? .Button : .Label,
-				text    = item.text,
-				bounds  = b,
-				actions = item.enabled ? {.Activate} : {},
+				info           = item.info,
+				kind           = item.enabled ? .Button : .Label,
+				text           = item.text,
+				bounds         = b,
+				actions        = item.enabled ? {.Activate} : {},
+				window_overlay = true,
 			}
 			n += 1
 		}

@@ -1212,6 +1212,33 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 // MOUSE_BUTTON_UP across editable text drag selection, canvas pointer gestures,
 // hover tracking, and ordinary element activation. Returns false if a frame
 // rebuild failed so the host exits through its normal failure path.
+// host_dispatch_text_event routes TEXT_EDITING and TEXT_INPUT events.
+// When a menu popup is open without an active composition, ordinary typing is
+// suppressed so it does not reach the underlying text field. When a popup opens
+// over an active IME composition, arriving IME updates, final commits, or
+// cancellations still route through the originating field exactly once.
+host_dispatch_text_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
+	if menu_is_open(&h.menu) && !menu_is_composing(h) {
+		return true
+	}
+	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
+	host_report_composition(h, host_active_composition(h))
+	if tres.needs_redraw {
+		h.needs_redraw = true
+	}
+	if tres.needs_rebuild {
+		if !host_rebuild_frame(h) {
+			if tres.has_pending_edit {
+				dagda.edit_destroy(&h.text_edit.session, &tres.pending_edit)
+			}
+			return false
+		} else if tres.has_pending_edit {
+			text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
+		}
+	}
+	return true
+}
+
 host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	defer host_report_composition(h, host_active_composition(h))
 	menu_consumed, menu_rebuild := menu_handle_mouse_event(h, ev)
@@ -1454,24 +1481,9 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
-					if menu_is_open(&h.menu) {
-						break
-					}
-					tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, &ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
-					host_report_composition(&h, host_active_composition(&h))
-					if tres.needs_redraw {
-						h.needs_redraw = true
-					}
-					if tres.needs_rebuild {
-						if !host_rebuild_frame(&h) {
-							if tres.has_pending_edit {
-								dagda.edit_destroy(&h.text_edit.session, &tres.pending_edit)
-							}
-							exit_code = 1
-							running = false
-						} else if tres.has_pending_edit {
-							text_edit_apply_committed(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, &tres.pending_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
-						}
+					if !host_dispatch_text_event(&h, &ev) {
+						exit_code = 1
+						running = false
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
 					needs_rebuild, has_pending_edit, pending_edit := host_dispatch_key_event(&h, &ev)
