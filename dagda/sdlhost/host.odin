@@ -145,6 +145,24 @@ parse_size_arg :: proc(s: string) -> (w: i32, h: i32, ok: bool) {
 	return i32(wv), i32(hv), true
 }
 
+parse_move_window_args :: proc(s: string) -> (x: c.int, y: c.int, ok: bool) {
+	sp := strings.index_byte(s, ' ')
+	if sp <= 0 || sp + 1 >= len(s) {
+		return 0, 0, false
+	}
+	mx, ok_x := strconv.parse_i64(s[:sp])
+	my, ok_y := strconv.parse_i64(s[sp + 1:])
+	if !ok_x || !ok_y {
+		return 0, 0, false
+	}
+	min_v := i64(min(c.int))
+	max_v := i64(max(c.int))
+	if mx < min_v || mx > max_v || my < min_v || my > max_v {
+		return 0, 0, false
+	}
+	return c.int(mx), c.int(my), true
+}
+
 parse_cli_args :: proc(args: []string) -> (opts: Run_Options, ok: bool) {
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
@@ -781,22 +799,64 @@ poll_control_stdin :: proc(
 		} else if line == "window-info" {
 			drv := sdl.GetCurrentVideoDriver()
 			drv_str := drv != nil ? string(drv) : "unknown"
+			pos_x, pos_y: c.int
 			win_w, win_h: c.int
 			out_w, out_h: c.int
-			_ = sdl.GetWindowSize(h.window, &win_w, &win_h)
-			_ = sdl.GetCurrentRenderOutputSize(h.renderer, &out_w, &out_h)
-			density := sdl.GetWindowPixelDensity(h.window)
-			display_scale := sdl.GetWindowDisplayScale(h.window)
-			fmt.printf(
-				"CONTROL_OK window-info driver=%s win=%dx%d output=%dx%d density=%.4f display_scale=%.4f\n",
-				drv_str,
-				win_w,
-				win_h,
-				out_w,
-				out_h,
-				density,
-				display_scale,
-			)
+			pos_ok := sdl.GetWindowPosition(h.window, &pos_x, &pos_y)
+			win_ok := sdl.GetWindowSize(h.window, &win_w, &win_h)
+			out_ok := sdl.GetCurrentRenderOutputSize(h.renderer, &out_w, &out_h)
+			if !win_ok || !out_ok {
+				fmt.println("CONTROL_ERR window-info failed")
+				_ = os.flush(os.stdout)
+			} else {
+				density := sdl.GetWindowPixelDensity(h.window)
+				display_scale := sdl.GetWindowDisplayScale(h.window)
+				focused := (.INPUT_FOCUS in sdl.GetWindowFlags(h.window)) ? 1 : 0
+				if pos_ok {
+					fmt.printf(
+						"CONTROL_OK window-info driver=%s pos=%d,%d win=%dx%d output=%dx%d density=%.4f display_scale=%.4f focused=%d\n",
+						drv_str,
+						pos_x,
+						pos_y,
+						win_w,
+						win_h,
+						out_w,
+						out_h,
+						density,
+						display_scale,
+						focused,
+					)
+				} else {
+					fmt.printf(
+						"CONTROL_OK window-info driver=%s pos=unavailable win=%dx%d output=%dx%d density=%.4f display_scale=%.4f focused=%d\n",
+						drv_str,
+						win_w,
+						win_h,
+						out_w,
+						out_h,
+						density,
+						display_scale,
+						focused,
+					)
+				}
+				_ = os.flush(os.stdout)
+			}
+		} else if line == "raise" {
+			if sdl.RaiseWindow(h.window) && sdl.SyncWindow(h.window) {
+				fmt.println("CONTROL_OK raise")
+			} else {
+				fmt.println("CONTROL_ERR raise failed")
+			}
+			_ = os.flush(os.stdout)
+		} else if strings.has_prefix(line, "move-window ") {
+			mx, my, ok_move := parse_move_window_args(line[len("move-window "):])
+			if !ok_move {
+				fmt.println("CONTROL_ERR invalid move-window")
+			} else if !sdl.SetWindowPosition(h.window, mx, my) || !sdl.SyncWindow(h.window) {
+				fmt.println("CONTROL_ERR move-window failed")
+			} else {
+				fmt.printf("CONTROL_OK move-window %d %d\n", mx, my)
+			}
 			_ = os.flush(os.stdout)
 		} else if strings.has_prefix(line, "measure ") {
 			rest := line[len("measure "):]
@@ -1176,7 +1236,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer delete(title_cstr)
 	w := opts.width > 0 ? c.int(opts.width) : (app.width > 0 ? c.int(app.width) : 360)
 	ht := opts.height > 0 ? c.int(opts.height) : (app.height > 0 ? c.int(app.height) : 180)
-	if !sdl.CreateWindowAndRenderer(title_cstr, w, ht, {.RESIZABLE}, &h.window, &h.renderer) {
+	window_flags := sdl.WindowFlags{.RESIZABLE}
+	if high_dpi, ok := os.lookup_env("DAGDA_SDL_HIGH_PIXEL_DENSITY", context.allocator); ok {
+		if high_dpi == "1" {
+			window_flags += {.HIGH_PIXEL_DENSITY}
+		}
+		delete(high_dpi)
+	}
+	if !sdl.CreateWindowAndRenderer(title_cstr, w, ht, window_flags, &h.window, &h.renderer) {
 		fmt.eprintf("SDL_CreateWindowAndRenderer failed: %s\n", sdl.GetError())
 		return 1
 	}

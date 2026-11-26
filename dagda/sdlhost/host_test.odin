@@ -3986,3 +3986,31 @@ test_failed_start_publishes_no_handle :: proc(t: ^testing.T) {
 	testing.expect_value(t, state2.ready_calls, 1)
 	testing.expect_value(t, state2.second_result, Rebuild_Result.Stale)
 }
+
+@(test)
+test_parse_move_window_args_bounds :: proc(t: ^testing.T) {
+	x, y, ok := parse_move_window_args("0 0")
+	testing.expect(t, ok)
+	testing.expect_value(t, x, c.int(0))
+	testing.expect_value(t, y, c.int(0))
+
+	x, y, ok = parse_move_window_args("-120 450")
+	testing.expect(t, ok)
+	testing.expect_value(t, x, c.int(-120))
+	testing.expect_value(t, y, c.int(450))
+
+	x, y, ok = parse_move_window_args("2147483647 -2147483648")
+	testing.expect(t, ok)
+	testing.expect_value(t, x, c.int(2147483647))
+	testing.expect_value(t, y, c.int(-2147483648))
+
+	// Values outside SDL's c.int range (such as 2^32) must be rejected instead of narrowed.
+	_, _, ok = parse_move_window_args("4294967296 4294967296")
+	testing.expect(t, !ok)
+	_, _, ok = parse_move_window_args("2147483648 0")
+	testing.expect(t, !ok)
+	_, _, ok = parse_move_window_args("0 -2147483649")
+	testing.expect(t, !ok)
+	_, _, ok = parse_move_window_args("100")
+	testing.expect(t, !ok)
+}

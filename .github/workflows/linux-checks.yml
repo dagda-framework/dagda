@@ -162,3 +162,6 @@ jobs:
 
       - name: Run the Cocoa caret and grapheme hit-test probe
         run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa
+
+      - name: Run the Cocoa caret probe with native macOS CGEvent pointer clicks
+        run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa --input-mode native
