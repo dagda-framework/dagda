@@ -124,3 +124,7 @@ The desktop API keeps an object's meaning alongside its geometry. A chart can ex
 This design draws on GPUI's custom native views, focus handling, and typed actions, and on Exact's driver for inspecting and exercising a running app. [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) · [Exact’s agent loop](https://github.com/expo/exact#the-agent-loop)
 
 Broader widgets, other native hosts (macOS and Windows), rich text, and a general inspector remain future work; the Linux window, local driver, and shared undo above are the first working slice.
+
+## License
+
+Dagda is licensed under the [Apache License, Version 2.0](LICENSE).
