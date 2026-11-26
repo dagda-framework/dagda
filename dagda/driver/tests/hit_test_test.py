@@ -7,19 +7,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 ODIN = ROOT / "scripts" / "odin.sh"
 
-def cleanup(proc):
+def cleanup(proc, grace=2):
     if proc.poll() is None:
         proc.terminate()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
+            proc.wait(timeout=grace)
     else:
-        proc.wait(timeout=5)
+        proc.wait(timeout=grace)
 
 
-def launch(argv, timeout=10):
+class StartupFailure(AssertionError):
+    def __init__(self, message, proc):
+        super().__init__(message)
+        self.proc = proc
+
+
+def launch(argv, timeout=10, expected=None):
     # Cleanup is established immediately after Popen, so a
     # stalled or partial readiness line never leaks the child.
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=ROOT)
@@ -33,16 +39,18 @@ def launch(argv, timeout=10):
             chunk = os.read(fd, 4096)
             if not chunk: raise AssertionError("host closed stdout")
             buf += chunk
-        return proc, buf.decode().strip()
-    except BaseException:
+        line = buf.decode().strip()
+        if expected is not None and line != expected:
+            raise AssertionError(f"unexpected startup line: {line!r}")
+        return proc, line
+    except BaseException as e:
         cleanup(proc)
-        raise
+        raise StartupFailure(str(e), proc) from e
 
 
 def start(host, sock, w, h):
     sock_dir = sock.parent; sock_dir.mkdir(exist_ok=True); os.chmod(sock_dir, 0o700)
-    proc, line = launch([str(host), str(sock), str(w), str(h)])
-    assert line == f"Listening {sock}", line
+    proc, _line = launch([str(host), str(sock), str(w), str(h)], expected=f"Listening {sock}")
     return proc
 
 
@@ -77,8 +85,16 @@ def main():
         try:
             launch([sys.executable, "-c", fake_src], timeout=1)
             raise AssertionError("partial-line child should have timed out")
-        except AssertionError as e:
+        except StartupFailure as e:
             assert "timeout" in str(e), e
+            assert e.proc.poll() is not None, "partial-line child was not reaped"
+        wrong_src = "import time,sys; sys.stdout.write('wrong\\n'); sys.stdout.flush(); time.sleep(30)"
+        try:
+            launch([sys.executable, "-c", wrong_src], timeout=5, expected="Listening /x")
+            raise AssertionError("wrong-line child should have failed validation")
+        except StartupFailure as e:
+            assert "unexpected startup line" in str(e), e
+            assert e.proc.poll() is not None, "wrong-line child was not reaped"
         # (launch already terminated, escalated, and reaped it;
         # reaching here without a leaked child is the assertion)
         host, client_bin = tmp / "hit-host", tmp / "dagda-client"
@@ -106,7 +122,7 @@ def main():
                 _, via_client = client(client_bin, sock, "hit-test", huge, "150")
                 via_socket = raw_hit(sock, f'{{"op":"hit-test","x":{huge},"y":150}}')
                 assert via_client == via_socket == {"ok": True, "id": None}, (via_client, via_socket)
-                inside = ("1079", "520") if width == 1200 else ("719", "450")
+                inside = ("1079.9998779296875", "520") if width == 1200 else ("719.99993896484375", "450")
                 outside = ("1080", "520") if width == 1200 else ("720", "450")
                 _, c_in = client(client_bin, sock, "hit-test", *inside)
                 s_in = raw_hit(sock, f'{{"op":"hit-test","x":{inside[0]},"y":{inside[1]}}}')
@@ -114,6 +130,11 @@ def main():
                 _, c_out = client(client_bin, sock, "hit-test", *outside)
                 s_out = raw_hit(sock, f'{{"op":"hit-test","x":{outside[0]},"y":{outside[1]}}}')
                 assert c_out == s_out == {"ok": True, "id": None}, (c_out, s_out)
+                for sign in ("", "-"):
+                    tok = sign + "340282346638528859811704183484516925440"
+                    _, c_max = client(client_bin, sock, "hit-test", tok, "150")
+                    s_max = raw_hit(sock, f'{{"op":"hit-test","x":{tok},"y":150}}')
+                    assert c_max == s_max == {"ok": True, "id": None}, (tok, c_max, s_max)
                 big_socket = raw_hit(sock, '{"op":"hit-test","x":1e40,"y":150}')
                 assert big_socket == {"ok": False, "error": "Malformed_Request"}, big_socket
                 big_code, _ = client(client_bin, sock, "hit-test", "1e40", "150", expect_ok=False)

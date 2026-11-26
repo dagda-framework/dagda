@@ -513,3 +513,23 @@ test_hit_test_numeric_tokens :: proc(t: ^testing.T) {
 		dagda.frame_destroy(&frame)
 	}
 }
+
+@(test)
+test_hit_test_f32_max_coordinates :: proc(t: ^testing.T) {
+	c: Test_Counter
+	frame, ok := dagda.resolve(dagda.View{elements = {{info = {id = 0, role = "a"}, kind = .Button, text = "A"}}}, {width = 1200, height = 540})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+	cases := []string{
+		`{"op":"hit-test","x":340282346638528859811704183484516925440,"y":150}`,
+		`{"op":"hit-test","x":-340282346638528859811704183484516925440,"y":150}`,
+	}
+	for req in cases {
+		rep, _ := dispatch(frame, test_counter_handle, &c, req)
+		defer delete(rep)
+		testing.expect_value(t, rep, `{"ok":true,"id":null}`)
+	}
+	big, _ := dispatch(frame, test_counter_handle, &c, `{"op":"hit-test","x":1e40,"y":150}`)
+	defer delete(big)
+	testing.expect_value(t, big, `{"ok":false,"error":"Malformed_Request"}`)
+}

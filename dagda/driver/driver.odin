@@ -288,7 +288,11 @@ extract_top_level_u64 :: proc(line: string, target_key: string) -> (val: u64, fo
 	}
 }
 
-F32_MAX_MAGNITUDE :: 3.402823466e+38
+// The exact largest finite f32, widened to f64. A rounded
+// decimal cutoff would reject that last representable value.
+max_f32_widened :: proc() -> f64 {
+	return f64(transmute(f32)u32(0x7F7FFFFF))
+}
 
 // parse_f32_token converts an original JSON number token to a
 // finite f32 without going through the parser's integer value,
@@ -300,7 +304,7 @@ parse_f32_token :: proc(kind: json.Token_Kind, text: string) -> (f32, bool) {
 		return 0, false
 	}
 	val, ok := strconv.parse_f64(text)
-	if !ok || val != val || val > F32_MAX_MAGNITUDE || val < -F32_MAX_MAGNITUDE {
+	if !ok || val != val || val > max_f32_widened() || val < -max_f32_widened() {
 		return 0, false
 	}
 	return f32(val), true

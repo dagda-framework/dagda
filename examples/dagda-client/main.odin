@@ -126,7 +126,8 @@ run_client :: proc() -> int {
 		y, ok_y := strconv.parse_f64(os.args[4])
 		// Coordinates must be finite f32 window coordinates,
 		// matching the wire decoder's range.
-		if !ok_x || !ok_y || x != x || y != y || x > 3.402823466e+38 || x < -3.402823466e+38 || y > 3.402823466e+38 || y < -3.402823466e+38 {
+		max_coord := f64(transmute(f32)u32(0x7F7FFFFF)) // exact f32 maximum, widened
+		if !ok_x || !ok_y || x != x || y != y || x > max_coord || x < -max_coord || y > max_coord || y < -max_coord {
 			usage()
 			return 2
 		}
