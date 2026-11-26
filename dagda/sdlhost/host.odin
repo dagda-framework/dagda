@@ -32,11 +32,13 @@ App :: struct {
 	// revisions, mutation policy, and undo history.
 	//
 	// Slice-borrowing contract (also for editable_text_targets):
-	// run takes App by value, so it borrows the slice descriptors
-	// supplied at startup — the caller gives each slice's base
-	// address and length once and keeps its backing array valid
-	// until run returns, including the strings the declarations
-	// in edits.edits reference. Refresh existing entries in the
+	// run takes App by value and copies the slice descriptors
+	// (base address and length) supplied at startup, while
+	// borrowing the backing arrays themselves — the caller
+	// keeps each backing array valid until run returns, and
+	// referenced strings must remain valid while used,
+	// including the strings the declarations in edits.edits
+	// reference. Refresh existing entries in the
 	// host-thread view or canvas builder before returning the
 	// matching elements; the host thread is the only writer of
 	// the arrays. Reassigning or reslicing the caller's own copy

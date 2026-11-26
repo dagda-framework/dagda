@@ -279,15 +279,35 @@ def main():
         mut.control("key shift+left")
         mut.control("preedit X")
         mut.fire("enable-b")
-        deadline = time.monotonic() + 5
+        # Wait, under one monotonic deadline, for the built
+        # generation to be presented before asking the client
+        # for B's edits or sending further input. A successful
+        # response with an empty edits list is the old state.
+        deadline = time.monotonic() + 10
+        generation = 0
+        while time.monotonic() < deadline:
+            if mut.present.exists():
+                present_now = mut.present.read_text()
+                if "gen=" in present_now:
+                    generation = int(present_now.split("gen=", 1)[1].split()[0])
+                    if generation >= 1:
+                        break
+            time.sleep(0.02)
+        assert generation >= 1, "enable-B generation was never presented"
         discovered = None
         while time.monotonic() < deadline:
             rr = subprocess.run([str(client_bin), str(mut.sock), "edits", "3"], capture_output=True, text=True, timeout=10)
-            if rr.returncode == 0:
+            if rr.returncode == 0 and json.loads(rr.stdout)["edits"]:
                 discovered = json.loads(rr.stdout)
                 break
             time.sleep(0.02)
         assert discovered is not None and discovered["edits"] == [{"name": "rename", "argument": "text"}], discovered
+        # A is still visibly composing after B became discoverable.
+        current_a = mut.inspect("worker.field")["bounds"]
+        shot_mut = mut.dir / "composing-after-enable.png"
+        mut.control(f"screenshot {shot_mut}")
+        hits_mut = count_preedit_pixels(shot_mut, {"x": 0, "y": 0, "width": 100000, "height": 100000})
+        assert hits_mut >= 20, f"A stopped composing after the enable-B rebuild (preedit pixels={hits_mut}, bounds={current_a})"
         mut.control("key enter")
         mut.control("text Y")
         assert mut.wait_text("worker.field", "FielY")["text"] == "FielY"
@@ -295,6 +315,8 @@ def main():
         mut.control("text !")
         assert mut.wait_text("worker.other", "other 0!")["text"] == "other 0!"
         assert mut.inspect("worker.field")["text"] == "FielY"
+        final_present = mut.present.read_text()
+        assert "commitsA=1" in final_present and "commitsB=1" in final_present, final_present
         print("[2b] in-place slice refresh: B edit discovered during A composition; both fields typed correctly")
         mut.quit()
         apps.remove(mut)
