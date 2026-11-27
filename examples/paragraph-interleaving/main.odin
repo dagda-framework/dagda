@@ -112,11 +112,18 @@ revision :: proc(data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
 	return ((^State)(data)).fields[0].revision, true
 }
 
-rename :: proc(data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+validate_rename :: proc(data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
 	rev, ok := revision(data, target.id)
 	if !ok { return .Unknown_Object }
 	if target.base_revision != rev { return .Stale_Revision }
 	if edit != "rename" || arg.kind != .Text { return .Not_Handled }
+	if !dagda.valid_single_line(arg.text) { return .Not_Handled }
+	if ((^State)(data)).fields[0].text == arg.text { return .Not_Handled }
+	return .Applied
+}
+
+rename :: proc(data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+	if vres := validate_rename(data, target, edit, arg); vres != .Applied { return vres }
 	preedit := sdlhost.current_composition()
 	if preedit.active && preedit.field_id == target.id { return .Busy_Composing }
 	if !commit(data, target.id, arg.text) { return .Not_Handled }
@@ -136,7 +143,7 @@ main :: proc() {
 		canvas = canvas, rebuild_handle = &s.handle, on_composition = composition,
 		editable_text_targets = ids[:], multiline_text_targets = ids[1:],
 		text_edit = {enabled = true, on_commit = commit, on_undo = undo},
-		edits = driver.Edit_Source{edits = edits[:], handler = rename, user_data = &s, revision_of = revision},
+		edits = driver.Edit_Source{edits = edits[:], handler = rename, validate = validate_rename, user_data = &s, revision_of = revision},
 	}, opts)
 	if s.worker != nil { thread.destroy(s.worker) }
 	for &field in s.fields {

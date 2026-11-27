@@ -12,6 +12,15 @@ import "dagda:dagda"
 
 Edit_Revision_Proc :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool)
 
+// Optional read-only application validator for an advertised edit.
+// Called by the driver after declaration, argument-kind, and revision checks,
+// at preview and again at commit before Edit_Source.handler. Must not mutate
+// application state. Returning anything other than .Applied rejects the
+// proposal with that result; leaving validate nil preserves existing behavior.
+// Commit-time-only policies (such as .Busy_Composing when preview is allowed
+// during composition) remain in Edit_Source.handler.
+Edit_Validate_Proc :: #type proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result
+
 Edit_Source :: struct {
 	// Advertised edit declarations, under the slice contract
 	// documented on sdlhost.App.edits: run copies this
@@ -21,6 +30,7 @@ Edit_Source :: struct {
 	// thread, and only the supplied length is visible.
 	edits:       []dagda.Advertised_Edit,
 	handler:     dagda.Edit_Handler,
+	validate:    Edit_Validate_Proc,
 	user_data:   rawptr,
 	revision_of: Edit_Revision_Proc,
 }
@@ -223,6 +233,12 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 			if result != .Applied {
 				return edit_error_reply(source, id, result), false
 			}
+			if source.validate != nil {
+				if vres := source.validate(source.user_data, target, name, arg); vres != .Applied {
+					dagda.preview_destroy(&preview)
+					return edit_error_reply(source, id, vres), false
+				}
+			}
 			b: strings.Builder
 			strings.builder_init(&b)
 			strings.write_string(&b, "{\"ok\":true,\"id\":")
@@ -237,6 +253,28 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 			reply := strings.to_string(b)
 			dagda.preview_destroy(&preview)
 			return reply, false
+		}
+		if source.validate != nil {
+			if _, vres := dagda.validate_edit(source.edits, target.id, name, arg); vres != .Applied {
+				return edit_error_reply(source, id, vres), false
+			}
+			if source.revision_of != nil {
+				current, known := source.revision_of(source.user_data, id)
+				if !known {
+					return reply_error("Unknown_Object"), false
+				}
+				if current != target.base_revision {
+					b: strings.Builder
+					strings.builder_init(&b)
+					strings.write_string(&b, "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":")
+					strings.write_u64(&b, u64(current))
+					strings.write_byte(&b, '}')
+					return strings.to_string(b), false
+				}
+			}
+			if vres := source.validate(source.user_data, target, name, arg); vres != .Applied {
+				return edit_error_reply(source, id, vres), false
+			}
 		}
 		result := dagda.commit_edit(source.edits, target, name, arg, source.handler, source.user_data)
 		if result != .Applied {
