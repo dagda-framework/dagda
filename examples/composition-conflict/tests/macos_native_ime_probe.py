@@ -44,6 +44,7 @@ run: its input source was a supplied label, unattended, and
 no composition start was received.
 """
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import platform
@@ -376,7 +377,8 @@ class Probe:
     def launch(self, tmp):
         app_bin, self.client_bin = tmp / "composition-conflict", tmp / "dagda-client"
         for src, out in [("examples/composition-conflict", app_bin), ("examples/dagda-client", self.client_bin)]:
-            subprocess.check_call([str(ODIN), "build", src, "-collection:dagda=.", f"-out:{out}"], cwd=ROOT)
+            flags = ["-define:DAGDA_TRACE_IME=true"] if self.args.trace_dispatch and out == app_bin else []
+            subprocess.check_call([str(ODIN), "build", src, "-collection:dagda=.", f"-out:{out}", *flags], cwd=ROOT)
             self.record(f"built {src} -> {out}")
         sock_dir = tmp / "sock"
         sock_dir.mkdir()
@@ -392,9 +394,13 @@ class Probe:
         self.record(f"child SDL_VIDEODRIVER: inherited {inherited_video!r} removed; SDL default (cocoa on macOS) required and verified from the trace")
         # Normal --socket launch only: no --control-stdin and no
         # dummy video driver, so SDL subscribes to the native IME.
-        self.proc = subprocess.Popen([str(app_bin), "--socket", str(self.sock)],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     bufsize=0, env=env, cwd=ROOT)
+        trace_path = self.out / "ime-dispatch.log"
+        if self.args.trace_dispatch:
+            self.record(f"host dispatch diagnostics: {trace_path}")
+        with trace_path.open("xb") if self.args.trace_dispatch else nullcontext(subprocess.PIPE) as stderr:
+            self.proc = subprocess.Popen([str(app_bin), "--socket", str(self.sock)],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                                         bufsize=0, env=env, cwd=ROOT)
         try:
             self.reader = base.DeadlineLineReader(self.proc.stdout)
             line = self.reader.read_line("startup", timeout=15.0)
@@ -493,6 +499,7 @@ def main():
     parser.add_argument("--stage-timeout", type=float, default=120.0)
     parser.add_argument("--update-seconds", type=float, default=12.0)
     parser.add_argument("--output-dir", default="")
+    parser.add_argument("--trace-dispatch", action="store_true", help="record host-dispatched SDL text events and composition transitions in ime-dispatch.log")
     args = parser.parse_args()
     if args.self_test_trace:
         return self_test_trace()

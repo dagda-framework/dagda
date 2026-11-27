@@ -353,8 +353,37 @@ Host :: struct {
 }
 
 @(private="package")
-host_report_composition :: proc(h: ^Host, current: Active_Composition) {
+host_report_composition :: proc(h: ^Host, current: Active_Composition, stage: string = "", event: ^sdl.Event = nil) {
 	previous := h.reported_composition
+	when #config(DAGDA_TRACE_IME, false) {
+		relevant := false
+		if event != nil {
+			#partial switch event.type {
+			case .TEXT_EDITING, .TEXT_INPUT, .WINDOW_FOCUS_LOST, .MOUSE_BUTTON_DOWN:
+				relevant = true
+			case .KEY_DOWN:
+				relevant = event.key.key == sdl.K_ESCAPE
+			}
+		}
+		if previous != current || relevant {
+			fmt.eprintf("ime ticks_ms=%d stage=%s before_active=%v before_id=%d after_active=%v after_id=%d",
+				sdl.GetTicks(), stage, previous.active, previous.field_id, current.active, current.field_id)
+			if event != nil {
+				fmt.eprintf(" event=%v", event.type)
+				#partial switch event.type {
+				case .TEXT_EDITING:
+					fmt.eprintf(" preedit_bytes=%d start=%d length=%d", event.edit.text == nil ? 0 : len(string(event.edit.text)), event.edit.start, event.edit.length)
+				case .TEXT_INPUT:
+					fmt.eprintf(" input_bytes=%d", event.text.text == nil ? 0 : len(string(event.text.text)))
+				case .KEY_DOWN, .KEY_UP:
+					fmt.eprintf(" escape=%v", event.key.key == sdl.K_ESCAPE)
+				case .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
+					fmt.eprintf(" button=%d x=%.1f y=%.1f", event.button.button, event.button.x, event.button.y)
+				}
+			}
+			fmt.eprintln()
+		}
+	}
 	if !previous.active && current.active && h.app.text_version_of != nil &&
 		h.text_edit.has_composition_snapshot && !h.text_edit.has_snapshot_version {
 		// Capture the version belonging to the snapshotted
@@ -510,7 +539,7 @@ host_rebuild_frame :: proc(h: ^Host) -> bool {
 	text_edit_reconcile(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.editable_text_targets, h.app.multiline_text_targets)
 	menu_reconcile(h)
 	host_sync_driver_frame(h)
-	host_report_composition(h, host_active_composition(h))
+	host_report_composition(h, host_active_composition(h), "rebuild")
 	h.needs_redraw = true
 	return true
 }
@@ -1359,7 +1388,7 @@ host_shift_down :: proc(h: ^Host) -> bool {
 // Shift+Tab traversal across editable fields and buttons, app-level Ctrl+Z
 // when the text field is not focused, button keyboard activation, and App.on_key.
 host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
-	defer host_report_composition(h, host_active_composition(h))
+	defer host_report_composition(h, host_active_composition(h), "key-or-focus", ev)
 	#partial switch ev.type {
 	case .KEY_DOWN:
 		if ev.key.key == sdl.K_LSHIFT {
@@ -1472,7 +1501,7 @@ host_dispatch_text_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 		return true
 	}
 	tres := text_edit_handle_event(&h.text_edit, h.ime_window, &h.font, h.frame, h.app.text_edit, h.app.user_data, ev, h.app.editable_text_targets, h.clipboard, h.app.multiline_text_targets)
-	host_report_composition(h, host_active_composition(h))
+	host_report_composition(h, host_active_composition(h), "text", ev)
 	if tres.needs_redraw {
 		h.needs_redraw = true
 	}
@@ -1490,7 +1519,7 @@ host_dispatch_text_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 }
 
 host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
-	defer host_report_composition(h, host_active_composition(h))
+	defer host_report_composition(h, host_active_composition(h), "pointer", ev)
 	menu_consumed, menu_rebuild := menu_handle_mouse_event(h, ev)
 	if menu_rebuild {
 		if !host_rebuild_frame(h) {
@@ -1663,7 +1692,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	defer text_edit_destroy(&h.text_edit)
 	defer dagda.frame_destroy(&h.driver_frame)
 	defer dagda.frame_destroy(&h.frame)
-	defer host_report_composition(&h, {})
+	defer host_report_composition(&h, {}, "shutdown")
 
 	if !host_rebuild_frame(&h) {
 		return 1
