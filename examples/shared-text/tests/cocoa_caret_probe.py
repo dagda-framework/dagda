@@ -56,6 +56,7 @@ ODIN = ROOT / "scripts" / "odin.sh"
 
 CARET_AMBER_RGB = (255, 206, 84)
 E_ACUTE_DECOMPOSED = "e\u0301"  # U+0065 + U+0301 -> UTF-8 bytes 65 CC 81
+WINDOW_TITLE = "Dagda — Shared Text Fixture"
 
 
 class DeadlineLineReader:
@@ -370,18 +371,82 @@ def query_window_info(proc: subprocess.Popen, reader: DeadlineLineReader) -> dic
     return parse_window_info(send_control(proc, reader, "window-info"))
 
 
-def wait_for_native_ready(proc: subprocess.Popen, reader: DeadlineLineReader, timeout: float = 2.0) -> dict[str, object]:
-    """Wait until the host reports both a valid content origin and input focus."""
-    deadline = time.monotonic() + timeout
-    info = query_window_info(proc, reader)
-    while (not info["has_pos"] or not info["focused"]) and time.monotonic() < deadline:
-        time.sleep(0.05)
-        info = query_window_info(proc, reader)
-    if not info["has_pos"] or info["pos_x"] is None or info["pos_y"] is None:
-        raise RuntimeError(f"native pointer mode requires a valid window content origin, got {info}")
-    if not info["focused"]:
-        raise RuntimeError(f"native pointer mode requires a focused target window before clicking, got {info}")
-    return info
+def format_window_metrics(info: dict[str, object]) -> str:
+    origin = f"({info['pos_x']},{info['pos_y']})pt" if info.get("has_pos") else "unavailable"
+    return (
+        f"driver={info['driver']} origin={origin} focused={int(bool(info.get('focused')))} "
+        f"win={info['win_w']}x{info['win_h']}pt output={info['out_w']}x{info['out_h']}px "
+        f"scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
+        f"density={info['density']:.4f} display_scale={info['display_scale']:.4f}"
+    )
+
+
+def wait_for_native_ready(
+    proc: subprocess.Popen | None,
+    reader: DeadlineLineReader | None,
+    timeout: float = 2.0,
+    *,
+    stage: str = "startup",
+    operator_focus_timeout: float = 0.0,
+    query_info_fn=None,
+    cue_stream=None,
+    poll_interval: float = 0.05,
+) -> tuple[dict[str, object], str]:
+    """Wait until the host reports both a valid content origin and input focus.
+
+    In unattended mode (operator_focus_timeout == 0), polls up to `timeout`
+    seconds with no operator prompt. When operator_focus_timeout > 0, does a
+    short initial check and—if the window is still unfocused—prints and flushes
+    an operator cue identifying the window and stage, then polls up to
+    `operator_focus_timeout` seconds. Returns (info, activation_mode) where
+    activation_mode is 'unattended-raise' or 'operator-assisted'.
+    """
+    read_info = query_info_fn if query_info_fn is not None else (lambda: query_window_info(proc, reader))
+    is_ready = lambda d: bool(d.get("has_pos")) and d.get("pos_x") is not None and d.get("pos_y") is not None and bool(d.get("focused"))
+
+    initial_wait = min(timeout, 0.5) if operator_focus_timeout > 0.0 else timeout
+    deadline = time.monotonic() + initial_wait
+    info = read_info()
+    while not is_ready(info) and time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        info = read_info()
+    if is_ready(info):
+        return info, "unattended-raise"
+
+    if operator_focus_timeout > 0.0 and not info.get("focused"):
+        out = sys.stdout if cue_stream is None else cue_stream
+        pid_str = f"pid={proc.pid}, " if proc is not None else ""
+        if stage == "post-move-resize":
+            reason = "Focus was lost after moving/resizing the window. "
+        else:
+            reason = ""
+        print(
+            f"[operator-cue] stage={stage} window={WINDOW_TITLE!r} ({pid_str}{format_window_metrics(info)}): "
+            f"{reason}Click the window's title bar once to give it focus, then leave the pointer alone "
+            f"(waiting up to {operator_focus_timeout:.1f}s)...",
+            file=out,
+            flush=True,
+        )
+        op_deadline = time.monotonic() + operator_focus_timeout
+        while not is_ready(info) and time.monotonic() < op_deadline:
+            time.sleep(poll_interval)
+            info = read_info()
+        if is_ready(info):
+            print(
+                f"[operator-cue] stage={stage} focus acquired ({format_window_metrics(info)}); "
+                f"leave pointer alone while CGEvent clicks run.",
+                file=out,
+                flush=True,
+            )
+            return info, "operator-assisted"
+
+    if not info.get("has_pos") or info.get("pos_x") is None or info.get("pos_y") is None:
+        raise RuntimeError(
+            f"[{stage}] native pointer mode requires a valid window content origin ({format_window_metrics(info)})"
+        )
+    raise RuntimeError(
+        f"[{stage}] native pointer mode timed out waiting for input focus ({format_window_metrics(info)})"
+    )
 
 
 class CGPoint(ctypes.Structure):
@@ -536,6 +601,84 @@ def verify_native_pointer_guards() -> None:
     assert mode == "macos-cgevent" and coords == (66.5, 211.25), (mode, coords)
     assert poster.calls == [(66.5, 211.25)], poster.calls
     print("[native-guards] unavailable origin & unfocused window posted 0 clicks; legitimate (0,0) origin converted cleanly")
+
+
+def verify_operator_focus_wait() -> None:
+    """Controlled tests for opt-in operator-assisted focus waiting:
+    1. Delayed focus: prints cue identifying the window and stage, waits until
+       focused=1, returns activation='operator-assisted', and posts no click
+       before readiness.
+    2. Never-acquired focus: times out with the stage name and preserved
+       window/output measurements, posting zero test clicks.
+    """
+    class RecordingPoster:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, float]] = []
+
+        def click_screen(self, x: float, y: float) -> None:
+            self.calls.append((x, y))
+
+    # 1. Delayed focus (focused=0 for first 3 reads, then focused=1).
+    poster = RecordingPoster()
+    cue_buf = io.StringIO()
+    polls = {"n": 0}
+
+    def delayed_info() -> dict[str, object]:
+        polls["n"] += 1
+        focused_flag = 1 if polls["n"] >= 4 else 0
+        return parse_window_info(
+            f"CONTROL_OK window-info driver=cocoa pos=100,80 win=800x540 output=1600x1080 "
+            f"density=2.0000 display_scale=2.0000 focused={focused_flag}"
+        )
+
+    ready_info, activation = wait_for_native_ready(
+        None,
+        None,
+        timeout=0.02,
+        stage="startup",
+        operator_focus_timeout=1.0,
+        query_info_fn=delayed_info,
+        cue_stream=cue_buf,
+        poll_interval=0.01,
+    )
+    assert activation == "operator-assisted", activation
+    assert ready_info["focused"] is True and ready_info["out_w"] == 1600
+    cue_text = cue_buf.getvalue()
+    assert WINDOW_TITLE in cue_text and "stage=startup" in cue_text and "title bar" in cue_text, cue_text
+    assert "output=1600x1080px" in cue_text, cue_text
+    assert len(poster.calls) == 0, f"no click may be posted before readiness: {poster.calls}"
+
+    mode, coords, _ = deliver_click(None, None, ready_info, 66.5, 211.25, poster, query_info_fn=lambda: ready_info)
+    assert mode == "macos-cgevent" and coords == (166.5, 291.25) and len(poster.calls) == 1
+
+    # 2. Never-acquired focus after move/resize: preserves stage & 2x measurements, posts 0 clicks.
+    poster2 = RecordingPoster()
+    cue_buf2 = io.StringIO()
+    always_unfocused = lambda: parse_window_info(
+        "CONTROL_OK window-info driver=cocoa pos=152,135 win=640x480 output=1280x960 "
+        "density=2.0000 display_scale=2.0000 focused=0"
+    )
+    try:
+        wait_for_native_ready(
+            None,
+            None,
+            timeout=0.02,
+            stage="post-move-resize",
+            operator_focus_timeout=0.05,
+            query_info_fn=always_unfocused,
+            cue_stream=cue_buf2,
+            poll_interval=0.01,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        assert "post-move-resize" in msg, msg
+        assert "win=640x480pt" in msg and "output=1280x960px" in msg and "scale=2.000x2.000" in msg, msg
+        assert "focused=0" in msg, msg
+    else:
+        raise AssertionError("expected RuntimeError when focus is never acquired")
+    assert "Focus was lost after moving/resizing" in cue_buf2.getvalue(), cue_buf2.getvalue()
+    assert len(poster2.calls) == 0, f"zero clicks may be posted on timeout: {poster2.calls}"
+    print("[operator-focus-guards] delayed focus acquired & never-focused timeout preserved metrics with 0 premature clicks")
 
 
 def verify_two_click_native_guards(app_bin: Path, client_bin: Path, capture_dir: Path) -> None:
@@ -736,6 +879,7 @@ def verify_grapheme_clicks(
     native_ptr: object | None,
     require_min_scale: float,
     query_info_fn=None,
+    activation: str = "none",
 ) -> dict[str, object]:
     read_info = query_info_fn if query_info_fn is not None else (lambda: query_window_info(proc, reader))
     info = read_info()
@@ -817,7 +961,7 @@ def verify_grapheme_clicks(
 
     origin_str = f"({info['pos_x']},{info['pos_y']})pt" if info["has_pos"] else "unavailable"
     print(
-        f"[{stage}] driver={info['driver']} click_input={click_mode} text_input=sdl-injected "
+        f"[{stage}] driver={info['driver']} activation={activation} click_input={click_mode} text_input=sdl-injected "
         f"win_origin={origin_str} focused={int(bool(info['focused']))} win={info['win_w']}x{info['win_h']}pt "
         f"output={info['out_w']}x{info['out_h']}px png={png_w}x{png_h}px "
         f"scale={info['scale_x']:.3f}x{info['scale_y']:.3f} "
@@ -852,8 +996,16 @@ def main() -> int:
         action="store_true",
         help="Opt-in experiment: set DAGDA_SDL_HIGH_PIXEL_DENSITY=1 when launching the host window",
     )
+    parser.add_argument(
+        "--wait-for-focus",
+        type=float,
+        default=0.0,
+        help="Opt-in desktop mode: wait up to N seconds for the operator to click the window title bar for focus (0=unattended CI)",
+    )
     parser.add_argument("--capture-dir", default="", help="Directory for PNG captures")
     args = parser.parse_args()
+    if args.wait_for_focus < 0.0:
+        parser.error("--wait-for-focus must be >= 0")
 
     native_ptr: MacOSNativePointer | None = None
     if args.input_mode == "native":
@@ -876,6 +1028,7 @@ def main() -> int:
 
     verify_startup_timeout_bounded()
     verify_native_pointer_guards()
+    verify_operator_focus_wait()
     verify_two_click_native_guards(app_bin, client_bin, capture_dir)
 
     sock_dir = Path(tempfile.mkdtemp(prefix="dagda-cocoa-caret."))
@@ -902,15 +1055,11 @@ def main() -> int:
         reader = DeadlineLineReader(proc.stdout)
         wait_for_startup(proc, reader, sock, timeout=10.0)
 
-        if native_ptr is not None:
-            send_control(proc, reader, "raise")
-            wait_for_native_ready(proc, reader, timeout=2.0)
-
         # Verify out-of-range move-window coordinates are rejected by the live host.
         bad_move = send_control_raw(proc, reader, "move-window 4294967296 4294967296")
         assert bad_move == "CONTROL_ERR invalid move-window", f"unexpected reply for overflow move-window: {bad_move!r}"
 
-        # Settle initial window dimensions and content origin.
+        # Settle initial window dimensions and paint the window on screen before any operator cue.
         init_png = capture_dir / "00-init.png"
         prev_info = None
         for _ in range(10):
@@ -921,10 +1070,22 @@ def main() -> int:
             prev_info = cur_info
             time.sleep(0.05)
 
-        info0 = query_window_info(proc, reader)
+        activation_stage1 = "none"
+        if native_ptr is not None:
+            send_control(proc, reader, "raise")
+            info0, activation_stage1 = wait_for_native_ready(
+                proc,
+                reader,
+                timeout=2.0,
+                stage="startup",
+                operator_focus_timeout=args.wait_for_focus,
+            )
+        else:
+            info0 = query_window_info(proc, reader)
+
         origin0_str = f"({info0['pos_x']},{info0['pos_y']})pt" if info0["has_pos"] else "unavailable"
         print(
-            f"[startup] driver={info0['driver']} high_density_opt_in={args.high_density} "
+            f"[startup] driver={info0['driver']} activation={activation_stage1} high_density_opt_in={args.high_density} "
             f"win_origin={origin0_str} focused={int(bool(info0['focused']))} win={info0['win_w']}x{info0['win_h']}pt "
             f"output={info0['out_w']}x{info0['out_h']}px scale={info0['scale_x']:.3f}x{info0['scale_y']:.3f} "
             f"density={info0['density']:.4f} display_scale={info0['display_scale']:.4f}"
@@ -962,6 +1123,7 @@ def main() -> int:
             right_marker="]",
             native_ptr=native_ptr,
             require_min_scale=args.require_min_scale,
+            activation=activation_stage1,
         )
 
         # Stage 2: Move (under native mode) and resize to 640x480, wait for Cocoa/WM to settle,
@@ -982,8 +1144,15 @@ def main() -> int:
         assert el_after_resize["bounds"] != res1["bounds"], (
             f"field bounds did not change after resize: {el_after_resize['bounds']}"
         )
+        activation_stage2 = "none"
         if native_ptr is not None:
-            wait_for_native_ready(proc, reader, timeout=2.0)
+            _, activation_stage2 = wait_for_native_ready(
+                proc,
+                reader,
+                timeout=2.0,
+                stage="post-move-resize",
+                operator_focus_timeout=args.wait_for_focus,
+            )
 
         res2 = verify_grapheme_clicks(
             stage="resized-640x480",
@@ -998,6 +1167,7 @@ def main() -> int:
             right_marker=">",
             native_ptr=native_ptr,
             require_min_scale=args.require_min_scale,
+            activation=activation_stage2,
         )
         assert res2["bounds"] != res1["bounds"]
 
