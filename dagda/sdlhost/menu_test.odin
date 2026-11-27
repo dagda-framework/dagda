@@ -329,12 +329,21 @@ Menu_Comp_App :: struct {
 	comp_starts:  int,
 	comp_ends:    int,
 	end_after_cm: bool,
+	observed_host: ^Host,
+	commit_with_snapshot: bool,
+	refuse: bool,
+	proposals: int,
 }
 
 @(private = "file")
 menu_comp_commit :: proc(user_data: rawptr, id: dagda.Object_Id, new_text: string) -> bool {
 	app := (^Menu_Comp_App)(user_data)
-	if id != 10 || len(new_text) > len(app.a_buf) {
+	app.proposals += 1
+	if h := app.observed_host; h != nil {
+		app.commit_with_snapshot = host_active_composition(h).active &&
+			h.text_edit.has_composition_snapshot && h.text_edit.composition_snapshot == "abcd"
+	}
+	if app.refuse || id != 10 || len(new_text) > len(app.a_buf) {
 		return false
 	}
 	app.base.a_text = string(app.a_buf[:copy(app.a_buf[:], new_text)])
@@ -519,6 +528,68 @@ test_menu_open_over_composition_both_orderings :: proc(t: ^testing.T) {
 		testing.expect(t, host_dispatch_text_event(&h, &mark_ev))
 		testing.expect_value(t, state.base.a_text, "ab|")
 	}
+
+	// Replay the native Cocoa Return sequence using SDL's event queue.
+	// With the popup open, clearing first would also suppress the final.
+	if !testing.expect(t, sdl.InitSubSystem({.EVENTS})) { return }
+	defer sdl.QuitSubSystem({.EVENTS})
+	cases := [?]struct{popup, refuse: bool}{{false, false}, {true, false}, {true, true}}
+	for c in cases {
+		state: Menu_Comp_App
+		h, ok := setup_comp_host(t, &state, viewport, surface, renderer)
+		if !ok { return }
+		defer teardown_host(&h)
+		state.observed_host = &h
+		state.refuse = c.refuse
+		if !c.popup {
+			_, _, _ = host_dispatch_key_event(&h, &esc_ev)
+		}
+		clear := make_text_editing_ev("")
+		final := make_text_input_ev("かっこ")
+		clear.edit.windowID, final.text.windowID = 1, 1
+		testing.expect(t, sdl.PushEvent(&final))
+		next: sdl.Event
+		dispatched, has_next := host_dispatch_queued_text_event(&h, &clear, true, &next)
+		testing.expect(t, dispatched && !has_next)
+		testing.expect_value(t, state.proposals, 1)
+		testing.expect(t, state.commit_with_snapshot)
+		testing.expect_value(t, state.comp_ends, 1)
+		testing.expect_value(t, state.end_after_cm, !c.refuse)
+		testing.expect_value(t, state.commits, c.refuse ? 0 : 1)
+		testing.expect_value(t, state.base.a_text, c.refuse ? "abcd" : "abかっこ")
+		testing.expect(t, !h.text_edit.has_composition_snapshot)
+		if !c.popup {
+			marker := make_text_input_ev("|")
+			testing.expect(t, host_dispatch_text_event(&h, &marker))
+			testing.expect_value(t, state.base.a_text, "abかっこ|")
+		}
+	}
+
+	// A clear alone ends the session in the same dispatch. Neither a focus
+	// change nor another window's text may be consumed as part of a commit.
+	for kind in ([3]sdl.EventType{.FIRST, .WINDOW_FOCUS_LOST, .TEXT_INPUT}) {
+		state: Menu_Comp_App
+		h, ok := setup_comp_host(t, &state, viewport, surface, renderer)
+		if !ok { return }
+		defer teardown_host(&h)
+		clear := make_text_editing_ev("")
+		clear.edit.windowID = 1
+		if kind != .FIRST {
+			unrelated := make_text_input_ev("X")
+			unrelated.text.windowID = 2
+			unrelated.type = kind
+			testing.expect(t, sdl.PushEvent(&unrelated))
+		}
+		next: sdl.Event
+		dispatched, has_next := host_dispatch_queued_text_event(&h, &clear, true, &next)
+		testing.expect(t, dispatched)
+		testing.expect_value(t, has_next, kind != .FIRST)
+		testing.expect_value(t, next.type, kind)
+		testing.expect_value(t, state.comp_ends, 1)
+		testing.expect_value(t, state.proposals, 0)
+		testing.expect_value(t, state.base.a_text, "abcd")
+	}
+
 }
 
 @(private = "file")

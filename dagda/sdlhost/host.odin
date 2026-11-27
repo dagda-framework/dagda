@@ -1489,6 +1489,30 @@ host_dispatch_text_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	return true
 }
 
+// Cocoa unmarks text before sending the accepted candidate. Handle the
+// immediately queued, same-window final while the original session is live.
+// A clear alone cancels immediately. Never wait for more input or look past
+// another event (including a key, a focus change, or a rebuild).
+@(private="package")
+host_dispatch_queued_text_event :: proc(h: ^Host, ev: ^sdl.Event, cocoa: bool, next: ^sdl.Event) -> (ok: bool, has_next: bool) {
+	if cocoa && ev.type == .TEXT_EDITING && len(ev.edit.text) == 0 && host_active_composition(h).active {
+		if sdl.PeepEvents(next, 1, .GETEVENT, .FIRST, .LAST) == 1 {
+			if next.type != .TEXT_INPUT || next.text.windowID != ev.edit.windowID || len(next.text.text) == 0 {
+				return host_dispatch_text_event(h, ev), true
+			}
+			if !host_dispatch_text_event(h, next) {
+				return false, false
+			}
+			// Acceptance already ended the old session. If the application
+			// refused the candidate, the native unmark still ends it.
+			if !host_active_composition(h).active {
+				return true, false
+			}
+		}
+	}
+	return host_dispatch_text_event(h, ev), false
+}
+
 host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 	defer host_report_composition(h, host_active_composition(h))
 	menu_consumed, menu_rebuild := menu_handle_mouse_event(h, ev)
@@ -1699,6 +1723,7 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 	running := true
 	exit_code := 0
 	wait_ms: c.int = (srv.active || opts.control_stdin) ? 16 : 100
+	cocoa := string(sdl.GetCurrentVideoDriver()) == "cocoa"
 
 	for running && !signal_stopped {
 		ev: sdl.Event
@@ -1731,9 +1756,14 @@ run :: proc(app: App, opts: Run_Options = {}) -> int {
 						running = false
 					}
 				case .TEXT_EDITING, .TEXT_INPUT:
-					if !host_dispatch_text_event(&h, &ev) {
+					next: sdl.Event
+					ok, has_next := host_dispatch_queued_text_event(&h, &ev, cocoa, &next)
+					if !ok {
 						exit_code = 1
 						running = false
+					} else if has_next {
+						ev = next
+						continue
 					}
 				case .KEY_DOWN, .KEY_UP, .WINDOW_FOCUS_LOST:
 					needs_rebuild, has_pending_edit, pending_edit := host_dispatch_key_event(&h, &ev)
