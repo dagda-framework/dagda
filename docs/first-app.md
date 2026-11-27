@@ -23,6 +23,12 @@ Linux x86-64 or macOS on Apple Silicon (arm64), plus:
     needed; the host finds a system font. Python 3, curl, and
     tar come with the Xcode Command Line Tools
     (`xcode-select --install`) or Homebrew.
+On macOS, that dependency step is this runnable command:
+
+```sh
+brew install sdl3 freetype
+```
+
 - A Dagda checkout. Below, `$DAGDA` is its path. The pinned
   installer picks the macOS ARM64 compiler automatically on
   an Apple Silicon machine:
