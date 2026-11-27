@@ -148,6 +148,44 @@ dispatch_edits :: proc(
 	return dispatch(frame, handler, user_data, line)
 }
 
+// validate_live_edit_preconditions runs the shared precondition checks for
+// preview and validator-enabled commit in identical order:
+// 1. Live object and revision lookup (revision_of == nil or unknown ->
+//    Unknown_Object; mismatch -> Stale_Revision with current revision).
+// 2. Edit declaration and argument-kind validation (dagda.validate_edit).
+// 3. Optional read-only app validator (source.validate).
+validate_live_edit_preconditions :: proc(
+	source: Edit_Source,
+	target: dagda.Action_Target,
+	name: string,
+	arg: dagda.Edit_Argument,
+) -> (error_reply: string, ok: bool) {
+	if source.revision_of == nil {
+		return reply_error("Unknown_Object"), false
+	}
+	current, known := source.revision_of(source.user_data, target.id)
+	if !known {
+		return reply_error("Unknown_Object"), false
+	}
+	if current != target.base_revision {
+		b: strings.Builder
+		strings.builder_init(&b)
+		strings.write_string(&b, "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":")
+		strings.write_u64(&b, u64(current))
+		strings.write_byte(&b, '}')
+		return strings.to_string(b), false
+	}
+	if _, vres := dagda.validate_edit(source.edits, target.id, name, arg); vres != .Applied {
+		return edit_error_reply(source, target.id, vres), false
+	}
+	if source.validate != nil {
+		if vres := source.validate(source.user_data, target, name, arg); vres != .Applied {
+			return edit_error_reply(source, target.id, vres), false
+		}
+	}
+	return "", true
+}
+
 dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (string, bool) {
 	if !utf8.valid_string(line) || len(strings.trim_space(line)) == 0 || !single_object(line) {
 		return reply_error("Malformed_Request"), false
@@ -209,35 +247,12 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 		}
 		target := dagda.Action_Target{id = id, base_revision = dagda.Revision(raw_rev)}
 		if op == "preview" {
-			// Preview uses the same live-object lookup as
-			// discovery: without a revision callback, or for an
-			// unknown ID, the object does not exist here. For a
-			// known ID the revision just read is compared and
-			// is the value reported on a stale reply.
-			if source.revision_of == nil {
-				return reply_error("Unknown_Object"), false
-			}
-			current, known := source.revision_of(source.user_data, id)
-			if !known {
-				return reply_error("Unknown_Object"), false
-			}
-			if current != target.base_revision {
-				b: strings.Builder
-				strings.builder_init(&b)
-				strings.write_string(&b, "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":")
-				strings.write_u64(&b, u64(current))
-				strings.write_byte(&b, '}')
-				return strings.to_string(b), false
+			if err_reply, ok_pre := validate_live_edit_preconditions(source, target, name, arg); !ok_pre {
+				return err_reply, false
 			}
 			preview, result := dagda.preview_edit(source.edits, target, name, arg)
 			if result != .Applied {
 				return edit_error_reply(source, id, result), false
-			}
-			if source.validate != nil {
-				if vres := source.validate(source.user_data, target, name, arg); vres != .Applied {
-					dagda.preview_destroy(&preview)
-					return edit_error_reply(source, id, vres), false
-				}
 			}
 			b: strings.Builder
 			strings.builder_init(&b)
@@ -255,25 +270,8 @@ dispatch_edit_op :: proc(source: Edit_Source, line: string, op: string) -> (stri
 			return reply, false
 		}
 		if source.validate != nil {
-			if _, vres := dagda.validate_edit(source.edits, target.id, name, arg); vres != .Applied {
-				return edit_error_reply(source, id, vres), false
-			}
-			if source.revision_of != nil {
-				current, known := source.revision_of(source.user_data, id)
-				if !known {
-					return reply_error("Unknown_Object"), false
-				}
-				if current != target.base_revision {
-					b: strings.Builder
-					strings.builder_init(&b)
-					strings.write_string(&b, "{\"ok\":false,\"error\":\"Stale_Revision\",\"revision\":")
-					strings.write_u64(&b, u64(current))
-					strings.write_byte(&b, '}')
-					return strings.to_string(b), false
-				}
-			}
-			if vres := source.validate(source.user_data, target, name, arg); vres != .Applied {
-				return edit_error_reply(source, id, vres), false
+			if err_reply, ok_pre := validate_live_edit_preconditions(source, target, name, arg); !ok_pre {
+				return err_reply, false
 			}
 		}
 		result := dagda.commit_edit(source.edits, target, name, arg, source.handler, source.user_data)

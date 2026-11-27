@@ -627,9 +627,20 @@ test_dispatch_edits_optional_validator :: proc(t: ^testing.T) {
 	testing.expect_value(t, doc.handler_calls, 1)
 	doc.handler_calls = 0
 
-	// 2. With validator installed, declaration/argument/revision checks run BEFORE validate.
+	// 2. With validator installed, preview and commit share identical precondition order:
+	//    live object + revision first (even when edit name or argument is also invalid),
+	//    then declaration and argument checks, then validate.
 	with_val := Edit_Source{edits = edits, handler = handle_fn, validate = validate_fn, user_data = &doc, revision_of = rev_of}
 	for req_and_err in ([?]struct{ req, want: string }{
+		// Stale revision takes precedence over Unknown_Edit and Wrong_Argument on both preview and commit.
+		{`{"op":"preview","id":1,"edit":"bogus","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"commit","id":1,"edit":"bogus","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"preview","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"commit","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		// Unknown object (revision_of reports unknown) returns Unknown_Object on both preview and commit.
+		{`{"op":"preview","id":99,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Object"}`},
+		{`{"op":"commit","id":99,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Object"}`},
+		// At current revision, declaration and argument checks still run before validate.
 		{`{"op":"preview","id":1,"edit":"bogus","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Edit"}`},
 		{`{"op":"commit","id":1,"edit":"bogus","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Edit"}`},
 		{`{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Wrong_Argument"}`},
@@ -640,6 +651,18 @@ test_dispatch_edits_optional_validator :: proc(t: ^testing.T) {
 		rep, app := dispatch_edits(frame, nil, nil, with_val, req_and_err.req)
 		testing.expect_value(t, app, false)
 		testing.expect_value(t, rep, req_and_err.want)
+		delete(rep)
+	}
+	// When revision_of is absent (nil), both preview and validator-enabled commit return Unknown_Object
+	// before either validate or handler runs.
+	no_rev := Edit_Source{edits = edits, handler = handle_fn, validate = validate_fn, user_data = &doc, revision_of = nil}
+	for req in ([?]string{
+		`{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`,
+		`{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`,
+	}) {
+		rep, app := dispatch_edits(frame, nil, nil, no_rev, req)
+		testing.expect_value(t, app, false)
+		testing.expect_value(t, rep, `{"ok":false,"error":"Unknown_Object"}`)
 		delete(rep)
 	}
 	testing.expect_value(t, doc.validate_calls, 0)
