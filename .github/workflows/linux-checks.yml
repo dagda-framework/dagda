@@ -135,6 +135,9 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: python3 examples/title-window/tests/e2e_title_conflict.py
 
+      - name: Run the application key test
+        run: python3 examples/app-keys/tests/e2e_app_keys.py
+
       - name: Run the action origin test
         env:
           SDL_VIDEODRIVER: dummy

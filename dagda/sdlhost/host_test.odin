@@ -4866,3 +4866,48 @@ test_multiline_paste_normalization_failure_and_control_push_growth_failure :: pr
 	testing.expect_value(t, len(h.queued_control_cstrs), 0)
 	testing.expect(t, !sdl.PollEvent(&ev_drain))
 }
+
+@(test)
+test_app_key_event_metadata_and_rebuild :: proc(t: ^testing.T) {
+	Record :: struct {
+		calls: int,
+		key: Key,
+		mods: Key_Mods,
+		repeat: bool,
+	}
+
+	record: Record
+	h: Host
+	h.app.user_data = &record
+	h.app.on_key = proc(data: rawptr, key: Key, mods: Key_Mods, repeat: bool) -> bool {
+		r := (^Record)(data)
+		r^ = {r.calls + 1, key, mods, repeat}
+		return !repeat
+	}
+
+	ev: sdl.Event
+	ev.type = .KEY_DOWN
+	ev.key.key = sdl.K_RIGHT
+	ev.key.mod = sdl.KMOD_RSHIFT | sdl.KMOD_LCTRL | sdl.KMOD_RALT | sdl.KMOD_LGUI
+	rebuild, _, _ := host_dispatch_key_event(&h, &ev)
+	testing.expect(t, rebuild)
+	testing.expect_value(t, record.key, .Right)
+	testing.expect_value(t, record.mods, Key_Mods{.Shift, .Ctrl, .Alt, .GUI})
+	testing.expect(t, !record.repeat)
+	testing.expect_value(t, record.calls, 1)
+
+	ev.key.repeat = true
+	ev.key.mod = {}
+	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect(t, !rebuild && record.repeat && record.mods == {})
+	testing.expect_value(t, record.calls, 2)
+
+	ev.type = .KEY_UP
+	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect(t, !rebuild)
+	ev.type = .KEY_DOWN
+	ev.key.key = sdl.K_A
+	rebuild, _, _ = host_dispatch_key_event(&h, &ev)
+	testing.expect(t, !rebuild)
+	testing.expect_value(t, record.calls, 2)
+}

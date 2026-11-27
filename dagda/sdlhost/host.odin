@@ -126,6 +126,11 @@ Composition_Remap_Decision :: struct {
 
 Composition_Remap_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id, old_text: string, new_text: string, anchor: int, caret: int, source_version: u64, destination_version: u64, versioned: bool) -> Composition_Remap_Decision
 
+// Navigation keys available to an application after host input handling.
+Key :: enum { Left, Right, Escape }
+Key_Mod :: enum { Shift, Ctrl, Alt, GUI }
+Key_Mods :: bit_set[Key_Mod]
+
 // App describes a native Dagda application hosted in an SDL3 window.
 // Supply either view (flow layout) or canvas (fixed-aspect canvas layout).
 App :: struct {
@@ -247,6 +252,10 @@ App :: struct {
 	// .Local or .Driver origin.
 	menus:         []Menu,
 	context_menus: []Context_Menu,
+	// Called on the host thread for an unconsumed navigation key-down, after
+	// pointer, menu, text/IME, traversal, undo and button handling. Mods and
+	// repeat describe this event. Return true to rebuild once for this event.
+	on_key: proc(user_data: rawptr, key: Key, mods: Key_Mods, repeat: bool) -> bool,
 }
 
 Run_Options :: struct {
@@ -1345,10 +1354,10 @@ host_shift_down :: proc(h: ^Host) -> bool {
 }
 
 // host_dispatch_key_event routes KEY_DOWN, KEY_UP, and WINDOW_FOCUS_LOST in
-// priority order: active pointer gesture cancellation, focused editable text
+// priority order: active pointer gesture cancellation, open menus, focused editable text
 // (including field-scoped Ctrl+Z and composition protection), unified Tab /
 // Shift+Tab traversal across editable fields and buttons, app-level Ctrl+Z
-// when the text field is not focused, and button keyboard activation.
+// when the text field is not focused, button keyboard activation, and App.on_key.
 host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: bool, has_pending_edit: bool, pending_edit: dagda.Text_Edit) {
 	defer host_report_composition(h, host_active_composition(h))
 	#partial switch ev.type {
@@ -1427,6 +1436,24 @@ host_dispatch_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (needs_rebuild: boo
 	}
 	if applied {
 		needs_rebuild = true
+		return
+	}
+	if h.app.on_key != nil && ev.type == .KEY_DOWN {
+		key: Key
+		switch ev.key.key {
+		case sdl.K_LEFT:   key = .Left
+		case sdl.K_RIGHT:  key = .Right
+		case sdl.K_ESCAPE: key = .Escape
+		case: return
+		}
+		mods: Key_Mods
+		if ev.key.mod & sdl.KMOD_SHIFT != {} { mods += {.Shift} }
+		if ev.key.mod & sdl.KMOD_CTRL  != {} { mods += {.Ctrl} }
+		if ev.key.mod & sdl.KMOD_ALT   != {} { mods += {.Alt} }
+		if ev.key.mod & sdl.KMOD_GUI   != {} { mods += {.GUI} }
+		if h.app.on_key(h.app.user_data, key, mods, ev.key.repeat) {
+			needs_rebuild = true
+		}
 	}
 	return
 }
