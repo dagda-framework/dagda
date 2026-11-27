@@ -37,17 +37,19 @@ Menu_Popup_Kind :: enum {
 }
 
 Menu_State :: struct {
-	kind:          Menu_Popup_Kind,
-	menu_index:    int,
-	context_index: int,
-	context_id:    dagda.Object_Id,
-	anchor:        dagda.Point,
-	highlighted:   int,
-	mouse_pos:     dagda.Point,
-	has_mouse:     bool,
+	kind:            Menu_Popup_Kind,
+	menu_index:      int,
+	context_index:   int,
+	context_id:      dagda.Object_Id,
+	anchor:          dagda.Point,
+	highlighted:     int,
+	has_highlighted: bool,
+	highlighted_id:  dagda.Object_Id,
+	mouse_pos:       dagda.Point,
+	has_mouse:       bool,
 	// Set when a MOUSE_BUTTON_DOWN was consumed by the menu bar or popup so
 	// the matching MOUSE_BUTTON_UP is also swallowed cleanly.
-	swallow_up:    bool,
+	swallow_up:      bool,
 }
 
 MENU_BAR_HEIGHT :: f32(32)
@@ -66,6 +68,18 @@ menu_is_open :: proc(m: ^Menu_State) -> bool {
 	return m.kind != .None
 }
 
+menu_set_highlight :: proc(h: ^Host, items: []Menu_Item, index: int) {
+	if index >= 0 && index < len(items) && items[index].enabled {
+		h.menu.highlighted = index
+		h.menu.has_highlighted = true
+		h.menu.highlighted_id = items[index].info.id
+	} else {
+		h.menu.highlighted = -1
+		h.menu.has_highlighted = false
+		h.menu.highlighted_id = 0
+	}
+}
+
 menu_close :: proc(h: ^Host) -> bool {
 	if h.menu.kind == .None {
 		return false
@@ -74,7 +88,7 @@ menu_close :: proc(h: ^Host) -> bool {
 	h.menu.menu_index = 0
 	h.menu.context_index = 0
 	h.menu.context_id = 0
-	h.menu.highlighted = -1
+	menu_set_highlight(h, nil, -1)
 	h.needs_redraw = true
 	host_sync_driver_frame(h)
 	return true
@@ -240,7 +254,8 @@ menu_open_bar :: proc(h: ^Host, index: int, highlight_first: bool) {
 	h.menu.menu_index = index
 	h.menu.context_index = 0
 	h.menu.context_id = 0
-	h.menu.highlighted = highlight_first ? menu_first_enabled(h.app.menus[index].items) : -1
+	items := h.app.menus[index].items
+	menu_set_highlight(h, items, highlight_first ? menu_first_enabled(items) : -1)
 	h.needs_redraw = true
 	host_sync_driver_frame(h)
 }
@@ -254,9 +269,27 @@ menu_open_context :: proc(h: ^Host, ctx_index: int, anchor: dagda.Point, highlig
 	h.menu.context_index = ctx_index
 	h.menu.context_id = ctx.target_id
 	h.menu.anchor = anchor
-	h.menu.highlighted = highlight_first ? menu_first_enabled(ctx.items) : -1
+	menu_set_highlight(h, ctx.items, highlight_first ? menu_first_enabled(ctx.items) : -1)
 	h.needs_redraw = true
 	host_sync_driver_frame(h)
+}
+
+menu_reconcile_highlight :: proc(h: ^Host, items: []Menu_Item) {
+	if !h.menu.has_highlighted {
+		menu_set_highlight(h, nil, -1)
+		return
+	}
+	for item, i in items {
+		if item.info.id == h.menu.highlighted_id {
+			if item.enabled {
+				menu_set_highlight(h, items, i)
+			} else {
+				menu_set_highlight(h, nil, -1)
+			}
+			return
+		}
+	}
+	menu_set_highlight(h, nil, -1)
 }
 
 menu_reconcile :: proc(h: ^Host) {
@@ -266,25 +299,22 @@ menu_reconcile :: proc(h: ^Host) {
 	case .Menu_Bar:
 		if h.menu.menu_index < 0 || h.menu.menu_index >= len(h.app.menus) {
 			h.menu.kind = .None
-			h.menu.highlighted = -1
+			menu_set_highlight(h, nil, -1)
 			return
 		}
-		items := h.app.menus[h.menu.menu_index].items
-		if h.menu.highlighted >= len(items) || (h.menu.highlighted >= 0 && !items[h.menu.highlighted].enabled) {
-			h.menu.highlighted = -1
-		}
+		menu_reconcile_highlight(h, h.app.menus[h.menu.menu_index].items)
 	case .Context:
 		idx := menu_find_context(h.app.context_menus, h.menu.context_id)
-		if idx < 0 {
+		_, row_found := dagda.find(h.frame, h.menu.context_id)
+		if idx < 0 || !row_found {
 			h.menu.kind = .None
-			h.menu.highlighted = -1
+			h.menu.context_index = 0
+			h.menu.context_id = 0
+			menu_set_highlight(h, nil, -1)
 			return
 		}
 		h.menu.context_index = idx
-		items := h.app.context_menus[idx].items
-		if h.menu.highlighted >= len(items) || (h.menu.highlighted >= 0 && !items[h.menu.highlighted].enabled) {
-			h.menu.highlighted = -1
-		}
+		menu_reconcile_highlight(h, h.app.context_menus[idx].items)
 	}
 }
 
@@ -326,7 +356,7 @@ menu_handle_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (consumed: bool, need
 		case sdl.K_DOWN:
 			next := menu_step_enabled(items, h.menu.highlighted, +1)
 			if next != h.menu.highlighted {
-				h.menu.highlighted = next
+				menu_set_highlight(h, items, next)
 				h.needs_redraw = true
 			}
 			return true, false
@@ -334,7 +364,7 @@ menu_handle_key_event :: proc(h: ^Host, ev: ^sdl.Event) -> (consumed: bool, need
 		case sdl.K_UP:
 			next := menu_step_enabled(items, h.menu.highlighted, -1)
 			if next != h.menu.highlighted {
-				h.menu.highlighted = next
+				menu_set_highlight(h, items, next)
 				h.needs_redraw = true
 			}
 			return true, false
@@ -477,7 +507,7 @@ menu_handle_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> (consumed: bool, ne
 			items := menu_active_items(h)
 			next := (item_idx >= 0 && item_idx < len(items) && items[item_idx].enabled) ? item_idx : -1
 			if next != h.menu.highlighted {
-				h.menu.highlighted = next
+				menu_set_highlight(h, items, next)
 				h.needs_redraw = true
 			}
 		}
@@ -620,7 +650,10 @@ host_sync_driver_frame :: proc(h: ^Host) {
 	}
 	n := copy(elems, h.frame.elements)
 
-	// Assign synthetic non-colliding IDs for menu bar titles.
+	// Assign synthetic non-colliding IDs for menu bar titles. Their validity is
+	// scoped to this driver frame only: drivers should rediscover titles by
+	// role "menu.title" and text after rebuilds, and use app-owned item IDs to
+	// invoke commands.
 	next_title_id := max(u64) - 1
 	for m, i in h.app.menus {
 		for menu_id_used(elems[:n], h.app.menus, h.app.context_menus, dagda.Object_Id(next_title_id)) {
@@ -689,6 +722,33 @@ MENU_POPUP_BORDER :: sdl.Color{92, 108, 138, 255}
 MENU_ITEM_HIGHLIGHT_BG :: sdl.Color{58, 118, 212, 255}
 MENU_ITEM_ENABLED_TEXT :: sdl.Color{242, 246, 252, 255}
 MENU_ITEM_DISABLED_TEXT :: sdl.Color{120, 128, 146, 255}
+MENU_CONTEXT_OUTLINE :: sdl.Color{164, 136, 255, 255}
+
+// menu_draw_context_outline draws a distinct outline around the row that owns
+// the currently open context menu, using its current bounds in h.frame. Called
+// while the canvas clip is still active so the outline clips cleanly with the
+// row, before menu_draw paints the popup overlay on top.
+menu_draw_context_outline :: proc(h: ^Host, scale_x, scale_y: f32) {
+	if h.menu.kind != .Context {
+		return
+	}
+	el, found := dagda.find(h.frame, h.menu.context_id)
+	if !found {
+		return
+	}
+	r := h.renderer
+	rect := sdl.FRect{
+		x = el.bounds.x,
+		y = el.bounds.y,
+		w = el.bounds.width,
+		h = el.bounds.height,
+	}
+	sdl.SetRenderDrawColor(r, MENU_CONTEXT_OUTLINE.r, MENU_CONTEXT_OUTLINE.g, MENU_CONTEXT_OUTLINE.b, MENU_CONTEXT_OUTLINE.a)
+	ring1 := scale_frect(sdl.FRect{x = rect.x - 2, y = rect.y - 2, w = rect.w + 4, h = rect.h + 4}, scale_x, scale_y)
+	ring2 := scale_frect(sdl.FRect{x = rect.x - 1, y = rect.y - 1, w = rect.w + 2, h = rect.h + 2}, scale_x, scale_y)
+	sdl.RenderRect(r, &ring1)
+	sdl.RenderRect(r, &ring2)
+}
 
 menu_window_clip_px :: proc(h: ^Host, scale_x, scale_y: f32) -> sdl.Rect {
 	out_w, out_h: c.int

@@ -137,10 +137,21 @@ App :: struct {
 	// Borrowed under the same slice-borrowing contract as edits and
 	// editable_text_targets: pass the slices once, keep their backing arrays
 	// (and each menu's items array and label/role strings) valid until run
-	// returns, and refresh existing item text/enabled slots only from the
-	// host-thread builder. Menu items are discoverable via driver inspect
-	// whether their popup is open or closed, are not Tab stops, and activate
-	// through App.handle with .Local or .Driver origin.
+	// returns, and refresh existing slots only from the host-thread builder.
+	// During a host-thread rebuild, the app may update Context_Menu.target_id
+	// and each Menu_Item's info.id, text, and enabled state in place inside
+	// those backing arrays. Open context popups reconcile by stable target ID
+	// (closing if the target row or its Context_Menu binding disappears), and
+	// the highlighted command reconciles by stable item ID (following moves
+	// and clearing if removed, replaced at the same index, or disabled).
+	//
+	// Menu bar titles receive host-generated synthetic Object_Ids scoped to
+	// the current driver frame so they never collide with app element or item
+	// IDs. Drivers should rediscover titles by role "menu.title" and text
+	// after rebuilds, and use app-owned item IDs to invoke commands.
+	// Menu items are discoverable via driver inspect whether their popup is
+	// open or closed, are not Tab stops, and activate through App.handle with
+	// .Local or .Driver origin.
 	menus:         []Menu,
 	context_menus: []Context_Menu,
 }
@@ -424,6 +435,7 @@ host_draw :: proc(h: ^Host) {
 		}
 	}
 
+	menu_draw_context_outline(h, scale_x, scale_y)
 	if h.frame.has_canvas {
 		sdl.SetRenderClipRect(r, nil)
 	}

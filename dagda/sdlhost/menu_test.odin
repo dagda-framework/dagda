@@ -587,3 +587,345 @@ test_menu_driver_hit_test_letterbox_1200x540 :: proc(t: ^testing.T) {
 	defer delete(closed_reply)
 	testing.expect_value(t, closed_reply, `{"ok":true,"id":null}`)
 }
+
+@(private = "file")
+has_context_outline_pixel :: proc(surface: ^sdl.Surface, x0, x1, y_center: i32) -> bool {
+	for y in y_center - 2 ..= y_center + 2 {
+		for x in x0 ..< x1 {
+			p := read_px(surface, x, y)
+			if p == {MENU_CONTEXT_OUTLINE.r, MENU_CONTEXT_OUTLINE.g, MENU_CONTEXT_OUTLINE.b, 255} {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+@(private = "file")
+Outline_Test_App :: struct {
+	base:      Menu_Test_App,
+	b_y:       f32,
+	include_b: bool,
+}
+
+@(private = "file")
+outline_test_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+	app := (^Outline_Test_App)(user_data)
+	app.base.elements[0] = {info = {id = 10, role = "slide.a"}, kind = .Label, text = app.base.a_text, bounds = {x = 40, y = 60, width = 380, height = 56}}
+	if app.include_b {
+		app.base.elements[1] = {info = {id = 11, role = "slide.b"}, kind = .Label, text = app.base.b_text, bounds = {x = 40, y = app.b_y, width = 380, height = 56}}
+		return {size = {width = 480, height = 300}, elements = app.base.elements[:2]}
+	}
+	return {size = {width = 480, height = 300}, elements = app.base.elements[:1]}
+}
+
+@(test)
+test_menu_context_outline_two_scales :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	viewport := dagda.Size{width = 480, height = 300}
+	scales := [?]i32{1, 2}
+
+	for scale in scales {
+		out_w := i32(viewport.width) * scale
+		out_h := i32(viewport.height) * scale
+		surface := sdl.CreateSurface(out_w, out_h, .RGBA8888)
+		if !testing.expect(t, surface != nil) { return }
+		defer sdl.DestroySurface(surface)
+		renderer := sdl.CreateSoftwareRenderer(surface)
+		if !testing.expect(t, renderer != nil) { return }
+		defer sdl.DestroyRenderer(renderer)
+
+		state := Outline_Test_App{b_y = 160, include_b = true}
+		h, ok := menu_test_setup_host(t, &state.base, viewport, surface, renderer)
+		if !ok { return }
+		defer {
+			font_destroy_textures(&h.font)
+			font_destroy(&h.font)
+			text_edit_destroy(&h.text_edit)
+			dagda.frame_destroy(&h.driver_frame)
+			dagda.frame_destroy(&h.frame)
+		}
+		h.app.user_data = &state
+		h.app.canvas = outline_test_canvas
+		if !testing.expect(t, host_rebuild_frame(&h)) { return }
+
+		// Caret at ab|cd on A.
+		testing.expect(t, text_edit_focus_id(&h.text_edit, nil, &h.font, h.frame, h.app.text_edit, 10, h.app.editable_text_targets))
+		h.text_edit.session.anchor = 2
+		h.text_edit.session.caret = 2
+
+		a_el, _ := dagda.find(h.frame, 10)
+		b_el, _ := dagda.find(h.frame, 11)
+		caret_x, caret_y, caret_px := text_edit_caret_pos(&h.text_edit, &h.font, h.frame, a_el.bounds, state.base.a_text, false)
+		caret_px_x := i32(math.round(caret_x * f32(scale)))
+		caret_y0 := i32(math.floor(caret_y * f32(scale)))
+		caret_y1 := i32(math.ceil((caret_y + caret_px) * f32(scale)))
+
+		// Probe the left segment of B's top border (away from the popup placed on the right).
+		probe_x0 := i32(50 * scale)
+		probe_x1 := i32(120 * scale)
+		old_b_top_y := i32((b_el.bounds.y - 2) * f32(scale))
+
+		// 1. Before opening B's context menu: no context outline on B.
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, !has_context_outline_pixel(surface, probe_x0, probe_x1, old_b_top_y), "B must not be outlined before context menu opens")
+		testing.expect(t, has_caret_pixel_in_band(surface, caret_px_x, caret_y0, caret_y1))
+
+		// 2. Secondary-click B (on its right side so popup does not cover the left outline probe):
+		//    B is outlined, A keeps its ab|cd caret.
+		rc_ev: sdl.Event
+		rc_ev.type = .MOUSE_BUTTON_DOWN
+		rc_ev.button.button = sdl.BUTTON_RIGHT
+		rc_ev.button.down = true
+		rc_ev.button.x = b_el.bounds.x + 240
+		rc_ev.button.y = b_el.bounds.y + 20
+		testing.expect(t, host_dispatch_mouse_event(&h, &rc_ev))
+		testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+		testing.expect_value(t, h.menu.context_id, dagda.Object_Id(11))
+
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, has_context_outline_pixel(surface, probe_x0, probe_x1, old_b_top_y), "B must show context outline while its popup is open")
+		testing.expect(t, has_caret_pixel_in_band(surface, caret_px_x, caret_y0, caret_y1), "A caret must remain intact while B is outlined")
+
+		// 3. Rebuild moves B downward (y: 160 -> 200): outline follows B's current bounds.
+		state.b_y = 200
+		testing.expect(t, host_rebuild_frame(&h))
+		new_b_top_y := i32((200 - 2) * scale)
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, !has_context_outline_pixel(surface, probe_x0, probe_x1, old_b_top_y), "outline must clear from B's previous bounds after rebuild")
+		testing.expect(t, has_context_outline_pixel(surface, probe_x0, probe_x1, new_b_top_y), "outline must follow B's current bounds after rebuild")
+
+		// 4. Switching target to A clears B's outline and outlines A.
+		menu_open_context(&h, 0, {x = 280, y = 80}, false)
+		a_top_y := i32((a_el.bounds.y - 2) * f32(scale))
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, !has_context_outline_pixel(surface, probe_x0, probe_x1, new_b_top_y), "switching target must clear B's outline")
+		testing.expect(t, has_context_outline_pixel(surface, probe_x0, probe_x1, a_top_y), "new target A must be outlined")
+
+		// 5. Closing popup clears the outline.
+		_ = menu_close(&h)
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, !has_context_outline_pixel(surface, probe_x0, probe_x1, a_top_y), "closing popup must clear outline")
+
+		// 6. Reopen on B, then drop B from canvas on rebuild: popup closes and outline clears.
+		menu_open_context(&h, 1, {x = 280, y = 210}, false)
+		state.include_b = false
+		testing.expect(t, host_rebuild_frame(&h))
+		testing.expect(t, !menu_is_open(&h.menu), "losing target row on rebuild must close context popup")
+		host_draw(&h)
+		testing.expect(t, sdl.FlushRenderer(renderer))
+		testing.expect(t, !has_context_outline_pixel(surface, probe_x0, probe_x1, new_b_top_y), "losing target row must clear outline")
+	}
+}
+
+@(private = "file")
+Rebuild_Menu_App :: struct {
+	base:      Menu_Test_App,
+	include_b: bool,
+	activations: int,
+	last_id:     dagda.Object_Id,
+}
+
+@(private = "file")
+rebuild_menu_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+	app := (^Rebuild_Menu_App)(user_data)
+	app.base.elements[0] = {info = {id = 10, role = "slide.a"}, kind = .Label, text = app.base.a_text, bounds = {x = 40, y = 60, width = 380, height = 56}}
+	if app.include_b {
+		app.base.elements[1] = {info = {id = 11, role = "slide.b"}, kind = .Label, text = app.base.b_text, bounds = {x = 40, y = 160, width = 380, height = 56}}
+		return {size = {width = 480, height = 300}, elements = app.base.elements[:2]}
+	}
+	return {size = {width = 480, height = 300}, elements = app.base.elements[:1]}
+}
+
+@(private = "file")
+rebuild_menu_handle :: proc(user_data: rawptr, id: dagda.Object_Id, action: dagda.Action) -> bool {
+	app := (^Rebuild_Menu_App)(user_data)
+	if action != .Activate {
+		return false
+	}
+	app.activations += 1
+	app.last_id = id
+	return true
+}
+
+@(test)
+test_menu_rebuild_reconciles_ids_while_open :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	viewport := dagda.Size{width = 480, height = 300}
+	surface := sdl.CreateSurface(480, 300, .RGBA8888)
+	if !testing.expect(t, surface != nil) { return }
+	defer sdl.DestroySurface(surface)
+	renderer := sdl.CreateSoftwareRenderer(surface)
+	if !testing.expect(t, renderer != nil) { return }
+	defer sdl.DestroyRenderer(renderer)
+
+	state := Rebuild_Menu_App{include_b = true}
+	h, ok := menu_test_setup_host(t, &state.base, viewport, surface, renderer)
+	if !ok { return }
+	defer {
+		font_destroy_textures(&h.font)
+		font_destroy(&h.font)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.driver_frame)
+		dagda.frame_destroy(&h.frame)
+	}
+	h.app.user_data = &state
+	h.app.canvas = rebuild_menu_canvas
+	h.app.handle = rebuild_menu_handle
+	if !testing.expect(t, host_rebuild_frame(&h)) { return }
+
+	enter_ev: sdl.Event
+	enter_ev.type = .KEY_DOWN
+	enter_ev.key.key = sdl.K_RETURN
+	enter_ev.key.down = true
+
+	// Open B's context menu (target_id=11 at contexts[1]) with first enabled item highlighted (id=203 at b_ctx_it[1]).
+	menu_open_context(&h, 1, {x = 120, y = 180}, true)
+	testing.expect_value(t, h.menu.context_index, 1)
+	testing.expect_value(t, h.menu.highlighted, 1)
+	testing.expect_value(t, h.menu.highlighted_id, dagda.Object_Id(203))
+
+	// 1. Move target_id=11 from contexts[1] to contexts[0] AND move item 203 from index 1 to index 0.
+	state.base.contexts[0], state.base.contexts[1] = state.base.contexts[1], state.base.contexts[0]
+	state.base.b_ctx_it[0], state.base.b_ctx_it[1] = state.base.b_ctx_it[1], state.base.b_ctx_it[0]
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+	testing.expect_value(t, h.menu.context_index, 0)
+	testing.expect_value(t, h.menu.highlighted, 0)
+	testing.expect_value(t, h.menu.highlighted_id, dagda.Object_Id(203))
+
+	// 2. Replace item 203 at the same index (0) with a different enabled ID (299):
+	//    highlight must clear so Enter does nothing and popup stays open.
+	state.base.b_ctx_it[0].info.id = 299
+	state.base.b_ctx_it[0].text = "Replaced B"
+	state.base.b_ctx_it[0].enabled = true
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+	testing.expect_value(t, h.menu.highlighted, -1)
+	testing.expect(t, !h.menu.has_highlighted)
+	_, _, _ = host_dispatch_key_event(&h, &enter_ev)
+	testing.expect_value(t, state.activations, 0)
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+
+	// 3. Highlight 299, then disable it on rebuild: highlight clears and Enter does nothing.
+	menu_set_highlight(&h, state.base.b_ctx_it[:], 0)
+	testing.expect_value(t, h.menu.highlighted_id, dagda.Object_Id(299))
+	state.base.b_ctx_it[0].enabled = false
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, h.menu.highlighted, -1)
+	_, _, _ = host_dispatch_key_event(&h, &enter_ev)
+	testing.expect_value(t, state.activations, 0)
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+
+	// 4. Context-menu binding for target 11 disappears (target_id updated to 999): popup closes.
+	state.base.contexts[0].target_id = 999
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.None)
+
+	// 5. Restore binding for 11, reopen, then remove row 11 from canvas: popup closes.
+	state.base.contexts[0].target_id = 11
+	state.base.b_ctx_it[0].enabled = true
+	testing.expect(t, host_rebuild_frame(&h))
+	menu_open_context(&h, 0, {x = 120, y = 180}, true)
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.Context)
+	state.include_b = false
+	testing.expect(t, host_rebuild_frame(&h))
+	testing.expect_value(t, h.menu.kind, Menu_Popup_Kind.None)
+}
+
+@(private = "file")
+Title_Collision_App :: struct {
+	base:         Menu_Test_App,
+	extra_active: bool,
+	extra_id:     dagda.Object_Id,
+	elements:     [3]dagda.Canvas_Element,
+}
+
+@(private = "file")
+title_collision_canvas :: proc(user_data: rawptr) -> dagda.Canvas {
+	app := (^Title_Collision_App)(user_data)
+	app.elements[0] = {info = {id = 10, role = "slide.a"}, kind = .Label, text = app.base.a_text, bounds = {x = 40, y = 60, width = 380, height = 56}}
+	app.elements[1] = {info = {id = 11, role = "slide.b"}, kind = .Label, text = app.base.b_text, bounds = {x = 40, y = 160, width = 380, height = 56}}
+	if app.extra_active {
+		app.elements[2] = {info = {id = app.extra_id, role = "app.high"}, kind = .Button, text = "High", bounds = {x = 40, y = 230, width = 120, height = 40}}
+		return {size = {width = 480, height = 300}, elements = app.elements[:3]}
+	}
+	return {size = {width = 480, height = 300}, elements = app.elements[:2]}
+}
+
+@(test)
+test_menu_title_generated_id_collision_on_rebuild :: proc(t: ^testing.T) {
+	sync.mutex_lock(&sdl_test_mu)
+	defer sync.mutex_unlock(&sdl_test_mu)
+
+	viewport := dagda.Size{width = 480, height = 300}
+	surface := sdl.CreateSurface(480, 300, .RGBA8888)
+	if !testing.expect(t, surface != nil) { return }
+	defer sdl.DestroySurface(surface)
+	renderer := sdl.CreateSoftwareRenderer(surface)
+	if !testing.expect(t, renderer != nil) { return }
+	defer sdl.DestroyRenderer(renderer)
+
+	state: Title_Collision_App
+	h, ok := menu_test_setup_host(t, &state.base, viewport, surface, renderer)
+	if !ok { return }
+	defer {
+		font_destroy_textures(&h.font)
+		font_destroy(&h.font)
+		text_edit_destroy(&h.text_edit)
+		dagda.frame_destroy(&h.driver_frame)
+		dagda.frame_destroy(&h.frame)
+	}
+	h.app.user_data = &state
+	h.app.canvas = title_collision_canvas
+	if !testing.expect(t, host_rebuild_frame(&h)) { return }
+
+	find_title :: proc(frame: dagda.Frame, text: string) -> (dagda.Resolved_Element, int) {
+		found: dagda.Resolved_Element
+		count := 0
+		for el in frame.elements {
+			if el.info.role == "menu.title" && el.text == text {
+				found = el
+				count += 1
+			}
+		}
+		return found, count
+	}
+
+	orig_file, orig_count := find_title(host_driver_frame(&h)^, "File")
+	testing.expect_value(t, orig_count, 1)
+	testing.expect(t, orig_file.bounds.width > 0 && orig_file.bounds.height > 0)
+
+	// Introduce a high-valued app element using the exact previously generated title ID.
+	state.extra_active = true
+	state.extra_id = orig_file.info.id
+	testing.expect(t, host_rebuild_frame(&h))
+
+	df := host_driver_frame(&h)^
+	// App element owns orig_file.info.id cleanly.
+	high_el, high_found := dagda.find(df, orig_file.info.id)
+	testing.expect(t, high_found)
+	testing.expect_value(t, high_el.info.role, "app.high")
+
+	// "File" title is rediscovered by role "menu.title" + text with a new non-colliding ID.
+	new_file, new_count := find_title(df, "File")
+	testing.expect_value(t, new_count, 1)
+	testing.expect(t, new_file.info.id != orig_file.info.id, "generated title ID must step past colliding app ID")
+	testing.expect(t, new_file.bounds.width > 0 && new_file.bounds.height > 0)
+
+	// Every ID in the driver frame is unique.
+	for a, i in df.elements {
+		for b in df.elements[i + 1:] {
+			testing.expect(t, a.info.id != b.info.id, "driver frame must have no duplicate IDs")
+		}
+	}
+}
