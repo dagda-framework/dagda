@@ -9,19 +9,23 @@ Dagda is an experimental native UI framework for Odin, designed for applications
 
 **New here?** [Build your first native Dagda app](docs/first-app.md) — a counter window from your own Odin project, clicked once by hand and once by an agent.
 
-Today, on Linux, one SDL3 window shows an editable slide title backed by a shared title model, and a terminal client can inspect, preview, and commit a rename over a local socket while a second client watches committed changes. Typing, text composition, and keyboard undo in the window operate on the same model, and the window keeps keyboard focus when an external edit lands.
+Today, on Linux and on Apple Silicon macOS, one SDL3 window shows an editable slide title backed by a shared title model, and a terminal client can inspect, preview, and commit a rename over a local socket while a second client watches committed changes. Typing, text composition, and keyboard undo in the window operate on the same model, and the window keeps keyboard focus when an external edit lands.
 
 ## Quick start
 
-From a clean checkout on Linux x86-64 you need the tools the pinned Odin installer uses (Python 3, curl, tar, sha256sum) plus SDL3, FreeType, and a sans-serif TrueType font:
+From a clean checkout on Linux x86-64 or macOS on Apple Silicon (arm64) you need the tools the pinned Odin installer uses (Python 3, curl, tar) plus SDL3, FreeType, and a sans-serif TrueType font:
 
 ```sh
 # Debian / Ubuntu
 sudo apt-get install -y python3 curl tar libsdl3-dev libfreetype-dev fonts-liberation
 # Arch Linux:  pacman -S python curl tar sdl3 freetype2 ttf-liberation
 # Fedora:      dnf install python3 curl tar SDL3-devel freetype-devel liberation-sans-fonts
+# macOS (Apple Silicon): brew install sdl3 freetype
+#   (the setup the macOS CI job uses; Python 3, curl and tar come
+#    with the Xcode Command Line Tools or Homebrew, and the host
+#    finds a system font, so no font package is needed)
 
-bash scripts/setup-odin.sh   # installs the pinned Odin compiler from dagda.lock
+bash scripts/setup-odin.sh   # installs the pinned Odin compiler from dagda.lock (macOS ARM64 on Apple Silicon)
 mkdir -p build
 ./scripts/odin.sh build examples/title-window -collection:dagda=. -out:build/title-window
 ./scripts/odin.sh build examples/title-driver-client -collection:dagda=. -out:build/title-client
@@ -52,7 +56,7 @@ SOCK=/tmp/dagda-title.AbCdEf/title.sock   # paste the line Terminal 1 printed
 # the watcher prints: {"event":"commit","id":1,"revision":1,"text":"Revenue grew 12%"}
 ```
 
-Now click the title in the window if it is not already focused and press **Ctrl+Z**. The window restores “Quarterly results”, keeps keyboard focus, and the watcher in Terminal 2 prints:
+Now click the title in the window if it is not already focused and press **Ctrl+Z** (on macOS, **Cmd+Z**). The window restores “Quarterly results”, keeps keyboard focus, and the watcher in Terminal 2 prints:
 
 ```json
 {"event":"undo","id":1,"revision":2,"text":"Quarterly results"}
