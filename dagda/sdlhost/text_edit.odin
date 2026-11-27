@@ -16,6 +16,18 @@ Text_Commit_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id, new_te
 // and not composing. Return true if the app applied an undo step.
 Text_Undo_Handler :: #type proc(user_data: rawptr, id: dagda.Object_Id) -> bool
 
+// Text_Version_Handler (App.text_version_of) supplies an
+// optional opaque version
+// for an editable field's committed text. The version is
+// app-owned bookkeeping (a document revision is the obvious
+// choice): the host only stores the value captured with a
+// composition snapshot, compares it with the value belonging
+// to a later frame, and hands both to the remap callback.
+// ok=false means the field is unversioned, in which case
+// only byte changes invoke the mapper. Version zero is a
+// valid version whenever ok is true.
+Text_Version_Handler :: #type proc(user_data: rawptr, field_id: dagda.Object_Id) -> (version: u64, ok: bool)
+
 // Editable_Text_Config opts a single-line text element into host-managed
 // grapheme movement, selection, and IME composition backed by dagda.Text_Session.
 // The app owns committed text, revision, and undo history.
@@ -36,6 +48,43 @@ Text_Edit_State :: struct {
 	preferred_x:     f32,
 	scroll_offsets:  map[dagda.Object_Id][2]f32,
 	session:         dagda.Text_Session,
+	// Session-owned snapshot of the composing field's
+	// committed text, cloned at composition start and
+	// advanced only after a successful remap. It keeps the
+	// old bytes alive when the app builder replaces its own
+	// storage, and is released when composition ends.
+	composition_snapshot:     string,
+	has_composition_snapshot: bool,
+	snapshot_allocator:       mem.Allocator,
+	// Opaque app version captured with the snapshot, when
+	// the field is versioned. Advanced together with the
+	// snapshot text after a successful remap.
+	snapshot_version:     u64,
+	has_snapshot_version: bool,
+}
+
+text_edit_snapshot_clear :: proc(te: ^Text_Edit_State) {
+	if te.has_composition_snapshot {
+		delete(te.composition_snapshot, te.snapshot_allocator)
+		te.composition_snapshot = ""
+		te.has_composition_snapshot = false
+		te.snapshot_version = 0
+		te.has_snapshot_version = false
+	}
+}
+
+text_edit_snapshot_set :: proc(te: ^Text_Edit_State, text: string) -> bool {
+	alloc := te.session.allocator
+	cloned, err := strings.clone(text, alloc)
+	if err != nil || (len(text) > 0 && len(cloned) != len(text)) {
+		delete(cloned, alloc)
+		return false
+	}
+	text_edit_snapshot_clear(te)
+	te.composition_snapshot = cloned
+	te.has_composition_snapshot = true
+	te.snapshot_allocator = alloc
+	return true
 }
 
 // Active_Composition identifies which visual field in the current host window
@@ -495,6 +544,7 @@ text_edit_caret_x :: proc(
 }
 
 text_edit_destroy :: proc(te: ^Text_Edit_State) {
+	text_edit_snapshot_clear(te)
 	dagda.text_session_destroy(&te.session)
 	delete(te.scroll_offsets)
 	te.scroll_offsets = nil
@@ -815,6 +865,7 @@ text_edit_blur :: proc(te: ^Text_Edit_State, window: ^sdl.Window) -> bool {
 		return false
 	}
 	_ = dagda.cancel_composition(&te.session)
+	text_edit_snapshot_clear(te)
 	te.focused = false
 	te.active_id = 0
 	te.dragging = false
@@ -1139,8 +1190,20 @@ text_edit_handle_event :: proc(
 	case .TEXT_EDITING:
 		text_edit_drag_end(te)
 		te.has_preferred_x = false
+		was_composing := dagda.is_composing(&te.session)
 		preedit := ev.edit.text != nil ? string(ev.edit.text) : ""
-		_ = dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		begin_err := dagda.begin_composition(&te.session, preedit, int(ev.edit.start), int(ev.edit.length))
+		if begin_err == .None && !was_composing && dagda.is_composing(&te.session) {
+			// Establish the session-owned snapshot of the
+			// committed text this composition is anchored
+			// against. If it cannot be established, cancel:
+			// a later final must never run against stale
+			// offsets with no trustworthy old text.
+			if !text_edit_snapshot_set(te, el.text) {
+				_ = dagda.cancel_composition(&te.session)
+				text_edit_snapshot_clear(te)
+			}
+		}
 		text_edit_update_ime_area(te, window, font, frame, cfg, targets, multiline_targets)
 		res.consumed = true
 		res.needs_redraw = true
