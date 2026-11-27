@@ -9,55 +9,19 @@ Dagda is an experimental native UI framework for Odin, designed for applications
 
 **New here?** [Build your first native Dagda app](docs/first-app.md) — a counter window from your own Odin project, clicked once by hand and once by an agent.
 
-Today, on Linux and on Apple Silicon macOS, one SDL3 window shows an editable slide title backed by a shared title model, and a terminal client can inspect, preview, and commit a rename over a local socket while a second client watches committed changes. Typing, text composition, and keyboard undo in the window operate on the same model, and the window keeps keyboard focus when an external edit lands.
+Today, on Linux, one SDL3 window shows an editable slide title backed by a shared title model, and a terminal client can inspect, preview, and commit a rename over a local socket while a second client watches committed changes. Typing, text composition, and keyboard undo in the window operate on the same model, and the window keeps keyboard focus when an external edit lands.
 
 ## Quick start
 
 ### macOS (Apple Silicon)
 
-The Apple Silicon quick start is the tested counter from
-[Build your first native Dagda app](docs/first-app.md). From
-a fresh checkout, install SDL3 and FreeType — the setup the
-macOS CI job uses — and the pinned Odin compiler (Python 3,
-curl and tar come with the Xcode Command Line Tools or
-Homebrew, and the host finds a system font, so no font
-package is needed):
+Install SDL3 and FreeType — the setup the macOS CI job uses (Python 3, curl, and tar come with the Xcode Command Line Tools or Homebrew, and the host finds a system font, so no font package is needed):
 
 ```sh
 brew install sdl3 freetype
-git clone https://github.com/dagda-framework/dagda.git
-cd dagda
-bash scripts/setup-odin.sh   # installs the pinned macOS ARM64 Odin compiler from dagda.lock
-export DAGDA="$PWD"
 ```
 
-Then follow the guide: save its `main.odin` as
-`my-counter/main.odin` in a project of your own, build both
-binaries, start the counter on a private socket, click
-**Increment** once, and let the client invoke the same
-button:
-
-```sh
-cd my-counter
-"$DAGDA/scripts/odin.sh" build . -collection:dagda="$DAGDA" -out:my-counter
-mkdir -p "$DAGDA/build"
-"$DAGDA/scripts/odin.sh" build "$DAGDA/examples/dagda-client" -collection:dagda="$DAGDA" -out:"$DAGDA/build/dagda-client"
-SOCK_DIR=$(mktemp -d /tmp/my-counter.XXXXXX)
-SOCK=$SOCK_DIR/counter.sock
-echo "SOCK=$SOCK"
-./my-counter --socket "$SOCK"   # Terminal 1; click Increment in the window
-
-# Terminal 2, after pasting the SOCK=... line printed above:
-CLIENT="$DAGDA/build/dagda-client"
-"$CLIENT" "$SOCK" inspect counter.increment   # discover the button's ID (2)
-"$CLIENT" "$SOCK" invoke 2 activate
-"$CLIENT" "$SOCK" inspect counter.value       # reads 2: one click, one invocation
-```
-
-Close the window when you are done; it removes its own
-socket file, and `rmdir "$SOCK_DIR"` in Terminal 1 cleans
-up. The full guide explains how the app owns the count and
-why the click and the invocation reach the same handler.
+Then follow [Build your first native Dagda app](docs/first-app.md) for the Dagda checkout, pinned Odin setup, build, and two-terminal counter walkthrough.
 
 ### Linux
 
