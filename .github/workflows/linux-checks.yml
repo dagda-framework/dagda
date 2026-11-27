@@ -16,7 +16,7 @@ jobs:
       - name: Install SDL3, FreeType, a font, and the WebAssembly linker
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsdl3-dev libfreetype-dev fonts-liberation lld
+          sudo apt-get install -y --no-install-recommends libsdl3-dev libfreetype-dev fonts-liberation fonts-nanum lld
 
       - name: Install the pinned Odin compiler
         run: bash scripts/setup-odin.sh

@@ -117,12 +117,19 @@ Cached_Glyph :: struct {
 	tex_renderer: ^sdl.Renderer,
 }
 
+Fallback_Face :: struct {
+	face:       FT_Face,
+	path:       string,
+	current_px: u32,
+}
+
 Font :: struct {
 	lib:        FT_Library,
 	face:       FT_Face,
 	loaded:     bool,
 	font_path:  string,
 	current_px: u32,
+	fallbacks:  [dynamic]Fallback_Face,
 	glyphs:     map[Glyph_Key]Cached_Glyph,
 }
 
@@ -139,26 +146,68 @@ DEFAULT_FONT_PATHS :: [?]string{
 	"/Library/Fonts/LiberationSans-Regular.ttf",
 }
 
+DEFAULT_FALLBACK_FONT_PATHS :: [?]string{
+	"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+	"/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+	"/usr/share/fonts/noto-cjk/NotoSansKR-Regular.otf",
+	"/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
+	"/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+	"/usr/share/fonts/nanum/NanumGothic.ttf",
+	"/usr/share/fonts/TTF/DejaVuSans.ttf",
+	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	"/System/Library/Fonts/AppleSDGothicNeo.ttc",
+	"/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+	"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	"/System/Library/Fonts/Hiragino Sans GB.ttc",
+}
+
 font_init :: proc(font: ^Font) -> bool {
 	if FT_Init_FreeType(&font.lib) != 0 {
 		fmt.eprintln("FT_Init_FreeType failed")
 		return false
 	}
+	loaded := false
 	if custom_path, ok := os.lookup_env("DAGDA_FONT", context.allocator); ok {
 		defer delete(custom_path)
 		if font_load_face(font, custom_path) {
-			return true
+			loaded = true
 		}
 	}
-	for path in DEFAULT_FONT_PATHS {
-		if font_load_face(font, path) {
-			return true
+	if !loaded {
+		for path in DEFAULT_FONT_PATHS {
+			if font_load_face(font, path) {
+				loaded = true
+				break
+			}
 		}
 	}
-	FT_Done_FreeType(font.lib)
-	font.lib = nil
-	fmt.eprintln("No TrueType font found. Set DAGDA_FONT or install ttf-liberation / fonts-liberation.")
-	return false
+	if !loaded {
+		FT_Done_FreeType(font.lib)
+		font.lib = nil
+		fmt.eprintln("No TrueType font found. Set DAGDA_FONT or install ttf-liberation / fonts-liberation.")
+		return false
+	}
+	for path in DEFAULT_FALLBACK_FONT_PATHS {
+		_ = font_add_fallback_face(font, path)
+	}
+	return true
+}
+
+font_init_with_paths :: proc(font: ^Font, primary_path: string, fallback_paths: []string = nil) -> bool {
+	if FT_Init_FreeType(&font.lib) != 0 {
+		return false
+	}
+	if !font_load_face(font, primary_path) {
+		FT_Done_FreeType(font.lib)
+		font.lib = nil
+		return false
+	}
+	for path in fallback_paths {
+		_ = font_add_fallback_face(font, path)
+	}
+	return true
 }
 
 font_load_face :: proc(font: ^Font, path: string) -> bool {
@@ -173,6 +222,51 @@ font_load_face :: proc(font: ^Font, path: string) -> bool {
 	font.loaded = true
 	font.font_path = strings.clone(path)
 	font.current_px = 0
+	return true
+}
+
+font_add_fallback_face :: proc(font: ^Font, path: string) -> bool {
+	if !font.loaded || font.lib == nil || len(path) == 0 {
+		return false
+	}
+	if path == font.font_path {
+		return false
+	}
+	for fb in font.fallbacks {
+		if fb.path == path {
+			return false
+		}
+	}
+	cpath_buf, cpath_err := make([]u8, len(path) + 1)
+	if cpath_err != nil || len(cpath_buf) != len(path) + 1 {
+		delete(cpath_buf)
+		return false
+	}
+	defer delete(cpath_buf)
+	copy(cpath_buf, path)
+	cpath_buf[len(path)] = 0
+	cpath := cstring(raw_data(cpath_buf))
+	face: FT_Face
+	if FT_New_Face(font.lib, cpath, 0, &face) != 0 {
+		return false
+	}
+	path_buf, path_err := make([]u8, len(path))
+	if path_err != nil || len(path_buf) != len(path) {
+		delete(path_buf)
+		FT_Done_Face(face)
+		return false
+	}
+	copy(path_buf, path)
+	cloned_path := string(path_buf)
+	prev_len := len(font.fallbacks)
+	if _, append_err := append(&font.fallbacks, Fallback_Face{
+		face = face,
+		path = cloned_path,
+	}); append_err != nil || len(font.fallbacks) != prev_len + 1 {
+		delete(cloned_path)
+		FT_Done_Face(face)
+		return false
+	}
 	return true
 }
 
@@ -196,6 +290,14 @@ font_destroy :: proc(font: ^Font) {
 	delete(font.glyphs)
 	delete(font.font_path)
 	font.font_path = ""
+	for &fb in font.fallbacks {
+		delete(fb.path)
+		if fb.face != nil {
+			FT_Done_Face(fb.face)
+			fb.face = nil
+		}
+	}
+	delete(font.fallbacks)
 	if font.face != nil {
 		FT_Done_Face(font.face)
 		font.face = nil
@@ -250,19 +352,38 @@ copy_ft_bitmap_alpha :: proc(bmp: FT_Bitmap, allocator := context.allocator) -> 
 	return alpha, true
 }
 
+font_resolve_glyph :: proc(font: ^Font, ch: rune, px: u32) -> (face: FT_Face, glyph_idx: u32) {
+	glyph_idx = FT_Get_Char_Index(font.face, c.ulong(ch))
+	if glyph_idx != 0 {
+		font_set_size(font, px)
+		return font.face, glyph_idx
+	}
+	for &fb in font.fallbacks {
+		fb_idx := FT_Get_Char_Index(fb.face, c.ulong(ch))
+		if fb_idx != 0 {
+			if fb.current_px != px {
+				_ = FT_Set_Pixel_Sizes(fb.face, 0, px)
+				fb.current_px = px
+			}
+			return fb.face, fb_idx
+		}
+	}
+	font_set_size(font, px)
+	return font.face, 0
+}
+
 font_get_glyph :: proc(font: ^Font, ch: rune, px_height: f32) -> ^Cached_Glyph {
 	px := u32(max(math.round(px_height), 1))
 	key := Glyph_Key{codepoint = ch, px_height = px}
 	if g, ok := &font.glyphs[key]; ok {
 		return g
 	}
-	font_set_size(font, px)
-	glyph_idx := FT_Get_Char_Index(font.face, c.ulong(ch))
-	if FT_Load_Glyph(font.face, glyph_idx, FT_LOAD_RENDER) != 0 {
+	face, glyph_idx := font_resolve_glyph(font, ch, px)
+	if FT_Load_Glyph(face, glyph_idx, FT_LOAD_RENDER) != 0 {
 		font.glyphs[key] = Cached_Glyph{advance_x = px_height * 0.5}
 		return &font.glyphs[key]
 	}
-	slot := font.face.glyph
+	slot := face.glyph
 	bmp := slot.bitmap
 	alpha, bmp_ok := copy_ft_bitmap_alpha(bmp)
 	w, h := 0, 0
