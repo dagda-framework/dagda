@@ -41,6 +41,17 @@ def exercise(app, client, tmp):
         heading = element("heading", "Report")
         hid = heading["id"]
         rev = command("edits", hid)["revision"]
+
+        # Case 1 (issue #64): unchanged state gives the same refusal at preview and commit,
+        # leaving text, revision, and undo history untouched.
+        p_code, p_refusal = run_client(client, sock, "preview", str(hid), "rename", str(rev), "text", "Report")
+        c_code, c_refusal = run_client(client, sock, "commit", str(hid), "rename", str(rev), "text", "Report")
+        assert p_code != 0 and p_refusal == {"ok": False, "error": "Not_Handled"}, (p_code, p_refusal)
+        assert c_code != 0 and c_refusal == {"ok": False, "error": "Not_Handled"}, (c_code, c_refusal)
+        assert command("edits", hid)["revision"] == rev
+        element("heading", "Report")
+        element("status", "starts=0 ends=0 heading_history=0 writer_history=0")
+
         click(writer["bounds"])
         control("key ctrl+a")
         control("key left")
@@ -59,8 +70,14 @@ def exercise(app, client, tmp):
             time.sleep(0.01)
         assert moved["id"] == writer["id"]
         element("paragraph.inserted", "Remote paragraph")
+        # Case 2: valid preview leaves text, revision, and undo history untouched; commit applies once.
         command("preview", hid, "rename", rev, "text", "Agent report")
-        command("commit", hid, "rename", rev, "text", "Agent report")
+        assert command("edits", hid)["revision"] == rev
+        element("heading", "Report")
+        element("status", "starts=1 ends=0 heading_history=0 writer_history=0")
+        committed = command("commit", hid, "rename", rev, "text", "Agent report")
+        assert committed["revision"] == rev + 1
+        element("heading", "Agent report")
         element("status", "starts=1 ends=0 heading_history=1 writer_history=0")
         control("text 한")
         element("status", "starts=1 ends=1 heading_history=1 writer_history=1")
@@ -89,6 +106,16 @@ def exercise(app, client, tmp):
         element("status", unchanged)
         element("heading", "Human report")
         assert command("edits", hid)["revision"] == current
+
+        # Commit-time Busy_Composing remains available while preview succeeds during heading composition.
+        control("preedit é")
+        command("preview", hid, "rename", current, "text", "While composing")
+        assert command("edits", hid)["revision"] == current
+        element("heading", "Human report")
+        b_code, b_refusal = run_client(client, sock, "commit", str(hid), "rename", str(current), "text", "While composing")
+        assert b_code != 0 and b_refusal == {"ok": False, "error": "Busy_Composing"}, (b_code, b_refusal)
+        element("status", unchanged)
+        element("heading", "Human report")
         control("quit")
         assert proc.wait(timeout=5) == 0
     finally:

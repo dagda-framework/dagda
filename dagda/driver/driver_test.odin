@@ -560,3 +560,173 @@ test_inspect_bounds_exact_round_trip :: proc(t: ^testing.T) {
 	defer delete(edge)
 	testing.expect_value(t, edge, `{"ok":true,"id":null}`)
 }
+
+@(test)
+test_dispatch_edits_optional_validator :: proc(t: ^testing.T) {
+	Val_Doc :: struct {
+		text:           string,
+		rev:            dagda.Revision,
+		undo_depth:     int,
+		composing:      bool,
+		validate_calls: int,
+		handler_calls:  int,
+	}
+	rev_of :: proc(user_data: rawptr, id: dagda.Object_Id) -> (dagda.Revision, bool) {
+		doc := (^Val_Doc)(user_data)
+		return doc.rev, id == 1
+	}
+	validate_fn :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+		doc := (^Val_Doc)(user_data)
+		doc.validate_calls += 1
+		if edit != "rename" || arg.kind != .Text {
+			return .Not_Handled
+		}
+		if arg.text == doc.text || len(arg.text) == 0 {
+			return .Not_Handled
+		}
+		return .Applied
+	}
+	handle_fn :: proc(user_data: rawptr, target: dagda.Action_Target, edit: string, arg: dagda.Edit_Argument) -> dagda.Edit_Result {
+		doc := (^Val_Doc)(user_data)
+		doc.handler_calls += 1
+		if target.base_revision != doc.rev {
+			return .Stale_Revision
+		}
+		if doc.composing {
+			return .Busy_Composing
+		}
+		if arg.text == doc.text || len(arg.text) == 0 {
+			return .Not_Handled
+		}
+		delete(doc.text)
+		doc.text = strings.clone(arg.text)
+		doc.rev += 1
+		doc.undo_depth += 1
+		return .Applied
+	}
+
+	doc := Val_Doc{text = strings.clone("Report")}
+	defer delete(doc.text)
+	elements := []dagda.Element{{info = {id = 1, role = "heading"}, kind = .Label, text = doc.text}}
+	frame, ok := dagda.resolve({elements = elements}, {width = 320, height = 120})
+	testing.expect(t, ok)
+	defer dagda.frame_destroy(&frame)
+
+	edits := []dagda.Advertised_Edit{{object_id = 1, edit = "rename", argument = .Text}}
+
+	// 1. Nil validator preserves existing behavior: no-op previews ok, commit returns Not_Handled.
+	no_val := Edit_Source{edits = edits, handler = handle_fn, user_data = &doc, revision_of = rev_of}
+	p0, app0 := dispatch_edits(frame, nil, nil, no_val, `{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Report"}}`)
+	defer delete(p0)
+	testing.expect_value(t, app0, false)
+	testing.expect_value(t, p0, `{"ok":true,"id":1,"edit":"rename","revision":0,"argument":{"kind":"text","text":"Report"}}`)
+	c0, appc0 := dispatch_edits(frame, nil, nil, no_val, `{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Report"}}`)
+	defer delete(c0)
+	testing.expect_value(t, appc0, false)
+	testing.expect_value(t, c0, `{"ok":false,"error":"Not_Handled"}`)
+	testing.expect_value(t, doc.handler_calls, 1)
+	doc.handler_calls = 0
+
+	// 2. With validator installed, preview and commit share identical precondition order:
+	//    live object + revision first (even when edit name or argument is also invalid),
+	//    then declaration and argument checks, then validate.
+	with_val := Edit_Source{edits = edits, handler = handle_fn, validate = validate_fn, user_data = &doc, revision_of = rev_of}
+	for req_and_err in ([?]struct{ req, want: string }{
+		// Stale revision takes precedence over Unknown_Edit and Wrong_Argument on both preview and commit.
+		{`{"op":"preview","id":1,"edit":"bogus","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"commit","id":1,"edit":"bogus","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"preview","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"commit","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		// Unknown object (revision_of reports unknown) returns Unknown_Object on both preview and commit.
+		{`{"op":"preview","id":99,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Object"}`},
+		{`{"op":"commit","id":99,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Object"}`},
+		// At current revision, declaration and argument checks still run before validate.
+		{`{"op":"preview","id":1,"edit":"bogus","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Edit"}`},
+		{`{"op":"commit","id":1,"edit":"bogus","base_revision":0,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Unknown_Edit"}`},
+		{`{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Wrong_Argument"}`},
+		{`{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"none"}}`, `{"ok":false,"error":"Wrong_Argument"}`},
+		{`{"op":"preview","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+		{`{"op":"commit","id":1,"edit":"rename","base_revision":9,"argument":{"kind":"text","text":"New"}}`, `{"ok":false,"error":"Stale_Revision","revision":0}`},
+	}) {
+		rep, app := dispatch_edits(frame, nil, nil, with_val, req_and_err.req)
+		testing.expect_value(t, app, false)
+		testing.expect_value(t, rep, req_and_err.want)
+		delete(rep)
+	}
+	// When revision_of is absent (nil), both preview and validator-enabled commit return Unknown_Object
+	// before either validate or handler runs.
+	no_rev := Edit_Source{edits = edits, handler = handle_fn, validate = validate_fn, user_data = &doc, revision_of = nil}
+	for req in ([?]string{
+		`{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`,
+		`{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"New"}}`,
+	}) {
+		rep, app := dispatch_edits(frame, nil, nil, no_rev, req)
+		testing.expect_value(t, app, false)
+		testing.expect_value(t, rep, `{"ok":false,"error":"Unknown_Object"}`)
+		delete(rep)
+	}
+	testing.expect_value(t, doc.validate_calls, 0)
+	testing.expect_value(t, doc.handler_calls, 0)
+
+	// 3. Unchanged state gives the same refusal at preview and commit; handler is not called.
+	p1, app1 := dispatch_edits(frame, nil, nil, with_val, `{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Report"}}`)
+	defer delete(p1)
+	testing.expect_value(t, app1, false)
+	testing.expect_value(t, p1, `{"ok":false,"error":"Not_Handled"}`)
+	c1, appc1 := dispatch_edits(frame, nil, nil, with_val, `{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Report"}}`)
+	defer delete(c1)
+	testing.expect_value(t, appc1, false)
+	testing.expect_value(t, c1, `{"ok":false,"error":"Not_Handled"}`)
+	testing.expect_value(t, doc.validate_calls, 2)
+	testing.expect_value(t, doc.handler_calls, 0)
+
+	// 4. Commit-time Busy_Composing remains available while preview still succeeds during composition.
+	doc.composing = true
+	p_comp, _ := dispatch_edits(frame, nil, nil, with_val, `{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	defer delete(p_comp)
+	testing.expect_value(t, p_comp, `{"ok":true,"id":1,"edit":"rename","revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	c_comp, app_comp := dispatch_edits(frame, nil, nil, with_val, `{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Draft"}}`)
+	defer delete(c_comp)
+	testing.expect_value(t, app_comp, false)
+	testing.expect_value(t, c_comp, `{"ok":false,"error":"Busy_Composing"}`)
+	testing.expect_value(t, doc.text, "Report")
+	testing.expect_value(t, doc.rev, dagda.Revision(0))
+	testing.expect_value(t, doc.undo_depth, 0)
+	doc.composing = false
+
+	// 5. Valid preview leaves state untouched; matching commit revalidates and applies once.
+	p2, app2 := dispatch_edits(frame, nil, nil, with_val, `{"op":"preview","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Updated"}}`)
+	defer delete(p2)
+	testing.expect_value(t, app2, false)
+	testing.expect_value(t, p2, `{"ok":true,"id":1,"edit":"rename","revision":0,"argument":{"kind":"text","text":"Updated"}}`)
+	testing.expect_value(t, doc.text, "Report")
+	testing.expect_value(t, doc.rev, dagda.Revision(0))
+	testing.expect_value(t, doc.undo_depth, 0)
+
+	c2, appc2 := dispatch_edits(frame, nil, nil, with_val, `{"op":"commit","id":1,"edit":"rename","base_revision":0,"argument":{"kind":"text","text":"Updated"}}`)
+	defer delete(c2)
+	testing.expect_value(t, appc2, true)
+	testing.expect_value(t, c2, `{"ok":true,"id":1,"edit":"rename","revision":1}`)
+	testing.expect_value(t, doc.text, "Updated")
+	testing.expect_value(t, doc.rev, dagda.Revision(1))
+	testing.expect_value(t, doc.undo_depth, 1)
+
+	// 6. Change after preview causes commit to revalidate and report current refusal (at same revision)
+	//    or Stale_Revision (when revision advanced).
+	p3, _ := dispatch_edits(frame, nil, nil, with_val, `{"op":"preview","id":1,"edit":"rename","base_revision":1,"argument":{"kind":"text","text":"Target"}}`)
+	defer delete(p3)
+	testing.expect_value(t, p3, `{"ok":true,"id":1,"edit":"rename","revision":1,"argument":{"kind":"text","text":"Target"}}`)
+	// Simulate concurrent state change matching "Target" at same revision: validator now refuses.
+	delete(doc.text)
+	doc.text = strings.clone("Target")
+	c3, appc3 := dispatch_edits(frame, nil, nil, with_val, `{"op":"commit","id":1,"edit":"rename","base_revision":1,"argument":{"kind":"text","text":"Target"}}`)
+	defer delete(c3)
+	testing.expect_value(t, appc3, false)
+	testing.expect_value(t, c3, `{"ok":false,"error":"Not_Handled"}`)
+	// Simulate revision bump: commit reports Stale_Revision with current revision.
+	doc.rev = 2
+	c4, appc4 := dispatch_edits(frame, nil, nil, with_val, `{"op":"commit","id":1,"edit":"rename","base_revision":1,"argument":{"kind":"text","text":"Another"}}`)
+	defer delete(c4)
+	testing.expect_value(t, appc4, false)
+	testing.expect_value(t, c4, `{"ok":false,"error":"Stale_Revision","revision":2}`)
+}
