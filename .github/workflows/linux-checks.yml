@@ -214,9 +214,9 @@ jobs:
       - name: Install the pinned Odin compiler
         shell: pwsh
         run: |
-          pwsh -File scripts/setup-odin.ps1
-          pwsh -File scripts/odin.ps1 version
+          & ./scripts/setup-odin.ps1
+          & ./scripts/odin.ps1 version
 
       - name: Run the Dagda core unit suite
         shell: pwsh
-        run: pwsh -File scripts/odin.ps1 test dagda -collection:dagda=.
+        run: '& ./scripts/odin.ps1 test dagda "-collection:dagda=."'
