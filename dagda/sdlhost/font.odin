@@ -8,9 +8,20 @@ import "core:strings"
 import "core:unicode/utf8"
 import sdl "vendor:sdl3"
 
-foreign import freetype "system:freetype"
+when ODIN_OS == .Windows {
+	foreign import freetype "system:freetype.lib"
+} else {
+	foreign import freetype "system:freetype"
+}
 
 FT_Error :: c.int
+FT_Long :: c.long
+FT_Pos :: c.long
+FT_Fixed :: c.long
+FT_Int :: c.int
+FT_UInt :: c.uint
+FT_Short :: i16
+FT_UShort :: u16
 FT_Library :: distinct rawptr
 FT_Face :: ^FT_FaceRec
 
@@ -26,69 +37,166 @@ FT_PIXEL_MODE_LCD_V :: u8(6)
 FT_PIXEL_MODE_BGRA  :: u8(7)
 
 FT_Vector :: struct {
-	x: c.long,
-	y: c.long,
+	x: FT_Pos,
+	y: FT_Pos,
+}
+
+FT_BBox :: struct {
+	xMin: FT_Pos,
+	yMin: FT_Pos,
+	xMax: FT_Pos,
+	yMax: FT_Pos,
+}
+
+FT_Generic :: struct {
+	data:      rawptr,
+	finalizer: rawptr,
+}
+
+FT_ListRec :: struct {
+	head: rawptr,
+	tail: rawptr,
 }
 
 FT_Bitmap :: struct {
-	rows:         u32,
-	width:        u32,
-	pitch:        i32,
-	_pad0:        u32,
+	rows:         FT_UInt,
+	width:        FT_UInt,
+	pitch:        FT_Int,
 	buffer:       [^]u8,
 	num_grays:    u16,
 	pixel_mode:   u8,
 	palette_mode: u8,
-	_pad1:        u32,
 	palette:      rawptr,
 }
 
+FT_Outline :: struct {
+	n_contours: u16,
+	n_points:   u16,
+	points:     rawptr,
+	tags:       rawptr,
+	contours:   rawptr,
+	flags:      FT_Int,
+}
+
+FT_Glyph_Metrics :: struct {
+	width:        FT_Pos,
+	height:       FT_Pos,
+	horiBearingX: FT_Pos,
+	horiBearingY: FT_Pos,
+	horiAdvance:  FT_Pos,
+	vertBearingX: FT_Pos,
+	vertBearingY: FT_Pos,
+	vertAdvance:  FT_Pos,
+}
+
 FT_Size_Metrics :: struct {
-	_pad:        [24]u8,
-	ascender:    c.long,
-	descender:   c.long,
-	height:      c.long,
-	max_advance: c.long,
+	x_ppem:      FT_UShort,
+	y_ppem:      FT_UShort,
+	x_scale:     FT_Fixed,
+	y_scale:     FT_Fixed,
+	ascender:    FT_Pos,
+	descender:   FT_Pos,
+	height:      FT_Pos,
+	max_advance: FT_Pos,
 }
 
 FT_SizeRec :: struct {
-	_pad:    [24]u8,
-	metrics: FT_Size_Metrics,
-	_tail:   [8]u8,
+	face:     FT_Face,
+	generic:  FT_Generic,
+	metrics:  FT_Size_Metrics,
+	internal: rawptr,
 }
 
 FT_GlyphSlotRec :: struct {
-	_pad0:       [128]u8,
-	advance:     FT_Vector,
-	_pad1:       [8]u8,
-	bitmap:      FT_Bitmap,
-	bitmap_left: c.int,
-	bitmap_top:  c.int,
-	_tail:       [104]u8,
+	library:           FT_Library,
+	face:              FT_Face,
+	next:              ^FT_GlyphSlotRec,
+	glyph_index:       FT_UInt,
+	generic:           FT_Generic,
+	metrics:           FT_Glyph_Metrics,
+	linearHoriAdvance: FT_Fixed,
+	linearVertAdvance: FT_Fixed,
+	advance:           FT_Vector,
+	format:            u32,
+	bitmap:            FT_Bitmap,
+	bitmap_left:       FT_Int,
+	bitmap_top:        FT_Int,
+	outline:           FT_Outline,
+	num_subglyphs:     FT_UInt,
+	subglyphs:         rawptr,
+	control_data:      rawptr,
+	control_len:       FT_Long,
+	lsb_delta:         FT_Pos,
+	rsb_delta:         FT_Pos,
+	other:             rawptr,
+	internal:          rawptr,
 }
 
 FT_FaceRec :: struct {
-	_pad0: [152]u8,
-	glyph: ^FT_GlyphSlotRec,
-	size:  ^FT_SizeRec,
-	_tail: [80]u8,
+	num_faces:           FT_Long,
+	face_index:          FT_Long,
+	face_flags:          FT_Long,
+	style_flags:         FT_Long,
+	num_glyphs:          FT_Long,
+	family_name:         cstring,
+	style_name:          cstring,
+	num_fixed_sizes:     FT_Int,
+	available_sizes:     rawptr,
+	num_charmaps:        FT_Int,
+	charmaps:            rawptr,
+	generic:             FT_Generic,
+	bbox:                FT_BBox,
+	units_per_EM:        FT_UShort,
+	ascender:            FT_Short,
+	descender:           FT_Short,
+	height:              FT_Short,
+	max_advance_width:   FT_Short,
+	max_advance_height:  FT_Short,
+	underline_position:  FT_Short,
+	underline_thickness: FT_Short,
+	glyph:               ^FT_GlyphSlotRec,
+	size:                ^FT_SizeRec,
+	charmap:             rawptr,
+	driver:              rawptr,
+	memory:              rawptr,
+	stream:              rawptr,
+	sizes_list:          FT_ListRec,
+	autohint:            FT_Generic,
+	extensions:          rawptr,
+	internal:            rawptr,
 }
 
 #assert(size_of(FT_Bitmap) == 40)
 #assert(offset_of(FT_Bitmap, buffer) == 16)
 #assert(offset_of(FT_Bitmap, pixel_mode) == 26)
-#assert(size_of(FT_Size_Metrics) == 56)
-#assert(offset_of(FT_Size_Metrics, ascender) == 24)
-#assert(size_of(FT_SizeRec) == 88)
 #assert(offset_of(FT_SizeRec, metrics) == 24)
-#assert(size_of(FT_GlyphSlotRec) == 304)
-#assert(offset_of(FT_GlyphSlotRec, advance) == 128)
-#assert(offset_of(FT_GlyphSlotRec, bitmap) == 152)
-#assert(offset_of(FT_GlyphSlotRec, bitmap_left) == 192)
-#assert(offset_of(FT_GlyphSlotRec, bitmap_top) == 196)
-#assert(size_of(FT_FaceRec) == 248)
-#assert(offset_of(FT_FaceRec, glyph) == 152)
-#assert(offset_of(FT_FaceRec, size) == 160)
+when ODIN_OS == .Windows {
+	// Windows x64 (LLP64): c.long / FT_Long / FT_Pos is 4 bytes.
+	#assert(size_of(FT_Size_Metrics) == 28)
+	#assert(offset_of(FT_Size_Metrics, ascender) == 12)
+	#assert(size_of(FT_SizeRec) == 64)
+	#assert(size_of(FT_GlyphSlotRec) == 248)
+	#assert(offset_of(FT_GlyphSlotRec, advance) == 88)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap) == 104)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap_left) == 144)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap_top) == 148)
+	#assert(size_of(FT_FaceRec) == 216)
+	#assert(offset_of(FT_FaceRec, glyph) == 120)
+	#assert(offset_of(FT_FaceRec, size) == 128)
+} else {
+	// Linux / macOS 64-bit (LP64): c.long / FT_Long / FT_Pos is 8 bytes.
+	#assert(size_of(FT_Size_Metrics) == 56)
+	#assert(offset_of(FT_Size_Metrics, ascender) == 24)
+	#assert(size_of(FT_SizeRec) == 88)
+	#assert(size_of(FT_GlyphSlotRec) == 304)
+	#assert(offset_of(FT_GlyphSlotRec, advance) == 128)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap) == 152)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap_left) == 192)
+	#assert(offset_of(FT_GlyphSlotRec, bitmap_top) == 196)
+	#assert(size_of(FT_FaceRec) == 248)
+	#assert(offset_of(FT_FaceRec, glyph) == 152)
+	#assert(offset_of(FT_FaceRec, size) == 160)
+}
 
 @(default_calling_convention = "c")
 foreign freetype {
@@ -144,6 +252,8 @@ DEFAULT_FONT_PATHS :: [?]string{
 	"/System/Library/Fonts/Supplemental/Arial.ttf",
 	"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 	"/Library/Fonts/LiberationSans-Regular.ttf",
+	"C:/Windows/Fonts/arial.ttf",
+	"C:/Windows/Fonts/segoeui.ttf",
 }
 
 DEFAULT_FALLBACK_FONT_PATHS :: [?]string{
@@ -161,6 +271,7 @@ DEFAULT_FALLBACK_FONT_PATHS :: [?]string{
 	"/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 	"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 	"/System/Library/Fonts/Hiragino Sans GB.ttc",
+	"C:/Windows/Fonts/malgun.ttf",
 }
 
 font_init :: proc(font: ^Font) -> bool {

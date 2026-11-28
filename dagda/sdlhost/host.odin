@@ -6,7 +6,6 @@ import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import "core:sys/posix"
 import "dagda:dagda"
 import "dagda:dagda/driver"
 import sdl "vendor:sdl3"
@@ -320,10 +319,6 @@ parse_cli_args :: proc(args: []string) -> (opts: Run_Options, ok: bool) {
 }
 
 signal_stopped: bool
-
-on_signal :: proc "c" (_: posix.Signal) {
-	signal_stopped = true
-}
 
 Host :: struct {
 	app:           App,
@@ -937,16 +932,12 @@ poll_control_stdin :: proc(
 	running: ^bool,
 	exit_code: ^int,
 ) {
-	pfd := posix.pollfd{fd = posix.STDIN_FILENO, events = {.IN}}
-	if posix.poll(&pfd, 1, 0) <= 0 || .IN not_in pfd.revents {
-		return
-	}
 	tmp: [1024]u8
-	n := posix.read(posix.STDIN_FILENO, raw_data(tmp[:]), c.size_t(len(tmp)))
+	n := platform_read_stdin_nonblocking(tmp[:])
 	if n <= 0 {
 		return
 	}
-	append(in_buf, ..tmp[:int(n)])
+	append(in_buf, ..tmp[:n])
 
 	for {
 		nl := -1
@@ -1634,13 +1625,7 @@ host_dispatch_mouse_event :: proc(h: ^Host, ev: ^sdl.Event) -> bool {
 
 run :: proc(app: App, opts: Run_Options = {}) -> int {
 	signal_stopped = false
-	act: posix.sigaction_t
-	act.sa_handler = on_signal
-	posix.sigaction(.SIGINT, &act, nil)
-	posix.sigaction(.SIGTERM, &act, nil)
-	ignore: posix.sigaction_t
-	ignore.sa_handler = transmute(proc "c" (posix.Signal))posix.SIG_IGN
-	posix.sigaction(.SIGPIPE, &ignore, nil)
+	platform_install_signals()
 
 	h: Host
 	h.app = app
