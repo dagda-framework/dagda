@@ -8,15 +8,30 @@ same action handler.
 
 ## Prerequisites
 
-Linux x86-64, plus:
+Linux x86-64 or macOS on Apple Silicon (arm64), plus:
 
-- The tools Dagda's pinned Odin installer needs: Python 3, curl,
-  tar, and sha256sum.
+- The tools Dagda's pinned Odin installer needs: Python 3,
+  curl, and tar. The installer verifies the pinned archive
+  with Python's hashlib, so no GNU checksum tool is needed
+  on either platform.
 - SDL3, FreeType, and a sans-serif TrueType font:
   - Debian / Ubuntu: `sudo apt-get install -y libsdl3-dev libfreetype-dev fonts-liberation`
   - Arch Linux: `pacman -S sdl3 freetype2 ttf-liberation`
   - Fedora: `dnf install SDL3-devel freetype-devel liberation-sans-fonts`
-- A Dagda checkout. Below, `$DAGDA` is its path:
+  - macOS (Apple Silicon): `brew install sdl3 freetype` — the
+    same setup the macOS CI job uses. No font package is
+    needed; the host finds a system font. Python 3, curl, and
+    tar come with the Xcode Command Line Tools
+    (`xcode-select --install`) or Homebrew.
+On macOS, that dependency step is this runnable command:
+
+```sh
+brew install sdl3 freetype
+```
+
+- A Dagda checkout. Below, `$DAGDA` is its path. The pinned
+  installer picks the macOS ARM64 compiler automatically on
+  an Apple Silicon machine:
 
 ```sh
 git clone https://github.com/dagda-framework/dagda.git

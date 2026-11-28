@@ -13,6 +13,18 @@ Today, on Linux, one SDL3 window shows an editable slide title backed by a share
 
 ## Quick start
 
+### macOS (Apple Silicon)
+
+Install SDL3 and FreeType — the setup the macOS CI job uses (Python 3, curl, and tar come with the Xcode Command Line Tools or Homebrew, and the host finds a system font, so no font package is needed):
+
+```sh
+brew install sdl3 freetype
+```
+
+Then follow [Build your first native Dagda app](docs/first-app.md) for the Dagda checkout, pinned Odin setup, build, and two-terminal counter walkthrough.
+
+### Linux
+
 From a clean checkout on Linux x86-64 you need the tools the pinned Odin installer uses (Python 3, curl, tar, sha256sum) plus SDL3, FreeType, and a sans-serif TrueType font:
 
 ```sh
