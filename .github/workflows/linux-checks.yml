@@ -197,3 +197,26 @@ jobs:
 
       - name: Run the Cocoa caret probe with native macOS CGEvent pointer clicks
         run: python3 examples/shared-text/tests/cocoa_caret_probe.py --require-driver cocoa --input-mode native
+
+  windows-x64-checks:
+    name: Windows x64 core
+    runs-on: windows-2025
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Log runner architecture and system
+        shell: pwsh
+        run: |
+          Write-Host "arch: $env:PROCESSOR_ARCHITECTURE"
+          [System.Environment]::OSVersion | Format-List
+
+      - name: Install the pinned Odin compiler
+        shell: pwsh
+        run: |
+          pwsh -File scripts/setup-odin.ps1
+          pwsh -File scripts/odin.ps1 version
+
+      - name: Run the Dagda core unit suite
+        shell: pwsh
+        run: pwsh -File scripts/odin.ps1 test dagda -collection:dagda=.
