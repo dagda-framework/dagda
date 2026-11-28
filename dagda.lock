@@ -21,6 +21,13 @@
       "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-macos-arm64-dev-2026-11a.tar.gz",
       "sha256": "fa10eee280c8786758e3ff0b8fdd9355e1c9447b1f0b8c72764e25ee4ebc3e22",
       "compiler_version": "dev-2026-11-nightly:9a69916"
+    },
+    "windows-amd64": {
+      "version": "dev-2026-11a",
+      "platform": "windows-amd64",
+      "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-windows-amd64-dev-2026-11a.zip",
+      "sha256": "259effedf2997293c8fa4a5e497496f8ebce9f826652d9dd353a9dd2113c31fd",
+      "compiler_version": "dev-2026-11-nightly:9a69916"
     }
   }
 }
