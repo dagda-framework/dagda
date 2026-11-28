@@ -31,23 +31,28 @@ EXE = ".exe" if os.name == "nt" else ""
 
 
 def read_line(proc, stage, timeout=10.0):
-    fd = proc.stdout.fileno()
-    buf = bytearray()
-    deadline = time.monotonic() + timeout
-    while True:
-        nl = buf.find(b"\n")
-        if nl >= 0:
-            return bytes(buf[:nl]).decode().rstrip("\r")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"timed out waiting for {stage}; partial={bytes(buf)!r}")
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
-            continue
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            raise AssertionError(f"host closed stdout during {stage}")
-        buf.extend(chunk)
+    # A thread does the blocking read: select() on a pipe is
+    # not available on Windows.
+    import threading
+    box = {}
+
+    def _read():
+        try:
+            box["line"] = proc.stdout.readline()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    worker = threading.Thread(target=_read, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"timed out waiting for {stage}")
+    if "error" in box:
+        raise AssertionError(f"host stdout failed during {stage}: {box['error']!r}")
+    line = box.get("line") or b""
+    if not line:
+        raise AssertionError(f"host closed stdout during {stage}")
+    return line.decode().rstrip("\r\n")
 
 
 def stop(proc):
