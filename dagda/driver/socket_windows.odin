@@ -2,8 +2,6 @@
 package driver
 
 import "core:c"
-import "core:fmt"
-import "core:os"
 import win "core:sys/windows"
 
 // Winsock AF_UNIX transport: same --socket path interface
@@ -128,27 +126,11 @@ Endpoint_Identity :: struct {
 }
 
 endpoint_identity :: proc(path: string) -> Endpoint_Identity {
-	wpath := win.utf8_to_wstring(path)
-	if wpath == nil {
-		return {}
-	}
-	defer delete(wpath)
-	handle := win.CreateFileW(wpath, win.FILE_READ_ATTRIBUTES,
-		win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE,
-		nil, win.OPEN_EXISTING, 0, nil)
-	if handle == win.INVALID_HANDLE {
-		return {}
-	}
-	defer win.CloseHandle(handle)
-	info: win.BY_HANDLE_FILE_INFORMATION
-	if !win.GetFileInformationByHandle(handle, &info) {
-		return {}
-	}
-	return {
-		volume = u64(info.dwVolumeSerialNumber),
-		index  = (u64(info.nFileIndexHigh) << 32) | u64(info.nFileIndexLow),
-		valid  = true,
-	}
+	// AF_UNIX socket files on Windows are reparse points
+	// that do not reliably open as files, so the prototype
+	// does not read a file identity here. remove_unix_owned
+	// documents the fallback this selects.
+	return {}
 }
 
 remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
@@ -171,28 +153,22 @@ remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
 }
 
 listen_unix :: proc(path: string) -> (Socket_Handle, Endpoint_Identity, bool) {
-	fmt.eprintln("win-listen: ensure"); _ = os.flush(os.stderr)
 	if !winsock_ensure() {
 		return INVALID_SOCKET_HANDLE, {}, false
 	}
-	fmt.eprintln("win-listen: addr"); _ = os.flush(os.stderr)
 	addr, ok := make_addr_un(path)
 	if !ok {
 		return INVALID_SOCKET_HANDLE, {}, false
 	}
-	fmt.eprintln("win-listen: socket"); _ = os.flush(os.stderr)
 	fd := win.socket(AF_UNIX, SOCK_STREAM, 0)
 	if fd == INVALID_SOCKET_HANDLE {
 		return INVALID_SOCKET_HANDLE, {}, false
 	}
-	fmt.eprintln("win-listen: bind"); _ = os.flush(os.stderr)
 	if win.bind(fd, (^win.SOCKADDR_STORAGE_LH)(&addr), c.int(size_of(addr))) == win.SOCKET_ERROR {
 		_ = win.closesocket(fd)
 		return INVALID_SOCKET_HANDLE, {}, false
 	}
-	fmt.eprintln("win-listen: identity"); _ = os.flush(os.stderr)
 	identity := endpoint_identity(path)
-	fmt.eprintln("win-listen: listen"); _ = os.flush(os.stderr)
 	if win.listen(fd, 16) == win.SOCKET_ERROR {
 		_ = win.closesocket(fd)
 		remove_unix_owned(path, identity)
@@ -205,12 +181,10 @@ connect_unix :: proc(path: string) -> (Socket_Handle, bool) {
 	if !winsock_ensure() {
 		return INVALID_SOCKET_HANDLE, false
 	}
-	fmt.eprintln("win-listen: addr"); _ = os.flush(os.stderr)
 	addr, ok := make_addr_un(path)
 	if !ok {
 		return INVALID_SOCKET_HANDLE, false
 	}
-	fmt.eprintln("win-listen: socket"); _ = os.flush(os.stderr)
 	fd := win.socket(AF_UNIX, SOCK_STREAM, 0)
 	if fd == INVALID_SOCKET_HANDLE {
 		return INVALID_SOCKET_HANDLE, false
