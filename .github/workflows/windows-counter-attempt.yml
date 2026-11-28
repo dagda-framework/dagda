@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Log architecture
-        run: echo "arch: $env:PROCESSOR_ARCHITECTURE"
+        run: 'echo "arch: $env:PROCESSOR_ARCHITECTURE"'
       - name: Install pinned Odin (Windows)
         shell: pwsh
         run: |
