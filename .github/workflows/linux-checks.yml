@@ -220,3 +220,10 @@ jobs:
       - name: Run the Dagda core unit suite
         shell: pwsh
         run: '& ./scripts/odin.ps1 test dagda "-collection:dagda=."'
+
+      - name: Test Windows local driver transport
+        shell: pwsh
+        run: |
+          $pin = (Get-Content -Raw dagda.lock | ConvertFrom-Json).platforms.'windows-amd64'
+          $env:ODIN = (Resolve-Path ".tools/odin-$($pin.version)/odin.exe").Path
+          python dagda/driver/tests/windows_transport_test.py

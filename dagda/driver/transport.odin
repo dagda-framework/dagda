@@ -1,116 +1,31 @@
 package driver
 
-import "core:c"
 import "core:strings"
-import "core:sys/posix"
 
-make_addr :: proc(path: string) -> (posix.sockaddr_un, bool) {
-	addr: posix.sockaddr_un
-	if len(path) == 0 || len(path) >= len(addr.sun_path) {
-		return addr, false
-	}
-	addr.sun_family = posix.sa_family_t(posix.AF_UNIX)
-	for i in 0 ..< len(path) {
-		addr.sun_path[i] = c.char(path[i])
-	}
-	return addr, true
-}
+// Shared stream helpers for the local socket transport. The
+// socket itself is platform-specific: POSIX in
+// socket_posix.odin, Winsock AF_UNIX in socket_windows.odin.
+// Socket_Handle, INVALID_SOCKET_HANDLE, listen_unix,
+// connect_unix, close_socket, Endpoint_Identity, and
+// endpoint_identity are defined there with identical
+// signatures so the wire protocol and call sites do not
+// change between platforms.
 
-path_cstring :: proc(path: string, buf: ^[128]u8) -> cstring {
-	buf^ = {}
-	if len(path) >= len(buf) {
-		return nil
-	}
-	copy(buf[:], path)
-	return cstring(raw_data(buf[:]))
-}
-
-Endpoint_Identity :: struct {
-	dev:   posix.dev_t,
-	ino:   posix.ino_t,
-	valid: bool,
-}
-
-endpoint_identity :: proc(path: string) -> Endpoint_Identity {
-	buf: [128]u8
-	cpath := path_cstring(path, &buf)
-	if cpath == nil {
-		return {}
-	}
-	st: posix.stat_t
-	if posix.lstat(cpath, &st) != .OK {
-		return {}
-	}
-	return {dev = st.st_dev, ino = st.st_ino, valid = true}
-}
-
-remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
-	if !identity.valid {
-		return
-	}
-	current := endpoint_identity(path)
-	if !current.valid || current.dev != identity.dev || current.ino != identity.ino {
-		return
-	}
-	buf: [128]u8
-	if cpath := path_cstring(path, &buf); cpath != nil {
-		posix.unlink(cpath)
-	}
-}
-
-listen_unix :: proc(path: string) -> (posix.FD, Endpoint_Identity, bool) {
-	addr, ok := make_addr(path)
-	if !ok {
-		return -1, {}, false
-	}
-	fd := posix.socket(.UNIX, .STREAM)
-	if fd < 0 {
-		return -1, {}, false
-	}
-	if posix.bind(fd, (^posix.sockaddr)(&addr), posix.socklen_t(size_of(addr))) != .OK {
-		posix.close(fd)
-		return -1, {}, false
-	}
-	identity := endpoint_identity(path)
-	if posix.listen(fd, 16) != .OK {
-		posix.close(fd)
-		remove_unix_owned(path, identity)
-		return -1, {}, false
-	}
-	return fd, identity, true
-}
-
-connect_unix :: proc(path: string) -> (posix.FD, bool) {
-	addr, ok := make_addr(path)
-	if !ok {
-		return -1, false
-	}
-	fd := posix.socket(.UNIX, .STREAM)
-	if fd < 0 {
-		return -1, false
-	}
-	if posix.connect(fd, (^posix.sockaddr)(&addr), posix.socklen_t(size_of(addr))) != .OK {
-		posix.close(fd)
-		return -1, false
-	}
-	return fd, true
-}
-
-write_all :: proc(fd: posix.FD, data: string) -> bool {
+write_all :: proc(fd: Socket_Handle, data: string) -> bool {
 	sent := 0
 	for sent < len(data) {
 		remaining := len(data) - sent
-		n := posix.send(fd, rawptr(raw_data(data[sent:])), c.size_t(remaining), {.NOSIGNAL})
+		n, _ := socket_send(fd, raw_data(data[sent:]), remaining)
 		if n <= 0 {
 			return false
 		}
-		sent += int(n)
+		sent += n
 	}
 	return true
 }
 
 Line_Reader :: struct {
-	fd:    posix.FD,
+	fd:    Socket_Handle,
 	buf:   [4096]u8,
 	start: int,
 	end:   int,
@@ -136,12 +51,12 @@ read_line :: proc(r: ^Line_Reader) -> (line: string, ok: bool) {
 			}
 			r.start = r.end
 		}
-		n := posix.recv(r.fd, rawptr(&r.buf), c.size_t(len(r.buf)), {})
+		n, _ := socket_recv(r.fd, raw_data(r.buf[:]), len(r.buf))
 		if n <= 0 {
 			strings.builder_destroy(&b)
 			return "", false
 		}
 		r.start = 0
-		r.end = int(n)
+		r.end = n
 	}
 }
