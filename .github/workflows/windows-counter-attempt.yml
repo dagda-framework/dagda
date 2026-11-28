@@ -1,0 +1,38 @@
+name: Windows counter attempt (temporary)
+
+on:
+  push:
+    branches: [test/counter-windows-acceptance]
+
+jobs:
+  windows-counter:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log architecture
+        run: echo "arch: $env:PROCESSOR_ARCHITECTURE"
+      - name: Install pinned Odin (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-windows-amd64-dev-2026-11a.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\odin.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\odin.zip" -DestinationPath "$env:RUNNER_TEMP\odin" -Force
+          $odin = Get-ChildItem -Path "$env:RUNNER_TEMP\odin" -Filter odin.exe -Recurse | Select-Object -First 1
+          if (-not $odin) { throw "odin.exe not found" }
+          "ODIN=$($odin.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $odin.FullName version
+      - name: Install SDL3 and FreeType (vcpkg)
+        shell: pwsh
+        run: |
+          & C:\vcpkg\vcpkg.exe install sdl3:x64-windows freetype:x64-windows
+      - name: Run the counter acceptance test
+        shell: cmd
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set "LIB=C:\vcpkg\installed\x64-windows\lib;%LIB%"
+          set "INCLUDE=C:\vcpkg\installed\x64-windows\include;%INCLUDE%"
+          set "PATH=C:\vcpkg\installed\x64-windows\bin;%PATH%"
+          python examples\counter\tests\acceptance_test.py build\counter-capture-win
