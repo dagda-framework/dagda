@@ -23,5 +23,11 @@ jobs:
           if (-not $odin) { throw "odin.exe not found in the release archive" }
           "ODIN=$($odin.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           & $odin.FullName version
+      - name: Run the transport smoke
+        shell: pwsh
+        run: |
+          & $env:ODIN build dagda/driver/tests/windows_smoke -collection:dagda=. -out:"$env:RUNNER_TEMP\windows-smoke.exe"
+          & "$env:RUNNER_TEMP\windows-smoke.exe" "$env:RUNNER_TEMP\smoke.sock"
+          echo "smoke exit: $LASTEXITCODE"
       - name: Run the Windows transport proof
         run: python dagda/driver/tests/windows_transport_test.py
