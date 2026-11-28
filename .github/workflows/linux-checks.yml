@@ -244,20 +244,22 @@ jobs:
       - name: Verify FreeType struct layout against Windows headers
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          python -c "open('ft_check.c','w').write('#include <stddef.h>\n#include <stdio.h>\n#include <ft2build.h>\n#include FT_FREETYPE_H\nint main(void){\n#define CHK(e) if(!(e)){fprintf(stderr,\"FAIL: %s\\n\",#e);return 1;}\nCHK(sizeof(FT_Bitmap)==40);\nCHK(offsetof(FT_Bitmap,buffer)==16);\nCHK(offsetof(FT_Bitmap,pixel_mode)==26);\nCHK(sizeof(FT_Size_Metrics)==28);\nCHK(offsetof(FT_Size_Metrics,ascender)==12);\nCHK(sizeof(FT_SizeRec)==64);\nCHK(offsetof(FT_SizeRec,metrics)==24);\nCHK(sizeof(FT_GlyphSlotRec)==248);\nCHK(offsetof(FT_GlyphSlotRec,advance)==88);\nCHK(offsetof(FT_GlyphSlotRec,bitmap)==104);\nCHK(offsetof(FT_GlyphSlotRec,bitmap_left)==144);\nCHK(offsetof(FT_GlyphSlotRec,bitmap_top)==148);\nCHK(sizeof(FT_FaceRec)==216);\nCHK(offsetof(FT_FaceRec,glyph)==120);\nCHK(offsetof(FT_FaceRec,size)==128);\nprintf(\"Windows FreeType layout verified\\n\");return 0;}\n')"
-          cl /nologo /I"C:\vcpkg\installed\x64-windows\include" ft_check.c /Fe:ft_check.exe
-          ft_check.exe
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo Visual Studio not found & exit /b 1)
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          python -c "open('ft_check.c','w').write('#include <stddef.h>\n#include <stdio.h>\n#include <ft2build.h>\n#include FT_FREETYPE_H\nint main(void){\n#define CHK(e) if(!(e)){fprintf(stderr,\"FAIL: %s\\n\",#e);return 1;}\nCHK(sizeof(FT_Bitmap)==40);\nCHK(offsetof(FT_Bitmap,buffer)==16);\nCHK(offsetof(FT_Bitmap,pixel_mode)==26);\nCHK(sizeof(FT_Size_Metrics)==28);\nCHK(offsetof(FT_Size_Metrics,ascender)==12);\nCHK(sizeof(FT_SizeRec)==64);\nCHK(offsetof(FT_SizeRec,metrics)==24);\nCHK(sizeof(FT_GlyphSlotRec)==248);\nCHK(offsetof(FT_GlyphSlotRec,advance)==88);\nCHK(offsetof(FT_GlyphSlotRec,bitmap)==104);\nCHK(offsetof(FT_GlyphSlotRec,bitmap_left)==144);\nCHK(offsetof(FT_GlyphSlotRec,bitmap_top)==148);\nCHK(sizeof(FT_FaceRec)==216);\nCHK(offsetof(FT_FaceRec,glyph)==120);\nCHK(offsetof(FT_FaceRec,size)==128);\nprintf(\"Windows FreeType layout verified\\n\");return 0;}\n')" || exit /b 1
+          cl /nologo /I"C:\vcpkg\installed\x64-windows\include" ft_check.c /Fe:ft_check.exe || exit /b 1
+          ft_check.exe || exit /b 1
           del ft_check.c ft_check.obj ft_check.exe
 
       - name: Run the native counter acceptance test on Windows
-        shell: cmd
+        shell: pwsh
         env:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          set "ODIN=%CD%\.tools\odin-dev-2026-11a\odin.exe"
-          set "LIB=C:\vcpkg\installed\x64-windows\lib;%LIB%"
-          set "PATH=C:\vcpkg\installed\x64-windows\bin;%PATH%"
-          python examples\counter\tests\acceptance_test.py build\counter-capture-win
+          $pin = (Get-Content -Raw dagda.lock | ConvertFrom-Json).platforms.'windows-amd64'
+          $env:ODIN = (Resolve-Path ".tools/odin-$($pin.version)/odin.exe").Path
+          $env:LIB = "C:\vcpkg\installed\x64-windows\lib;$env:LIB"
+          $env:PATH = "C:\vcpkg\installed\x64-windows\bin;$env:PATH"
+          python examples/counter/tests/acceptance_test.py build/counter-capture-win
