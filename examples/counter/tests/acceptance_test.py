@@ -11,55 +11,74 @@ Space -> 3), and retains real-window PNG captures.
 
 import json
 import os
-import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-ODIN = ROOT / "scripts" / "odin.sh"
+# The pinned compiler: scripts/odin.sh on Linux/macOS, or an explicit odin executable (odin.exe) via ODIN on Windows.
+ODIN = os.environ.get("ODIN") or str(ROOT / "scripts" / "odin.sh")
+EXE = ".exe" if os.name == "nt" else ""
 
 
 class DeadlineLineReader:
-    """Reads complete newline-terminated UTF-8 lines from a raw pipe fd with a hard deadline."""
+    """Reads complete newline-terminated UTF-8 lines from a pipe with a hard deadline.
+
+    A daemon thread does the blocking reads (select() on a pipe
+    is unavailable on Windows) and hands chunks over under a
+    condition; read_line only waits, with its deadline, for a
+    full line to arrive.
+    """
 
     def __init__(self, stream) -> None:
         self.fd = stream.fileno()
         self.buf = bytearray()
+        self.eof = False
+        self.cond = threading.Condition()
+        self.worker = threading.Thread(target=self._pump, daemon=True)
+        self.worker.start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                chunk = os.read(self.fd, 4096)
+                with self.cond:
+                    if not chunk:
+                        self.eof = True
+                        self.cond.notify_all()
+                        return
+                    self.buf.extend(chunk)
+                    self.cond.notify_all()
+        except OSError:
+            with self.cond:
+                self.eof = True
+                self.cond.notify_all()
 
     def read_line(self, stage: str, timeout: float = 5.0) -> str:
         deadline = time.monotonic() + timeout
-        while True:
-            nl = self.buf.find(b"\n")
-            if nl >= 0:
-                raw = bytes(self.buf[:nl])
-                del self.buf[: nl + 1]
-                return raw.decode("utf-8", errors="replace").rstrip("\r")
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                partial = bytes(self.buf).decode("utf-8", errors="replace")
-                raise TimeoutError(
-                    f"timed out after {timeout:.2f}s waiting for complete line during {stage} (partial={partial!r})"
-                )
-
-            ready, _, _ = select.select([self.fd], [], [], remaining)
-            if not ready:
-                partial = bytes(self.buf).decode("utf-8", errors="replace")
-                raise TimeoutError(
-                    f"timed out after {timeout:.2f}s waiting for complete line during {stage} (partial={partial!r})"
-                )
-
-            chunk = os.read(self.fd, 4096)
-            if not chunk:
-                partial = bytes(self.buf).decode("utf-8", errors="replace")
-                raise AssertionError(
-                    f"unexpected EOF waiting for complete line during {stage} (partial={partial!r})"
-                )
-            self.buf.extend(chunk)
+        with self.cond:
+            while True:
+                nl = self.buf.find(b"\n")
+                if nl >= 0:
+                    raw = bytes(self.buf[:nl])
+                    del self.buf[: nl + 1]
+                    return raw.decode("utf-8", errors="replace").rstrip("\r")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    partial = bytes(self.buf).decode("utf-8", errors="replace")
+                    raise TimeoutError(
+                        f"timed out after {timeout:.2f}s waiting for complete line during {stage} (partial={partial!r})"
+                    )
+                if self.eof:
+                    partial = bytes(self.buf).decode("utf-8", errors="replace")
+                    raise AssertionError(
+                        f"unexpected EOF waiting for complete line during {stage} (partial={partial!r})"
+                    )
+                self.cond.wait(remaining)
 
 
 def stop_process(proc: subprocess.Popen | None) -> None:
@@ -166,11 +185,11 @@ def main() -> int:
 
     build_dir = ROOT / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
-    counter_bin = build_dir / "counter"
-    client_bin = build_dir / "dagda-client"
+    counter_bin = build_dir / f"counter{EXE}"
+    client_bin = build_dir / f"dagda-client{EXE}"
 
-    subprocess.check_call([str(ODIN), "build", "examples/counter", "-collection:dagda=.", f"-out:{counter_bin}"], cwd=ROOT)
-    subprocess.check_call([str(ODIN), "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
+    subprocess.check_call([ODIN, "build", "examples/counter", "-collection:dagda=.", f"-out:{counter_bin}"], cwd=ROOT)
+    subprocess.check_call([ODIN, "build", "examples/dagda-client", "-collection:dagda=.", f"-out:{client_bin}"], cwd=ROOT)
 
     sock_dir = Path(tempfile.mkdtemp(prefix="dagda-counter."))
     os.chmod(sock_dir, 0o700)
