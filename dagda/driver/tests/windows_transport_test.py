@@ -84,9 +84,14 @@ def start(host_bin, sock, stop_file):
         line = read_line(proc, "startup")
         assert line == f"Listening {sock}", line
         return proc
-    except BaseException:
+    except BaseException as exc:
         stop(proc)
-        raise
+        stderr = ""
+        try:
+            stderr = proc.stderr.read().decode(errors="replace")
+        except Exception:
+            pass
+        raise AssertionError(f"host failed to start: {exc}; exit={proc.poll()} stderr={stderr!r}") from exc
 
 
 def main():
