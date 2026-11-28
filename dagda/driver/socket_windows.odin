@@ -144,11 +144,11 @@ remove_unix_owned :: proc(path: string, identity: Endpoint_Identity) {
 	// not open as files), the listening server still removes
 	// the endpoint it created; this is the prototype's
 	// documented ownership fallback on Windows.
-	wpath := win.utf8_to_wstring(path)
+	wbuf: [512]u16
+	wpath := win.utf8_to_wstring_buf(wbuf[:], path)
 	if wpath == nil {
 		return
 	}
-	defer delete(wpath)
 	_ = win.DeleteFileW(wpath)
 }
 
