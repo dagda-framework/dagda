@@ -8,7 +8,6 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -60,7 +59,7 @@ test_host_exits_nonzero_and_removes_socket_on_duplicate_id_rebuild :: proc(t: ^t
 	}
 	probe_proc :: proc(th: ^thread.Thread) {
 		p := (^Client_Probe)(th.data)
-		fd: posix.FD = -1
+		fd := driver.INVALID_SOCKET_HANDLE
 		for _ in 0 ..< 200 {
 			if cfd, ok := driver.connect_unix(p.sock_path); ok {
 				fd = cfd
@@ -68,10 +67,10 @@ test_host_exits_nonzero_and_removes_socket_on_duplicate_id_rebuild :: proc(t: ^t
 			}
 			time.sleep(10 * time.Millisecond)
 		}
-		if fd < 0 {
+		if fd == driver.INVALID_SOCKET_HANDLE {
 			return
 		}
-		defer posix.close(fd)
+		defer driver.close_socket(fd)
 		p.connected = true
 		_ = driver.write_all(fd, "{\"op\":\"invoke\",\"id\":2,\"action\":\"activate\"}\n{\"op\":\"inspect\"}\n")
 		r := driver.Line_Reader{fd = fd}
@@ -87,7 +86,8 @@ test_host_exits_nonzero_and_removes_socket_on_duplicate_id_rebuild :: proc(t: ^t
 		}
 	}
 
-	sock_dir := fmt.tprintf("/tmp/dagda-sdlhost-dup-%d", posix.getpid())
+	tmp_dir, _ := os.temp_dir(context.temp_allocator)
+	sock_dir := fmt.tprintf("%s/dagda-sdlhost-dup-%d", tmp_dir, os.get_pid())
 	_ = os.make_directory(sock_dir)
 	defer _ = os.remove(sock_dir)
 	sock_path := fmt.tprintf("%s/dup.sock", sock_dir)
@@ -3963,7 +3963,8 @@ test_failed_start_publishes_no_handle :: proc(t: ^testing.T) {
 		user_data = &state, view = failed_view,
 		rebuild_handle = &storage, on_ready = failed_ready,
 	}
-	bad_path := fmt.tprintf("/tmp/dagda-no-such-dir-%d/x.sock", posix.getpid())
+	tmp_dir, _ := os.temp_dir(context.temp_allocator)
+	bad_path := fmt.tprintf("%s/dagda-no-such-dir-%d/x.sock", tmp_dir, os.get_pid())
 	code := run(app, {socket_path = bad_path})
 	testing.expect_value(t, code, 1)
 	testing.expect_value(t, state.ready_calls, 0)
@@ -3974,7 +3975,7 @@ test_failed_start_publishes_no_handle :: proc(t: ^testing.T) {
 	// A second ordinary window in the same process: asking it
 	// to rebuild through the failed window's handle is Stale,
 	// never Posted.
-	sock_dir := fmt.tprintf("/tmp/dagda-sdlhost-restart-%d", posix.getpid())
+	sock_dir := fmt.tprintf("%s/dagda-sdlhost-restart-%d", tmp_dir, os.get_pid())
 	_ = os.make_directory(sock_dir)
 	defer _ = os.remove(sock_dir)
 	state2: Failed_Start_State
