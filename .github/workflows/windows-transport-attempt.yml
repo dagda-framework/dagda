@@ -1,0 +1,27 @@
+name: Windows transport attempt (temporary)
+
+on:
+  push:
+    branches: [feat/windows-af-unix-transport]
+
+jobs:
+  windows-transport:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log architecture
+        run: |
+          echo "arch: $env:PROCESSOR_ARCHITECTURE"
+          [System.Environment]::OSVersion.VersionString
+      - name: Install pinned Odin (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-windows-amd64-dev-2026-11a.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\odin.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\odin.zip" -DestinationPath "$env:RUNNER_TEMP\odin" -Force
+          $odin = Get-ChildItem -Path "$env:RUNNER_TEMP\odin" -Filter odin.exe -Recurse | Select-Object -First 1
+          if (-not $odin) { throw "odin.exe not found in the release archive" }
+          "ODIN=$($odin.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $odin.FullName version
+      - name: Run the Windows transport proof
+        run: python dagda/driver/tests/windows_transport_test.py

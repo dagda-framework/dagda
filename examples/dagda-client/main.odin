@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import "core:sys/posix"
 import "dagda:dagda/driver"
 
 usage :: proc() {
@@ -142,7 +141,7 @@ run_client :: proc() -> int {
 		fmt.eprintf("could not connect to %s\n", path)
 		return 1
 	}
-	defer posix.close(fd)
+	defer driver.close_socket(fd)
 
 	request := strings.to_string(b)
 	if !driver.write_all(fd, request) || !driver.write_all(fd, "\n") {

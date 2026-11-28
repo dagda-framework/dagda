@@ -1,14 +1,12 @@
 package driver
 
-import "core:c"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "dagda:dagda"
 
 Client_Conn :: struct {
-	fd:       posix.FD,
+	fd:       Socket_Handle,
 	in_buf:   [dynamic]u8,
 	out_buf:  [dynamic]u8,
 	out_sent: int,
@@ -16,22 +14,28 @@ Client_Conn :: struct {
 	drop:     bool,
 }
 
+// Poll plumbing shared by server.odin.
+Socket_Poll_Request :: struct {
+	fd:        Socket_Handle,
+	want_read: bool,
+	want_write: bool,
+}
+
+Socket_Poll_Result :: struct {
+	read:  bool,
+	write: bool,
+	err:   bool,
+	hup:   bool,
+}
+
 // Server is a non-blocking Unix-domain socket server that runs on the host's
 // main thread so idle or partially written clients never stall UI rendering.
 Server :: struct {
 	active:    bool,
 	path:      string,
-	listen_fd: posix.FD,
+	listen_fd: Socket_Handle,
 	identity:  Endpoint_Identity,
 	clients:   [dynamic]Client_Conn,
-}
-
-set_nonblocking :: proc(fd: posix.FD) -> bool {
-	flags := posix.fcntl(fd, .GETFL)
-	if flags < 0 {
-		return false
-	}
-	return posix.fcntl(fd, .SETFL, flags | c.int(posix.O_NONBLOCK)) >= 0
 }
 
 compact_out_buf :: proc(client: ^Client_Conn) {
@@ -58,8 +62,8 @@ server_start :: proc(srv: ^Server, path: string) -> bool {
 		fmt.eprintf("could not listen on %s\n", path)
 		return false
 	}
-	if !set_nonblocking(listen_fd) {
-		posix.close(listen_fd)
+	if !set_nonblocking_socket(listen_fd) {
+		close_socket(listen_fd)
 		remove_unix_owned(path, identity)
 		fmt.eprintf("could not configure non-blocking socket on %s\n", path)
 		return false
@@ -74,9 +78,9 @@ server_start :: proc(srv: ^Server, path: string) -> bool {
 }
 
 client_destroy :: proc(client: ^Client_Conn) {
-	if client.fd >= 0 {
-		posix.close(client.fd)
-		client.fd = -1
+	if client.fd != INVALID_SOCKET_HANDLE {
+		close_socket(client.fd)
+		client.fd = INVALID_SOCKET_HANDLE
 	}
 	delete(client.in_buf)
 	delete(client.out_buf)
@@ -90,9 +94,9 @@ server_stop :: proc(srv: ^Server) {
 		client_destroy(&client)
 	}
 	delete(srv.clients)
-	if srv.listen_fd >= 0 {
-		posix.close(srv.listen_fd)
-		srv.listen_fd = -1
+	if srv.listen_fd != INVALID_SOCKET_HANDLE {
+		close_socket(srv.listen_fd)
+		srv.listen_fd = INVALID_SOCKET_HANDLE
 	}
 	remove_unix_owned(srv.path, srv.identity)
 	delete(srv.path)
@@ -147,12 +151,12 @@ server_poll_source :: proc(
 	}
 
 	for {
-		conn := posix.accept(srv.listen_fd, nil, nil)
-		if conn < 0 {
+		conn, accepted := socket_accept(srv.listen_fd)
+		if !accepted {
 			break
 		}
-		if !set_nonblocking(conn) {
-			posix.close(conn)
+		if !set_nonblocking_socket(conn) {
+			close_socket(conn)
 			continue
 		}
 		append(&srv.clients, Client_Conn{fd = conn})
@@ -162,20 +166,19 @@ server_poll_source :: proc(
 		return false, false
 	}
 
-	pfds := make([]posix.pollfd, len(srv.clients))
-	defer delete(pfds)
+	poll_requests := make([]Socket_Poll_Request, len(srv.clients))
+	defer delete(poll_requests)
+	poll_results := make([]Socket_Poll_Result, len(srv.clients))
+	defer delete(poll_results)
 	for i in 0 ..< len(srv.clients) {
-		ev: posix.Poll_Event
-		if !srv.clients[i].eof {
-			ev += {.IN}
+		poll_requests[i] = {
+			fd         = srv.clients[i].fd,
+			want_read  = !srv.clients[i].eof,
+			want_write = srv.clients[i].out_sent < len(srv.clients[i].out_buf),
 		}
-		if srv.clients[i].out_sent < len(srv.clients[i].out_buf) {
-			ev += {.OUT}
-		}
-		pfds[i] = posix.pollfd{fd = srv.clients[i].fd, events = ev}
 	}
 
-	ready := posix.poll(raw_data(pfds), posix.nfds_t(len(pfds)), 0)
+	ready := socket_poll(poll_requests, poll_results)
 	if ready <= 0 {
 		return false, false
 	}
@@ -183,18 +186,18 @@ server_poll_source :: proc(
 	read_buf: [4096]u8
 	i := 0
 	for i < len(srv.clients) {
-		revents := pfds[i].revents
+		revents := poll_results[i]
 		client := &srv.clients[i]
 
-		if .ERR in revents || .NVAL in revents {
+		if revents.err {
 			client.drop = true
 		}
 
-		if !client.drop && !rebuild_failed && (.IN in revents || .HUP in revents) && !client.eof {
+		if !client.drop && !rebuild_failed && (revents.read || revents.hup) && !client.eof {
 			for {
-				n := posix.recv(client.fd, rawptr(&read_buf), c.size_t(len(read_buf)), {})
+				n, recv_err := socket_recv(client.fd, raw_data(read_buf[:]), len(read_buf))
 				if n > 0 {
-					append(&client.in_buf, ..read_buf[:int(n)])
+					append(&client.in_buf, ..read_buf[:n])
 					for !rebuild_failed {
 						nl := -1
 						for j in 0 ..< len(client.in_buf) {
@@ -251,8 +254,7 @@ server_poll_source :: proc(
 					clear(&client.in_buf)
 					break
 				} else {
-					err := posix.errno()
-					if err != .EAGAIN && err != .EWOULDBLOCK {
+					if recv_err != .Again {
 						client.drop = true
 					}
 					break
@@ -263,12 +265,11 @@ server_poll_source :: proc(
 		if !client.drop && client.out_sent < len(client.out_buf) {
 			for client.out_sent < len(client.out_buf) {
 				rem := client.out_buf[client.out_sent:]
-				n := posix.send(client.fd, rawptr(raw_data(rem)), c.size_t(len(rem)), {.NOSIGNAL})
+				n, send_err := socket_send(client.fd, raw_data(rem), len(rem))
 				if n > 0 {
-					client.out_sent += int(n)
+					client.out_sent += n
 				} else if n < 0 {
-					err := posix.errno()
-					if err != .EAGAIN && err != .EWOULDBLOCK {
+					if send_err != .Again {
 						client.drop = true
 					}
 					break
@@ -283,8 +284,9 @@ server_poll_source :: proc(
 		if client.drop || (client.eof && client.out_sent >= len(client.out_buf)) {
 			client_destroy(client)
 			ordered_remove(&srv.clients, i)
-			for k := i; k + 1 < len(pfds); k += 1 {
-				pfds[k] = pfds[k + 1]
+			for k := i; k + 1 < len(poll_results); k += 1 {
+				poll_results[k] = poll_results[k + 1]
+				poll_requests[k] = poll_requests[k + 1]
 			}
 			continue
 		}
